@@ -192,7 +192,7 @@ impl Session {
         let timeout = timeout_secs.max(1);
         let name: corerouter_model::firewall::Name = list.parse().map_err(|e| format!("{e}"))?;
         let addr = corerouter_model::firewall::AddrMatch::Net(ipnet::IpNet::from(address));
-        let now = self.now();
+        let now = self.steady_now();
         if let Some(e) = self.dynamic_addresses.find(&name, &addr) {
             if e.left(now) >= timeout / 2 {
                 return Ok(());

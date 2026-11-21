@@ -14,10 +14,10 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "ip.service.print", "IP Services", [], None,
-        "{} → [{name, enabled, disabled, address, port, available_from, certificate? (www-ssl), status: stopped|listening|error, listening, last_error, refused, requests?, this_session: bool (this connection comes through it)}]",
+        "{} → [{name, enabled, disabled, address, port, available_from, certificate? (www-ssl), vrf, status: stopped|listening|error, listening, last_error, refused, requests?, this_session: bool (this connection comes through it)}]",
         always, print),
     cmd!(query "ip.service.check", "Check IP Service", [], None,
-        "{id?: string (www-ssl, www or metrics), enabled?: bool, address?: string, port?: string, available_from?: string (comma-separated; empty is everyone), certificate?: string (www-ssl: a /certificate or none)} → {computed: [{label, value}], checks: [{level, check, message, param?}], commands: [{command, params}], risk?}",
+        "{id?: string (www-ssl, www or metrics), enabled?: bool, address?: string, port?: string, available_from?: string (comma-separated; empty is everyone), certificate?: string (www-ssl: a /certificate or none), vrf?: string (main or a VRF)} → {computed: [{label, value}], checks: [{level, check, message, param?}], commands: [{command, params}], risk?}",
         always, check),
 ];
 
@@ -34,11 +34,13 @@ fn get(s: &mut Session, name: &str) -> Result<Value> {
 fn print(s: &mut Session, _: &Value) -> Result<Value> {
     let link = s.caller().link;
     let ssl = s.store().running().system.web.www_ssl.clone();
+    let table = link.map(|l| crate::mgmt_guard::table_of_local(s.store().running(), l.local.ip()));
     let mut rows = Vec::with_capacity(NAMES.len());
     for name in NAMES {
         let mut row = get(s, name)?;
         // Only `www-ssl` serves a session: `www` redirects, `metrics` has no login.
-        let this = name == "www-ssl" && link.is_some_and(|l| comes_through(&ssl, &l));
+        let this = name == "www-ssl"
+            && link.zip(table.as_ref()).is_some_and(|(l, t)| comes_through(&ssl, &l, t));
         let on = row.get("enabled").and_then(Value::as_bool).unwrap_or(false);
         if let Some(o) = row.as_object_mut() {
             o.insert("name".into(), json!(name));
@@ -78,6 +80,9 @@ fn typed(p: &Value) -> std::result::Result<Value, Value> {
     if p.get("certificate").is_some() {
         out.insert("certificate".into(), json!(text("certificate")));
     }
+    if !text("vrf").is_empty() {
+        out.insert("vrf".into(), json!(text("vrf")));
+    }
     Ok(Value::Object(out))
 }
 
@@ -97,10 +102,17 @@ fn check(s: &mut Session, p: &Value) -> Result<Value> {
     let before = cand.web.www_ssl.clone();
     let (mut web, mut metrics) = (cand.web.clone(), cand.metrics.clone());
     let certs = cand.certificates.clone();
+    let vrf = match metrics_service::vrf_param(s.store().candidate(), &params) {
+        Ok(v) => v,
+        Err(EngineError::BadParam { param, reason }) => {
+            return Ok(bad(check_row("error", &param, reason, Some(param.as_str()))));
+        }
+        Err(e) => return Err(e),
+    };
     let (now, was) = match name {
-        "www-ssl" => (web_service::apply(&mut web, &certs, &params, Row::Ssl), get(s, name)?),
-        "www" => (web_service::apply(&mut web, &certs, &params, Row::Plain), get(s, name)?),
-        _ => (metrics_service::apply(&mut metrics, &params), get(s, name)?),
+        "www-ssl" => (web_service::apply(&mut web, &certs, &params, Row::Ssl, vrf), get(s, name)?),
+        "www" => (web_service::apply(&mut web, &certs, &params, Row::Plain, vrf), get(s, name)?),
+        _ => (metrics_service::apply(&mut metrics, &params, vrf), get(s, name)?),
     };
     let now = match now {
         Ok(v) => v,
@@ -115,7 +127,7 @@ fn check(s: &mut Session, p: &Value) -> Result<Value> {
     }
     // Only what changes goes out (`set` takes each key on its own).
     let mut changed = Map::new();
-    for key in ["enabled", "address", "port", "available_from", "certificate"] {
+    for key in ["enabled", "address", "port", "available_from", "certificate", "vrf"] {
         if let Some(v) = now.get(key).filter(|v| was.get(key) != Some(*v)) {
             changed.insert(key.into(), v.clone());
         }
@@ -125,18 +137,25 @@ fn check(s: &mut Session, p: &Value) -> Result<Value> {
     } else {
         vec![json!({"command": format!("ip.service.{name}.set"), "params": changed})]
     };
-    let risk = s
-        .caller()
-        .link
-        .filter(|_| name == "www-ssl")
-        .and_then(|l| service_cut(&before, &web.www_ssl, &l));
+    let risk = s.caller().link.filter(|_| name == "www-ssl").and_then(|l| {
+        let t = crate::mgmt_guard::table_of_local(s.store().running(), l.local.ip());
+        service_cut(&before, &web.www_ssl, &l, &t)
+    });
     if risk.is_none() && !commands.is_empty() {
         checks.push(check_row("ok", "access", "this session does not depend on this change", None));
     }
     let address = now.get("address").and_then(Value::as_str).unwrap_or("");
     let everywhere = address == "::" || address == "0.0.0.0";
     let reach = json!({"label": "Listens on", "value": if everywhere { "every address of the router".to_owned() } else { address.to_owned() }});
-    Ok(json!({"computed": [reach], "checks": checks, "commands": commands, "risk": risk}))
+    // G3.4zb: where it answers.
+    let vrf = now.get("vrf").and_then(Value::as_str).unwrap_or("main");
+    let place = if vrf == "main" {
+        "main (the routing table OSPF and BGP feed; not the VRFs)".to_owned()
+    } else {
+        format!("VRF {vrf} only: bound to its device, out of the main table")
+    };
+    let table = json!({"label": "Answers in", "value": place});
+    Ok(json!({"computed": [reach, table], "checks": checks, "commands": commands, "risk": risk}))
 }
 
 #[cfg(test)]
@@ -268,5 +287,77 @@ mod tests {
         s.execute_as(&me, c["command"].as_str().unwrap(), &p).unwrap();
         let v = s.execute_as(&me, "ip.service.check", &form("www-ssl", true, "::", "443", Some("192.0.2.0/24"))).unwrap();
         assert!(v["risk"].is_null(), "{v}");
+    }
+
+    /// G3.4zb: a VRF of the lab (ether3 in `mgmt`, 10.99.0.1/24).
+    fn vrf_lab() -> Session {
+        let mut s = Session::virtual_lab();
+        s.execute("ip.vrf.add", &json!({"name": "mgmt", "interfaces": "ether3"})).unwrap();
+        s.execute("ip.address.add", &json!({"address": "10.99.0.1/24", "interface": "ether3"})).unwrap();
+        s.execute("ip.address.add", &json!({"address": "192.0.2.1/24", "interface": "ether1"})).unwrap();
+        s.execute("ip.service.www-ssl.set", &json!({"enabled": true})).unwrap();
+        s
+    }
+
+    /// A browser in the VRF.
+    fn through_vrf() -> Caller {
+        Caller::new(9, "wss 10.99.0.2".to_owned())
+            .with_principal(Principal::Local)
+            .with_link(Link { peer: "10.99.0.2:50000".parse().unwrap(), local: "10.99.0.1:443".parse().unwrap() })
+    }
+
+    #[test]
+    fn a_service_moves_into_a_vrf_and_says_where_it_answers() {
+        let mut s = vrf_lab();
+        let r = s.execute("ip.service.metrics.set", &json!({"enabled": true, "address": "::", "vrf": "mgmt"})).unwrap();
+        assert_eq!(r["vrf"], "mgmt");
+        let rows = s.execute("ip.service.print", &json!({})).unwrap();
+        assert_eq!((row(&rows, "metrics")["vrf"].as_str(), row(&rows, "www-ssl")["vrf"].as_str()), (Some("mgmt"), Some("main")));
+        // Bad VRFs, with the list.
+        let e = s.execute("ip.service.www.set", &json!({"vrf": "blue"})).unwrap_err().to_string();
+        assert!(e.contains("no VRF 'blue'") && e.contains("VRFs: main, mgmt"), "{e}");
+        let e = s.execute("ip.service.www.set", &json!({"vrf": 7})).unwrap_err().to_string();
+        assert!(e.contains("vrf"), "{e}");
+        // The same port in two VRFs is no clash.
+        s.execute("ip.service.www.set", &json!({"enabled": true, "port": 443, "vrf": "mgmt"})).unwrap();
+        // The VRF cannot go while a service listens in it.
+        let e = s.execute("ip.vrf.remove", &json!({"name": "mgmt"})).unwrap_err().to_string();
+        assert!(e.contains("no VRF 'mgmt' for ip.service"), "{e}");
+        // In one VRF they clash again.
+        let e = s.execute("ip.service.www-ssl.set", &json!({"vrf": "mgmt"})).unwrap_err().to_string();
+        assert!(e.contains("cannot both listen on port 443"), "{e}");
+        s.execute("ip.service.www.set", &json!({"enabled": false})).unwrap();
+        // The preview says where it answers.
+        let c = s.execute("ip.service.check", &json!({"id": "www-ssl", "enabled": true, "address": "::", "port": "443", "vrf": "mgmt"})).unwrap();
+        assert!(c.to_string().contains("VRF mgmt only"), "{c}");
+        assert_eq!(c["commands"][0]["params"]["vrf"], "mgmt", "{c}");
+        let c = s.execute("ip.service.check", &json!({"id": "www-ssl", "enabled": true, "address": "::", "port": "443", "vrf": "nope"})).unwrap();
+        assert_eq!(c["checks"][0]["param"], "vrf", "{c}");
+    }
+
+    #[test]
+    fn moving_www_ssl_away_from_the_vrf_of_this_session_is_a_lockout() {
+        let mut s = vrf_lab();
+        // From a main session, into the VRF: the next login from main
+        // would find nothing.
+        let e = s.execute_as(&through(443), "ip.service.www-ssl.set", &json!({"vrf": "mgmt"})).unwrap_err().to_string();
+        assert!(e.starts_with("lockout: ") && e.contains("to VRF mgmt") && e.contains("through main"), "{e}");
+        assert_eq!(s.store().running().system.web.www_ssl.vrf.to_string(), "main", "rolled back");
+        // The preview says so too.
+        let c = s
+            .execute_as(&through(443), "ip.service.check", &json!({"id": "www-ssl", "enabled": true, "address": "::", "port": "443", "vrf": "mgmt"}))
+            .unwrap();
+        assert!(c["risk"].as_str().is_some_and(|r| r.contains("to VRF mgmt")), "{c}");
+        // From the VRF's own session: fine, and it is this session's way in.
+        s.execute_as(&through_vrf(), "ip.service.www-ssl.set", &json!({"vrf": "mgmt"})).unwrap();
+        let rows = s.execute_as(&through_vrf(), "ip.service.print", &json!({})).unwrap();
+        assert_eq!(row(&rows, "www-ssl")["this_session"], true);
+        let rows = s.execute_as(&through(443), "ip.service.print", &json!({})).unwrap();
+        assert_eq!(row(&rows, "www-ssl")["this_session"], false, "a main session does not come through a VRF listener");
+        // Back to main from the VRF: refused; with force it goes.
+        let e = s.execute_as(&through_vrf(), "ip.service.www-ssl.set", &json!({"vrf": "main"})).unwrap_err().to_string();
+        assert!(e.contains("to main"), "{e}");
+        s.execute_as(&through_vrf(), "ip.service.www-ssl.set", &json!({"vrf": "main", "force": true})).unwrap();
+        assert!(s.store().running().system.web.www_ssl.vrf.is_main());
     }
 }

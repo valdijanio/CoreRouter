@@ -69,6 +69,9 @@ mount -t tmpfs tmpfs /var/lib
 mkdir -p /var/run/frr /etc/frr /var/lib/frr /run/netns
 export LD_LIBRARY_PATH=$FRR_DIR/root/usr/lib/x86_64-linux-gnu:$FRR_DIR/root/usr/lib/x86_64-linux-gnu/frr
 FRR=$FRR_DIR/root/usr/lib/frr
+# BFDD_BIN: another bfdd (G3.6n: the image's, with os/patches/frr, through
+# a wrapper that runs it with the image's loader and libraries).
+BFDD=${BFDD_BIN:-$FRR/bfdd}
 bin=$CARGO_TARGET_DIR/release
 CASES=("$@")
 [ ${#CASES[@]} -gt 0 ] || CASES=(ebgp ebgp6 mpbgp md5 filters extcomm announce nexthop-self rr maxprefix restart gr hardreset cbit llgr bfd convergence scale)
@@ -141,11 +144,13 @@ frr_start() {
   local ns=$1 p; shift
   mkdir -p "/etc/frr/$ns" "/var/lib/frr/$ns" "/var/run/frr/$ns"
   for p in zebra bgpd ospfd staticd bfdd; do : > "/etc/frr/$ns/$p.conf"; done
+  # BFD_DEBUG=1: bfdd's view of its data plane and sessions in frr-<ns>.log.
+  [ -z "${BFD_DEBUG:-}" ] || printf 'log stdout debugging\ndebug bfd peer\ndebug bfd network\ndebug bfd distributed\n' > "/etc/frr/$ns/bfdd.conf"
   [ -f "$W/$ns.bgpd" ] && cp "$W/$ns.bgpd" "/etc/frr/$ns/bgpd.conf"
   for p in "$@"; do
     case $p in
       mgmtd|staticd) ip netns exec "$ns" "$FRR/$p" -N "$ns" -u root -g root -d --limit-fds 4096 ;;
-      bfdd) ip netns exec "$ns" "$FRR/bfdd" -N "$ns" -u root -g root -d --limit-fds 4096 \
+      bfdd) ip netns exec "$ns" "$BFDD" -N "$ns" -u root -g root -d --limit-fds 4096 \
               -f "/etc/frr/$ns/bfdd.conf" --dplaneaddr "unix:/var/run/frr/$ns/bfdd_dplane.sock" ;;
       *) ip netns exec "$ns" "$FRR/$p" -N "$ns" -u root -g root -d --limit-fds 4096 -f "/etc/frr/$ns/$p.conf" ;;
     esac </dev/null >>"$W/frr-$ns.log" 2>&1
@@ -210,6 +215,11 @@ wait_for() { # wait_for <timeout s> <command…>: poll every 100 ms; prints the 
 }
 cr_sess() { cr "$1" routing.bgp.session.list | jq -c --arg c "$2" '[.[] | select(.connection == $c)][0] // {}'; }
 cr_up() { [ "$(cr_sess "$1" "$2" | jq -r '.established // false')" = true ]; }
+# cr_uptime <n> <connection>: the session's uptime in s, once that side
+# shows it (empty before: CR1 can see Established before CR2's daemon has
+# read its own session from bgpd).
+cr_uptime() { cr_sess "$1" "$2" | jq -r '.uptime_secs // empty'; }
+cr_uptime_known() { [ -n "$(cr_uptime "$1" "$2")" ]; }
 cr_state() { cr_sess "$1" "$2" | jq -c '{state, reason, last_error}'; }
 k_route() { ip -n "$1" route show "$2" 2>/dev/null | grep -o 'via [0-9.]*' | head -1 || true; }
 k_route6() { ip -n "$1" -6 route show "$2" 2>/dev/null | grep -o 'via [0-9a-f:]*' | head -1 || true; }
@@ -702,7 +712,7 @@ cbit_round() { # cbit_round <label> <CR1 extra> <CR2 extra> <what to kill: stack
   [ "$kept" = no ] && sleep 2
   case $what in
     stack|frr)
-      ip netns exec c1 "$FRR/bfdd" -N c1 -u root -g root -d --limit-fds 4096 -f /etc/frr/c1/bfdd.conf --dplaneaddr unix:/var/run/frr/c1/bfdd_dplane.sock </dev/null >>"$W/frr-c1.log" 2>&1
+      ip netns exec c1 "$BFDD" -N c1 -u root -g root -d --limit-fds 4096 -f /etc/frr/c1/bfdd.conf --dplaneaddr unix:/var/run/frr/c1/bfdd_dplane.sock </dev/null >>"$W/frr-c1.log" 2>&1
       ip netns exec c1 "$FRR/bgpd" -N c1 -u root -g root -d --limit-fds 4096 -f /etc/frr/c1/bgpd.conf </dev/null >>"$W/frr-c1.log" 2>&1 ;;
   esac
   case $what in
@@ -728,7 +738,15 @@ case_cbit() {
   grep -q '^frr yes ' "$W/cbit-summary.txt" && grep -q '^stack yes ' "$W/cbit-summary.txt" \
     && result cbit OK "BFD + graceful restart: CR1's route kept with bgpd+bfdd or the whole stack killed ($s)" \
     || result cbit FAIL "BFD + graceful restart: $s"
-  grep -q '^daemon no ' "$W/cbit-summary.txt" && result cbit INFO "known gap: corerouter-daemon alone killed takes BFD down and the routes with it ($s)"
+  # G3.6n: with the image's bfdd (os/patches/frr/0008) the daemon alone
+  # killed keeps the routes too; FRR's own packages still lose them.
+  if grep -q '^daemon yes ' "$W/cbit-summary.txt"; then
+    result cbit OK "G3.6n: corerouter-daemon alone killed, BFD and the routes kept ($s)"
+  elif [ -n "${BFDD_BIN:-}" ]; then
+    result cbit FAIL "G3.6n: corerouter-daemon alone killed took BFD down with the patched bfdd ($s)"
+  else
+    result cbit INFO "unpatched bfdd (FRR's packages; BFDD_BIN= the image's): corerouter-daemon alone killed takes BFD down and the routes with it ($s)"
+  fi
 }
 
 # G3.9fj, RFC 9494. CR1 restarts gracefully with Restart Time 5 s; kill -9
@@ -783,13 +801,16 @@ case_restart() {
   local ms
   ms=$(wait_for 60 cr_up 1 cr2) || { result restart FAIL "no session"; pair_down; return; }
   wait_for 30 k_has c2 100.64.39.0/24 >/dev/null || true
-  local up0; up0=$(cr_sess 2 cr1 | jq -r .uptime_secs)
+  # G3.9fk: CR2's own view of the session, before the restart. Read at
+  # once it was `null` in 2 of 4 runs (CR1 saw Established first).
+  wait_for 30 cr_uptime_known 2 cr1 >/dev/null || { result restart FAIL "CR2 never showed the session: $(cr_state 2 cr1)"; pair_down; return; }
+  local up0; up0=$(cr_uptime 2 cr1)
   kill "$(cat "$W/daemon1.pid")"; sleep 1
   local t0; t0=$(now_ms)
   start_daemon 1
   local tr=$(( $(now_ms) - t0 ))
   sleep 5
-  local up1; up1=$(cr_sess 2 cr1 | jq -r .uptime_secs)
+  local up1; up1=$(cr_uptime 2 cr1)
   cr_up 2 cr1 && k_has c2 100.64.39.0/24 && [ "${up1:-0}" -ge "${up0:-0}" ] \
     && result restart OK "corerouter-daemon restarted (answering in ${tr} ms): the peer's session untouched (uptime $up0 → $up1 s)" \
     || result restart FAIL "daemon restart: CR2 $(cr_state 2 cr1) uptime $up0 → $up1, route '$(k_route c2 100.64.39.0/24)'"

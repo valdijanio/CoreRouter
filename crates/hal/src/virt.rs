@@ -116,6 +116,9 @@ pub struct VirtualHal {
     replug: Option<(IfName, u64)>,
     /// G1.30: the lab's Wi-Fi radios and what they hear.
     wifi: crate::lab_wifi::LabWifi,
+    /// G0.13: the monotonic clock an app hands in (the daemon:
+    /// `CLOCK_MONOTONIC`); the lab itself has no clock (wasm).
+    monotonic: Option<fn() -> u64>,
 }
 
 /// A lab port's own settings (G1.26b); `None`: the NIC has no such knob.
@@ -187,6 +190,14 @@ impl VirtualHal {
     /// nobody configured yet, hearing the lab's networks
     /// ([`crate::lab_wifi::default_networks`]).
     #[must_use]
+    /// Deadlines follow `clock` (seconds from any fixed origin, steady)
+    /// instead of the wall clock (G0.13): the daemon's lab, like a real
+    /// router.
+    pub fn with_monotonic(mut self, clock: fn() -> u64) -> Self {
+        self.monotonic = Some(clock);
+        self
+    }
+
     pub fn with_wifi(self, radios: u8) -> Self {
         for i in 1..=radios {
             if let Ok(name) = format!("wifi{i}").parse::<IfName>() {
@@ -292,6 +303,7 @@ impl VirtualHal {
             absent: std::collections::BTreeSet::new(),
             replug: None,
             wifi: crate::lab_wifi::LabWifi::default(),
+            monotonic: None,
         }
     }
 
@@ -1251,6 +1263,10 @@ impl Hal for VirtualHal {
 
     fn now_unix(&self) -> Option<u64> {
         None
+    }
+
+    fn monotonic_secs(&self) -> Option<u64> {
+        self.monotonic.map(|clock| clock())
     }
 
     /// Counted, not shaped (G4.9g): the Queues window moves in the lab.

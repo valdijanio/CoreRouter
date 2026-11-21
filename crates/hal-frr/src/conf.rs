@@ -146,9 +146,11 @@ pub fn close(header: &str) -> &'static str {
 }
 
 /// Top-level contexts CoreRouter owns only lines of and never deletes:
-/// `interface X` (the interface itself belongs to zebra and the kernel).
+/// `interface X` (the interface itself belongs to zebra and the kernel) and
+/// `vrf X` (G3.4za: the VRF is the kernel's device, and the operator may
+/// hold other lines in it, a `vni`).
 fn kept_context(line: &str) -> bool {
-    line.starts_with("interface ")
+    line.starts_with("interface ") || line.starts_with("vrf ")
 }
 
 /// The command that undoes `line`: `no X` for `X`, `X` for `no X`.

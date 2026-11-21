@@ -366,7 +366,7 @@ impl Session {
     pub fn ppp_address_lists(&mut self, ops: &[PppListOp]) -> Vec<String> {
         use corerouter_hal::DynamicChange;
         use corerouter_model::firewall::{AddrMatch, Name};
-        let now = self.now();
+        let now = self.steady_now();
         let mut errors = Vec::new();
         // First what goes (one reindex for all), then what comes: a new
         // add replaces an old entry (a fresh timeout).

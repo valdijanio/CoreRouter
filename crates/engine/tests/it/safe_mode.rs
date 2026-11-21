@@ -370,3 +370,229 @@ fn the_deadline_follows_the_monotonic_clock() {
     assert!(!s.in_safe_mode());
     assert!(!disabled(&s, "ether2"));
 }
+
+/// G1.6qg: a user that logged in over the network, on connection `id`.
+fn user(id: u64, name: &str) -> Caller {
+    Caller::new(id, format!("tls 10.0.0.9:{}", 40_000 + id))
+        .with_principal(Principal::User(name.into()))
+}
+
+/// The router with `admin` and `ops` (both group full) before Safe Mode.
+fn with_users() -> Session {
+    let mut s = boot(&MemoryStorage::default());
+    for name in ["admin", "ops"] {
+        s.execute(
+            "user.add",
+            &json!({"name": name, "group": "full", "password": "s3cret-Passw0rd"}),
+        )
+        .unwrap();
+    }
+    s
+}
+
+#[test]
+fn detached_outlives_its_connection_and_undoes_at_the_deadline() {
+    let mut s = with_users();
+    let r = enter(
+        &mut s,
+        &user(8, "admin"),
+        json!({"timeout_secs": 60, "detach": true}),
+    );
+    assert_eq!(
+        (
+            r["detached"].as_bool(),
+            r["expires_in"].as_u64(),
+            r["owner_user"].as_str()
+        ),
+        (Some(true), Some(60), Some("admin")),
+        "{r}"
+    );
+    disable(&mut s, &user(8, "admin"), "ether2");
+    // `corerouter-cli run`: the connection closes after each command.
+    s.hang_up(8);
+    assert!(s.in_safe_mode(), "a detached Safe Mode stays");
+    assert!(disabled(&s, "ether2"));
+    let sm = summary(&mut s, &user(9, "admin"));
+    assert_eq!(
+        (sm["owner_connected"].as_bool(), sm["yours"].as_bool()),
+        (Some(false), Some(true)),
+        "{sm}"
+    );
+    s.tick(T0 + 59);
+    assert!(s.in_safe_mode());
+    s.tick(T0 + 60);
+    assert!(!s.in_safe_mode(), "undone at the deadline");
+    assert!(!disabled(&s, "ether2"));
+    let journal = s.journal().last().unwrap();
+    assert_eq!(
+        journal.params["automatic"],
+        "the timeout expired without confirmation"
+    );
+    let log = s.execute("log.print", &json!({})).unwrap().to_string();
+    assert!(
+        log.contains("Safe Mode (detached) entered by admin"),
+        "{log}"
+    );
+    assert!(
+        log.contains("the connection that entered it closed; the changes are undone in 60 s"),
+        "{log}"
+    );
+}
+
+#[test]
+fn the_same_user_confirms_from_another_connection_and_others_need_force() {
+    let mut s = with_users();
+    enter(&mut s, &user(8, "admin"), json!({"detach": true}));
+    assert_eq!(
+        summary(&mut s, &user(8, "admin"))["expires_in"],
+        600,
+        "default: 10 minutes, as Junos and VyOS"
+    );
+    disable(&mut s, &user(8, "admin"), "ether2");
+    s.hang_up(8);
+    // Another user cannot end it, nor take it over.
+    let e = s
+        .execute_as(&user(10, "ops"), "config.safe-mode.exit", &json!({}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("detached, user admin") && e.contains("force: true"),
+        "{e}"
+    );
+    let e = s
+        .execute_as(
+            &user(10, "ops"),
+            "config.safe-mode.enter",
+            &json!({"detach": true}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("held by"), "{e}");
+    assert!(s.in_safe_mode());
+    // The same user, a new connection: confirms, and it is saved.
+    let r = s
+        .execute_as(&user(9, "admin"), "config.safe-mode.exit", &json!({}))
+        .unwrap();
+    assert_eq!(r["active"], false);
+    assert!(r["last"].as_str().unwrap().starts_with("confirmed"), "{r}");
+    s.tick(T0 + 601);
+    assert!(disabled(&s, "ether2"), "kept after the old deadline");
+}
+
+#[test]
+fn force_ends_it_for_another_user_and_cancel_undoes_at_once() {
+    let mut s = with_users();
+    enter(
+        &mut s,
+        &user(8, "admin"),
+        json!({"timeout_secs": 300, "detach": true}),
+    );
+    disable(&mut s, &user(8, "admin"), "ether2");
+    s.hang_up(8);
+    s.execute_as(
+        &user(10, "ops"),
+        "config.safe-mode.cancel",
+        &json!({"force": true}),
+    )
+    .unwrap();
+    assert!(!s.in_safe_mode());
+    assert!(!disabled(&s, "ether2"), "cancel undoes now");
+}
+
+#[test]
+fn the_same_user_rearms_it_and_an_attached_entry_cannot_take_it() {
+    let mut s = with_users();
+    enter(
+        &mut s,
+        &user(8, "admin"),
+        json!({"timeout_secs": 60, "detach": true}),
+    );
+    disable(&mut s, &user(8, "admin"), "ether2");
+    s.hang_up(8);
+    s.tick(T0 + 50);
+    // `commit confirmed` again: a new deadline, the same entry point.
+    let r = enter(
+        &mut s,
+        &user(9, "admin"),
+        json!({"timeout_secs": 120, "detach": true}),
+    );
+    assert_eq!(
+        (r["expires_in"].as_u64(), r["entry_revision"].as_u64()),
+        (Some(120), Some(0)),
+        "{r}"
+    );
+    // Without detach the new connection would own it and its closing would
+    // undo it: refused, said how.
+    let e = s
+        .execute_as(&user(9, "admin"), "config.safe-mode.enter", &json!({}))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("detached") && e.contains("detach: true"), "{e}");
+    s.hang_up(9);
+    s.tick(T0 + 169);
+    assert!(s.in_safe_mode() && disabled(&s, "ether2"));
+    s.tick(T0 + 170);
+    assert!(!s.in_safe_mode() && !disabled(&s, "ether2"));
+}
+
+#[test]
+fn an_attached_one_becomes_detached_and_every_login_is_warned() {
+    let mut s = with_users();
+    enter(&mut s, &user(8, "admin"), json!({}));
+    disable(&mut s, &user(8, "admin"), "ether2");
+    // The owner detaches it before leaving (a script that must log out).
+    enter(
+        &mut s,
+        &user(8, "admin"),
+        json!({"timeout_secs": 30, "detach": true}),
+    );
+    s.hang_up(8);
+    assert!(s.in_safe_mode() && disabled(&s, "ether2"));
+    let w = s.safe_mode_warning().unwrap();
+    assert!(
+        w.contains("entered by admin")
+            && w.contains("1 change(s) are undone in 30 s")
+            && w.contains("config.safe-mode.exit"),
+        "{w}"
+    );
+    let me = corerouter_engine::auth::whoami(&s, &Principal::User("ops".into()), "tls");
+    assert_eq!(me["safe_mode"].as_str(), Some(w.as_str()));
+    // Not detached: no warning (the GUI's own Safe Mode has its button).
+    s.tick(T0 + 30);
+    assert!(s.safe_mode_warning().is_none());
+    enter(&mut s, &gui(), json!({}));
+    assert!(s.safe_mode_warning().is_none());
+}
+
+#[test]
+fn bad_detached_entries_are_refused() {
+    let mut s = with_users();
+    let e = s
+        .execute_as(
+            &user(8, "admin"),
+            "config.safe-mode.enter",
+            &json!({"detach": true, "timeout_secs": 5}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("timeout_secs"), "{e}");
+    let e = s
+        .execute_as(
+            &user(8, "admin"),
+            "config.safe-mode.enter",
+            &json!({"detach": "yes"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("detach"), "{e}");
+    assert!(!s.in_safe_mode());
+    // A restart in the middle boots the entry config, detached or not.
+    let storage = MemoryStorage::default();
+    let mut s = boot(&storage);
+    enter(&mut s, &gui(), json!({"detach": true}));
+    disable(&mut s, &gui(), "ether2");
+    drop(s);
+    let s = boot(&storage);
+    assert!(!s.in_safe_mode());
+    assert!(!disabled(&s, "ether2"));
+}

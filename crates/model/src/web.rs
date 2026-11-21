@@ -11,11 +11,17 @@
 //!
 //! The daemon follows the running config: a commit opens, moves or closes
 //! a listener without a restart.
+//!
+//! G3.4zb: each listener has its VRF (RouterOS `/ip service … vrf=`, default
+//! `main`): in one, it is bound to the VRF's device and answers only there,
+//! out of the table OSPF and BGP feed.
 
 use std::net::{IpAddr, Ipv6Addr};
 
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
+
+use crate::types::RoutingTable;
 
 /// Most `available_from` entries (as `/ip service metrics`).
 pub const MAX_AVAILABLE_FROM: usize = 64;
@@ -41,6 +47,10 @@ pub struct WebListener {
     /// empty is the router's own (the control port's). Only `www_ssl`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub certificate: String,
+    /// G3.4zb: the VRF it listens in (`main`: unbound, as before; a config
+    /// written before it has none).
+    #[serde(default, skip_serializing_if = "RoutingTable::is_main")]
+    pub vrf: RoutingTable,
 }
 
 fn any_address() -> IpAddr {
@@ -55,6 +65,7 @@ impl WebListener {
             port,
             available_from: Vec::new(),
             certificate: String::new(),
+            vrf: RoutingTable::Main,
         }
     }
 
@@ -143,6 +154,27 @@ mod tests {
         let f = WebService::factory();
         assert!(f.www_ssl.enabled && !f.www.enabled);
         assert!(f.www_ssl.address.is_unspecified());
+    }
+
+    /// G3.4zb: a listener saved before VRFs is in main; main is not
+    /// written; a VRF one round-trips. The metrics service too.
+    #[test]
+    fn a_service_saved_before_vrfs_listens_in_main() {
+        let old: WebService = serde_json::from_str(
+            r#"{"www_ssl":{"enabled":true,"address":"::","port":443,"available_from":[]},"www":{"enabled":false,"address":"::","port":80}}"#,
+        )
+        .unwrap();
+        assert!(old.www_ssl.vrf.is_main() && old.www.vrf.is_main());
+        assert!(!serde_json::to_string(&old).unwrap().contains("vrf"));
+        let mut w = old.clone();
+        w.www_ssl.vrf = "mgmt".parse().unwrap();
+        let text = serde_json::to_string(&w).unwrap();
+        assert!(text.contains(r#""vrf":"mgmt""#), "{text}");
+        assert_eq!(serde_json::from_str::<WebService>(&text).unwrap(), w);
+        let m: crate::metrics::MetricsService =
+            serde_json::from_str(r#"{"enabled":true,"address":"0.0.0.0","port":9100,"available_from":[]}"#).unwrap();
+        assert!(m.vrf.is_main());
+        assert!(!serde_json::to_string(&m).unwrap().contains("vrf"));
     }
 
     #[test]

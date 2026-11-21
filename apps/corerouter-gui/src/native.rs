@@ -361,6 +361,21 @@ pub fn main() -> ExitCode {
             }
             Err(e) => log::warn!("no local token: {e}"),
         }
+        // G0.11: and the local socket (`screenshot` from the CLI uses it).
+        #[cfg(target_os = "linux")]
+        match corerouter_control::unix::bind(port).and_then(|l| {
+            let shown = l.path().display().to_string();
+            corerouter_control::unix::spawn_until(
+                l,
+                host.clone(),
+                gate.clone(),
+                corerouter_control::Shutdown::default(),
+            )
+            .map(|_| shown)
+        }) {
+            Ok(path) => log::info!("control socket: {path}"),
+            Err(e) => log::warn!("control socket not served: {e}"),
+        }
         match bind_loopback(port).and_then(|l| spawn(Endpoint::loopback(l), host, gate)) {
             Ok(_) => log::info!("control channel on 127.0.0.1:{port}"),
             Err(e) => {
@@ -589,7 +604,9 @@ impl Platform for NativePlatform {
         let remote = Remote::spawn(way.dialer.clone(), Some(way.client))
             .map_err(|e| format!("cannot start the connection thread: {e}"))?;
         match way.how {
-            How::Token => log::info!("managing the router at {target} (local token)"),
+            How::Token => {
+                log::info!("managing the router at {target} (this OS user: local socket or token)")
+            }
             How::Password => log::info!("managing the router at {target} as {}", creds.user),
             How::Legacy => log::warn!(
                 "managing the router at {target}: an old version without login (update it)"
@@ -703,6 +720,14 @@ fn log_in(
             });
         }
         return Err(old_router(target, &info));
+    }
+    // G0.11: over the router's local socket this OS user is already in.
+    if client.is_unix() && client.call("auth.whoami", Value::Null).is_ok() {
+        return Ok(Way {
+            dialer: Dialer::new(target.clone(), Login::Auto, None),
+            client,
+            how: How::Token,
+        });
     }
     let token_note = match local {
         Some(token) => {

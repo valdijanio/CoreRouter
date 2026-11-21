@@ -32,6 +32,13 @@
 //!   `routing.management_guard`): the routing daemon refuses those routes
 //!   (`hal-frr`). Its window counts what it refuses from the daemon's RIB,
 //!   read on demand by the same thread that polls FRR ([`Session::mgmt_guard_rib_wanted`]).
+//!
+//! G3.4za: everything is per routing table. A session is in the table of
+//! the port its local address is on (a VRF's, or main); the kernel is asked
+//! with that VRF as the output device (`ip route get … vrf <name>`: the
+//! `l3mdev` rule then picks the VRF's table, as for the socket's own
+//! replies), its connected networks are that table's, and a guard network
+//! protects it only when it is in the same table.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
@@ -91,8 +98,23 @@ pub struct Guard {
     fed_at: Option<u64>,
     fed: bool,
     findings: Vec<Finding>,
-    rib: HashMap<IpNet, RibSlot>,
-    wanted: Vec<IpNet>,
+    rib: HashMap<(RoutingTable, IpNet), RibSlot>,
+    wanted: Vec<(RoutingTable, IpNet)>,
+}
+
+/// One lookup the `mgmt-guard` service makes: the replies from `local` to
+/// `peer`, in `vrf` (`None`: main).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    pub peer: IpAddr,
+    pub local: IpAddr,
+    pub vrf: Option<IfName>,
+}
+
+impl Probe {
+    pub fn pair(&self) -> (IpAddr, IpAddr) {
+        (self.peer, self.local)
+    }
 }
 
 /// One session the guard names.
@@ -116,6 +138,8 @@ pub struct Finding {
     pub sessions: Vec<Who>,
     /// The route the replies take.
     pub route: IpNet,
+    /// G3.4za: the table the session is in (main or a VRF).
+    pub vrf: RoutingTable,
     pub protocol: &'static str,
     pub interface: Option<IfName>,
     pub gateway: Option<IpAddr>,
@@ -211,30 +235,51 @@ fn prune(g: &mut Guard, now: Option<u64>) {
     });
 }
 
-/// The connected networks of the main table that are up, by network: the
-/// longest that holds an address is the one the kernel uses.
-fn connected_main(cfg: &Config) -> HashMap<IpNet, IfName> {
-    let mut out = HashMap::new();
-    for a in &cfg.ip.addresses {
-        if a.disabled || a.from_pool.is_some() || !is_up(cfg, &a.interface) {
-            continue;
-        }
-        if route::table_of(cfg, &a.interface) != RoutingTable::Main {
-            continue;
-        }
-        out.entry(a.address.trunc()).or_insert_with(|| a.interface.clone());
-    }
-    out
+/// The connected networks that are up, by table and network (the longest
+/// that holds an address is the one the kernel uses), and the table of each
+/// local address. One pass over the addresses.
+#[derive(Debug, Default)]
+struct Tables {
+    connected: HashMap<(RoutingTable, IpNet), IfName>,
+    local: HashMap<IpAddr, RoutingTable>,
 }
 
-/// The longest connected network holding `ip`: one hash lookup per prefix
-/// length (33 or 129), whatever the number of addresses.
-fn connected_of(nets: &HashMap<IpNet, IfName>, ip: IpAddr) -> Option<(IpNet, IfName)> {
-    let max = if ip.is_ipv4() { 32 } else { 128 };
-    (0..=max).rev().find_map(|len| {
-        let n = IpNet::new(ip, len).ok()?.trunc();
-        nets.get(&n).map(|i| (n, i.clone()))
-    })
+impl Tables {
+    fn of(cfg: &Config) -> Self {
+        let mut t = Tables::default();
+        for a in &cfg.ip.addresses {
+            if a.disabled || a.from_pool.is_some() || !is_up(cfg, &a.interface) {
+                continue;
+            }
+            // A `/routing table` (G1.27e) is not where a port's connected
+            // routes are: only a VRF is.
+            let table = match route::table_of(cfg, &a.interface) {
+                t @ RoutingTable::Vrf(_) if route::is_vrf_table(cfg, &t) => t,
+                _ => RoutingTable::Main,
+            };
+            t.local.entry(a.address.addr()).or_insert_with(|| table.clone());
+            t.connected.entry((table, a.address.trunc())).or_insert_with(|| a.interface.clone());
+        }
+        t
+    }
+
+    /// The table a session whose local address is `local` is in (main when
+    /// the address is not one of the config's: the daemon's own listen
+    /// address, a pool's).
+    fn table(&self, local: IpAddr) -> RoutingTable {
+        self.local.get(&local).cloned().unwrap_or_default()
+    }
+
+    /// The longest connected network of `table` holding `ip`: one hash
+    /// lookup per prefix length (33 or 129), whatever the number of
+    /// addresses.
+    fn connected_of(&self, table: &RoutingTable, ip: IpAddr) -> Option<(IpNet, IfName)> {
+        let max = if ip.is_ipv4() { 32 } else { 128 };
+        (0..=max).rev().find_map(|len| {
+            let n = IpNet::new(ip, len).ok()?.trunc();
+            self.connected.get(&(table.clone(), n)).map(|i| (n, i.clone()))
+        })
+    }
 }
 
 /// Who a session is, for people.
@@ -250,7 +295,7 @@ fn who(id: u64, o: &Open) -> Who {
 
 /// The findings of `fib` against the running config (pure, for the tests).
 fn judge(cfg: &Config, open: &HashMap<u64, Open>, fib: &HashMap<(IpAddr, IpAddr), FibEntry>) -> Vec<Finding> {
-    let nets = connected_main(cfg);
+    let tables = Tables::of(cfg);
     let mut by_pair: BTreeMap<(IpAddr, IpAddr), Vec<Who>> = BTreeMap::new();
     for (id, o) in open {
         by_pair
@@ -270,13 +315,15 @@ fn judge(cfg: &Config, open: &HashMap<u64, Open>, fib: &HashMap<(IpAddr, IpAddr)
         if !is_learned_protocol(e.protocol) {
             continue;
         }
-        let Some((connected, connected_interface)) = connected_of(&nets, pair.0) else {
+        let vrf = tables.table(pair.1);
+        let Some((connected, connected_interface)) = tables.connected_of(&vrf, pair.0) else {
             continue;
         };
         if route.prefix_len() <= connected.prefix_len() {
             continue;
         }
         sessions.sort_by_key(|w| w.id);
+        let guarded = guard.active_in(&vrf).any(|n| n.contains(&connected));
         out.push(Finding {
             peer: pair.0,
             local: pair.1,
@@ -285,7 +332,8 @@ fn judge(cfg: &Config, open: &HashMap<u64, Open>, fib: &HashMap<(IpAddr, IpAddr)
             protocol: protocol_name(e.protocol),
             interface: e.interface.clone(),
             gateway: e.gateway,
-            guarded: guard.active().any(|n| n.contains(&connected)),
+            guarded,
+            vrf,
             connected,
             connected_interface,
         });
@@ -293,9 +341,19 @@ fn judge(cfg: &Config, open: &HashMap<u64, Open>, fib: &HashMap<(IpAddr, IpAddr)
     out
 }
 
-/// The command that protects `net`.
-pub fn protect_command(net: &IpNet) -> String {
-    format!("routing.management-guard.add {{\"network\":\"{net}\"}}")
+/// The table a connection whose local address is `local` is in (G3.4zb:
+/// which VRF a service's session came through): the VRF of the port with
+/// that address, or main.
+pub(crate) fn table_of_local(cfg: &Config, local: IpAddr) -> RoutingTable {
+    Tables::of(cfg).table(plain(local))
+}
+
+/// The command that protects `net` of `table`.
+pub fn protect_command(table: &RoutingTable, net: &IpNet) -> String {
+    match table {
+        RoutingTable::Main => format!("routing.management-guard.add {{\"network\":\"{net}\"}}"),
+        RoutingTable::Vrf(v) => format!("routing.management-guard.add {{\"network\":\"{net}\",\"vrf\":\"{v}\"}}"),
+    }
 }
 
 /// One finding as a sentence (Portuguese, for the health check and the log).
@@ -315,8 +373,12 @@ pub fn describe(f: &Finding) -> String {
     let more = f.sessions.len().saturating_sub(4);
     let more = if more > 0 { format!(" e mais {more}") } else { String::new() };
     let out = f.interface.as_ref().map_or_else(String::new, |i| format!(": as respostas saem por {i}"));
+    let vrf = match &f.vrf {
+        RoutingTable::Main => String::new(),
+        RoutingTable::Vrf(v) => format!(" (VRF {v})"),
+    };
     format!(
-        "a rota {} ({}{}) é mais específica que a rede conectada {} de {} e cobre o par de {} sessão(ões) de gerência ({}{more}){out}",
+        "a rota {} ({}{}) é mais específica que a rede conectada {} de {}{vrf} e cobre o par de {} sessão(ões) de gerência ({}{more}){out}",
         f.route,
         f.protocol,
         if via.is_empty() { String::new() } else { format!(", {via}") },
@@ -329,9 +391,11 @@ pub fn describe(f: &Finding) -> String {
 
 impl Session {
     /// The distinct (peer, local address) pairs of the open management
-    /// sessions, for the `mgmt-guard` service to look up.
-    pub fn mgmt_guard_probes(&mut self) -> Vec<(IpAddr, IpAddr)> {
+    /// sessions, with the VRF each is in, for the `mgmt-guard` service to
+    /// look up.
+    pub fn mgmt_guard_probes(&mut self) -> Vec<Probe> {
         let now = self.now();
+        let tables = Tables::of(self.store().running());
         let Some(g) = self.ext_mut::<Guard>() else {
             return Vec::new();
         };
@@ -342,6 +406,14 @@ impl Session {
             .map(|o| (plain(o.link.peer.ip()), plain(o.link.local.ip())))
             .filter(|p| seen.insert(*p))
             .take(MAX_PROBES)
+            .map(|(peer, local)| Probe {
+                peer,
+                local,
+                vrf: match tables.table(local) {
+                    RoutingTable::Main => None,
+                    RoutingTable::Vrf(v) => Some(v),
+                },
+            })
             .collect()
     }
 
@@ -396,7 +468,7 @@ impl Session {
         let guard = &self.store().running().routing.management_guard;
         g.findings
             .iter()
-            .map(|f| Finding { guarded: guard.active().any(|n| n.contains(&f.connected)), ..f.clone() })
+            .map(|f| Finding { guarded: guard.active_in(&f.vrf).any(|n| n.contains(&f.connected)), ..f.clone() })
             .collect()
     }
 
@@ -416,22 +488,30 @@ impl Session {
         v
     }
 
-    /// The connected network (main table) each open session's peer is on,
-    /// with the sessions: what `routing.management-guard.suggest` offers.
-    pub fn mgmt_guard_networks(&self) -> Vec<(IpNet, IfName, Vec<Who>)> {
-        let nets = connected_main(self.store().running());
-        let mut by: BTreeMap<IpNet, (IfName, Vec<Who>)> = BTreeMap::new();
+    /// The connected network each open session's peer is on, in the
+    /// session's table, with the sessions: what
+    /// `routing.management-guard.suggest` offers.
+    pub fn mgmt_guard_networks(&self) -> Vec<MgmtNetwork> {
+        let tables = Tables::of(self.store().running());
+        let locals: HashMap<u64, IpAddr> = self
+            .ext::<Guard>()
+            .map(|g| g.open.iter().map(|(id, o)| (*id, plain(o.link.local.ip()))).collect())
+            .unwrap_or_default();
+        let mut by: BTreeMap<(RoutingTable, IpNet), (IfName, Vec<Who>)> = BTreeMap::new();
         for w in self.mgmt_guard_sessions() {
-            if let Some((n, i)) = connected_of(&nets, w.peer) {
-                by.entry(n).or_insert_with(|| (i, Vec::new())).1.push(w);
+            let table = locals.get(&w.id).map(|l| tables.table(*l)).unwrap_or_default();
+            if let Some((n, i)) = tables.connected_of(&table, w.peer) {
+                by.entry((table, n)).or_insert_with(|| (i, Vec::new())).1.push(w);
             }
         }
-        by.into_iter().map(|(n, (i, w))| (n, i, w)).collect()
+        by.into_iter()
+            .map(|((vrf, network), (interface, sessions))| MgmtNetwork { vrf, network, interface, sessions })
+            .collect()
     }
 
-    /// The RIB inside `net`, as last read; asks for a read when there is
-    /// none or it is old. Without a routing daemon: unavailable.
-    pub fn mgmt_guard_rib(&mut self, net: IpNet) -> RibView {
+    /// The RIB of `table` inside `net`, as last read; asks for a read when
+    /// there is none or it is old. Without a routing daemon: unavailable.
+    pub fn mgmt_guard_rib(&mut self, table: &RoutingTable, net: IpNet) -> RibView {
         if self.routing_status().is_none_or(|st| st.backend.is_empty()) {
             return RibView::Unavailable("no routing daemon attached (FRR is not running here)".into());
         }
@@ -439,13 +519,14 @@ impl Session {
         let Some(g) = self.ext_mut::<Guard>() else {
             return RibView::Pending;
         };
-        let slot = g.rib.get(&net).cloned();
+        let key = (table.clone(), net);
+        let slot = g.rib.get(&key).cloned();
         let old = slot.as_ref().is_none_or(|s| match (now, s.at) {
             (Some(n), Some(a)) => n.saturating_sub(a) >= RIB_FRESH_SECS,
             _ => false,
         });
-        if old && !g.wanted.contains(&net) && g.wanted.len() < MAX_RIB_WANTED {
-            g.wanted.push(net);
+        if old && !g.wanted.contains(&key) && g.wanted.len() < MAX_RIB_WANTED {
+            g.wanted.push(key);
         }
         match slot {
             Some(RibSlot { result: Ok(r), .. }) => RibView::Ready(r),
@@ -456,22 +537,33 @@ impl Session {
 
     /// The networks whose RIB a command asked for (the FRR thread reads
     /// them outside the lock).
-    pub fn mgmt_guard_rib_wanted(&mut self) -> Vec<IpNet> {
+    pub fn mgmt_guard_rib_wanted(&mut self) -> Vec<(RoutingTable, IpNet)> {
         self.ext_mut::<Guard>().map(|g| std::mem::take(&mut g.wanted)).unwrap_or_default()
     }
 
-    pub fn mgmt_guard_set_rib(&mut self, net: IpNet, result: Result<Vec<RibRoute>, String>) {
+    pub fn mgmt_guard_set_rib(&mut self, table: RoutingTable, net: IpNet, result: Result<Vec<RibRoute>, String>) {
         let at = self.now();
         if let Some(g) = self.ext_mut::<Guard>() {
-            if g.rib.len() >= MAX_RIB && !g.rib.contains_key(&net) {
-                let oldest = g.rib.iter().min_by_key(|(_, s)| s.at).map(|(n, _)| *n);
+            let key = (table, net);
+            if g.rib.len() >= MAX_RIB && !g.rib.contains_key(&key) {
+                let oldest = g.rib.iter().min_by_key(|(_, s)| s.at).map(|(n, _)| n.clone());
                 if let Some(o) = oldest {
                     g.rib.remove(&o);
                 }
             }
-            g.rib.insert(net, RibSlot { at, result });
+            g.rib.insert(key, RibSlot { at, result });
         }
     }
+}
+
+/// A connected network management sessions come from
+/// ([`Session::mgmt_guard_networks`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MgmtNetwork {
+    pub vrf: RoutingTable,
+    pub network: IpNet,
+    pub interface: IfName,
+    pub sessions: Vec<Who>,
 }
 
 /// The learned routes of `rib` the guard of `net` refuses (inside and
@@ -504,13 +596,15 @@ pub fn by_protocol(routes: &[RibRoute]) -> String {
 /// caller's peer? Only what was read is known: no read, no refusal.
 pub(crate) fn unguard_cut(s: &Session, before: &Config, after: &Config, link: &Link) -> Option<String> {
     let peer = plain(link.peer.ip());
-    let kept: Vec<&IpNet> = after.routing.management_guard.active().collect();
+    // The session's table, as the running config (before) puts it.
+    let table = Tables::of(before).table(plain(link.local.ip()));
+    let kept: Vec<&IpNet> = after.routing.management_guard.active_in(&table).collect();
     let g = s.ext::<Guard>()?;
-    for n in before.routing.management_guard.active() {
+    for n in before.routing.management_guard.active_in(&table) {
         if !n.contains(&peer) || kept.iter().any(|k| k.contains(&peer)) {
             continue;
         }
-        let Some(RibSlot { result: Ok(rib), .. }) = g.rib.get(n) else {
+        let Some(RibSlot { result: Ok(rib), .. }) = g.rib.get(&(table.clone(), *n)) else {
             continue;
         };
         if let Some(r) = rib
@@ -540,6 +634,7 @@ pub(crate) fn summary(s: &Session) -> Value {
             json!({
                 "peer": f.peer,
                 "route": f.route,
+                "vrf": f.vrf,
                 "protocol": f.protocol,
                 "interface": f.interface,
                 "gateway": f.gateway,
@@ -548,7 +643,7 @@ pub(crate) fn summary(s: &Session) -> Value {
                 "sessions": f.sessions,
                 "guarded": f.guarded,
                 "text": describe(f),
-                "fix": (!f.guarded).then(|| protect_command(&f.connected)),
+                "fix": (!f.guarded).then(|| protect_command(&f.vrf, &f.connected)),
             })
         })
         .collect();
@@ -594,9 +689,9 @@ pub(crate) mod tests {
         }
     }
 
-    fn feed(s: &mut Session, answer: impl Fn(IpAddr) -> FibEntry) {
-        let pairs = s.mgmt_guard_probes();
-        let answers = pairs.into_iter().map(|p| (p, Ok(answer(p.0)))).collect();
+    pub(crate) fn feed(s: &mut Session, answer: impl Fn(IpAddr) -> FibEntry) {
+        let probes = s.mgmt_guard_probes();
+        let answers = probes.into_iter().map(|p| (p.pair(), Ok(answer(p.peer)))).collect();
         s.mgmt_guard_feed(answers);
     }
 
@@ -690,6 +785,63 @@ pub(crate) mod tests {
         feed(&mut s, |_| learned("192.168.0.2/32", 188));
         assert!(s.mgmt_guard_findings()[0].guarded);
         assert!(summary(&s)[0]["fix"].is_null());
+    }
+
+    /// G3.4za: ether3 in VRF `mgmt` with 10.99.0.1/24, and the same
+    /// 192.168.0.0/24 as ether1's (overlapping: another network) on ether4,
+    /// also in the VRF.
+    pub(crate) fn vrf_lab() -> Session {
+        let mut s = lab();
+        s.execute("ip.vrf.add", &json!({"name": "mgmt", "interfaces": "ether3,ether4"})).unwrap();
+        s.execute("ip.address.add", &json!({"address": "10.99.0.1/24", "interface": "ether3"})).unwrap();
+        s
+    }
+
+    pub(crate) fn vrf_operator(id: u64, peer: &str) -> Caller {
+        let mut c = operator(id, peer, "GUI");
+        c.link = Some(Link { peer: format!("{peer}:50000").parse().unwrap(), local: "10.99.0.1:8729".parse().unwrap() });
+        c
+    }
+
+    #[test]
+    fn a_session_in_a_vrf_is_looked_up_and_judged_in_its_table() {
+        let mut s = vrf_lab();
+        s.execute_as(&vrf_operator(7, "10.99.0.2"), "system.identity.get", &json!({})).unwrap();
+        s.execute_as(&operator(8, "192.168.0.2", "GUI"), "system.identity.get", &json!({})).unwrap();
+        let mut probes = s.mgmt_guard_probes();
+        probes.sort_by_key(|p| p.peer);
+        assert_eq!(probes[0].vrf.as_ref().map(|v| v.as_str()), Some("mgmt"), "{probes:?}");
+        assert_eq!(probes[1].vrf, None, "main: no output device");
+        feed(&mut s, |peer| learned(&format!("{peer}/32"), 186));
+        let f = s.mgmt_guard_findings();
+        let v = f.iter().find(|f| f.peer.to_string() == "10.99.0.2").unwrap();
+        assert_eq!((v.vrf.to_string().as_str(), v.connected.to_string().as_str(), v.connected_interface.as_str(), v.protocol), ("mgmt", "10.99.0.0/24", "ether3", "bgp"));
+        assert!(describe(v).contains("de ether3 (VRF mgmt)"), "{}", describe(v));
+        assert_eq!(summary(&s).as_array().unwrap().iter().find(|r| r["vrf"] == "mgmt").unwrap()["fix"], "routing.management-guard.add {\"network\":\"10.99.0.0/24\",\"vrf\":\"mgmt\"}");
+        // A main guard of the same prefix does not protect the VRF one.
+        s.execute("routing.management-guard.add", &json!({"network": "10.99.0.0/24", "vrf": "main"})).unwrap();
+        assert!(!s.mgmt_guard_findings().iter().find(|f| f.vrf.to_string() == "mgmt").unwrap().guarded);
+        s.execute("routing.management-guard.add", &json!({"network": "10.99.0.0/24", "vrf": "mgmt"})).unwrap();
+        assert!(s.mgmt_guard_findings().iter().find(|f| f.vrf.to_string() == "mgmt").unwrap().guarded);
+        // The networks of the sessions, each in its table.
+        let nets: Vec<String> = s.mgmt_guard_networks().iter().map(|m| format!("{} {}", m.vrf, m.network)).collect();
+        assert_eq!(nets, ["main 192.168.0.0/24", "mgmt 10.99.0.0/24"]);
+    }
+
+    #[test]
+    fn the_same_prefix_in_a_vrf_is_another_network() {
+        let mut s = vrf_lab();
+        s.execute("ip.address.add", &json!({"address": "192.168.0.1/24", "interface": "ether4"})).unwrap();
+        // A main session: its connected network is ether1's.
+        s.execute_as(&operator(8, "192.168.0.2", "GUI"), "system.identity.get", &json!({})).unwrap();
+        feed(&mut s, |_| learned("192.168.0.2/32", 188));
+        let f = s.mgmt_guard_findings();
+        assert_eq!(f.len(), 1);
+        // The first configured address wins the local lookup (ether1, main).
+        assert_eq!((f[0].vrf.to_string().as_str(), f[0].connected_interface.as_str()), ("main", "ether1"));
+        // A VRF guard of the same prefix does not count for main.
+        s.execute("routing.management-guard.add", &json!({"network": "192.168.0.0/24", "vrf": "mgmt"})).unwrap();
+        assert!(!s.mgmt_guard_findings()[0].guarded);
     }
 
     #[test]

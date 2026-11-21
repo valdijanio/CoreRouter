@@ -48,6 +48,34 @@ pub fn frr_wanted(text: &str) -> Vec<&'static str> {
         .filter(|d| FRR_ALWAYS.contains(d) || listed.contains(d))
         .collect()
 }
+/// G1.6zz: `oom_score_adj` of the daemon. On an OOM the kernel kills the
+/// task with the most points, `rss + swap + page tables` plus `adj ×
+/// totalpages / 1000` (`oom_badness`, mm/oom_kill.c; proc.rst §3.1): −900
+/// takes 90 % of the memory off the daemon's count, so a leaking `bgpd` or
+/// a runaway tool goes first and the management plane stays. Not −1000:
+/// a daemon that leaks itself must still be killable (init restarts it);
+/// with nothing killable the kernel panics ("System is deadlocked on
+/// memory", `out_of_memory`). The kernel copies the value to every child
+/// (kernel/fork.c), so the daemon puts its long-lived helpers back to 0
+/// (hal-linux `oom`).
+pub const DAEMON_OOM_SCORE_ADJ: i32 = -900;
+
+/// G1.6zz: `oom_score_adj` of each FRR daemon, below the daemon's
+/// protection and in the order they should die in: `bgpd` first (0: it
+/// holds the full tables and is the likeliest to grow; Graceful Restart
+/// covers its restart), then the IGP and LDP, `staticd` (−300), `bfdd`
+/// (−600: small, and its death drops every BFD client at once), `zebra`
+/// and `mgmtd` (−700: without them no daemon reaches the kernel or its
+/// configuration). FRR itself sets none (its `frr.service` neither).
+pub fn frr_oom_score_adj(daemon: &str) -> i32 {
+    match daemon {
+        "zebra" | "mgmtd" => -700,
+        "bfdd" => -600,
+        "staticd" | "ospfd" | "ospf6d" | "ldpd" => -300,
+        _ => 0,
+    }
+}
+
 /// Where the FRR daemons are installed.
 pub const FRR_SBIN: &str = "/usr/sbin";
 /// Marks that the installer's management address (`corerouter.mgmt=`) was
@@ -1299,5 +1327,19 @@ mod tests {
         assert_eq!(port_index("ether0"), 0);
         assert_eq!(port_index("eth2"), 0);
         assert_eq!(port_index("ether999999999999999999999"), 0);
+    }
+
+    /// G1.6zz: the daemon is the most protected, nothing is unkillable,
+    /// and the FRR daemons die in the planned order.
+    #[test]
+    fn oom_score_adj_order() {
+        let adj = frr_oom_score_adj;
+        const { assert!(DAEMON_OOM_SCORE_ADJ > -1000) };
+        for d in FRR_DAEMONS {
+            assert!(adj(d) > DAEMON_OOM_SCORE_ADJ && adj(d) <= 0, "{d}");
+        }
+        assert_eq!(adj("bgpd"), 0);
+        assert!(adj("bgpd") > adj("ospfd") && adj("ospfd") > adj("bfdd"));
+        assert!(adj("bfdd") > adj("zebra") && adj("zebra") == adj("mgmtd"));
     }
 }

@@ -26,53 +26,98 @@
 
 use std::fmt::Write as _;
 
-use corerouter_model::Config;
 use corerouter_model::mgmt_guard::RibRoute;
+use corerouter_model::{Config, RoutingTable};
 use ipnet::IpNet;
 use serde_json::Value;
 
-/// The route-map and prefix-list names, per family.
+/// The route-map and prefix-list names of the main table, per family.
 pub const V4: &str = "CR-MG-4";
 pub const V6: &str = "CR-MG-6";
 
 /// Most routes read from one guarded network's RIB.
 pub const MAX_RIB_ROUTES: usize = 10_000;
 
+/// The route-map (and prefix-list) name of a family in `table`: `CR-MG-4`
+/// in main (as G3.4z typed it: a router that has it keeps it), `CR-MG-4-<vrf>`
+/// in a VRF (a VRF name follows interface-name rules, 15 characters of
+/// `A-Z a-z 0-9 - _ .`, all valid in an FRR map name).
+pub fn map_name(v6: bool, table: &RoutingTable) -> String {
+    let base = if v6 { V6 } else { V4 };
+    match table {
+        RoutingTable::Main => base.to_owned(),
+        RoutingTable::Vrf(v) => format!("{base}-{v}"),
+    }
+}
+
 /// The FRR text of `cfg`'s guard (empty when nothing is active).
+///
+/// G3.4za: a VRF's networks get their own prefix-list and route-map, and
+/// the `ip protocol` line inside zebra's `vrf <name>` context
+/// (`zebra/zebra_cli.c:3380` in FRR 10.7.1 installs `ip protocol` in
+/// `VRF_NODE`; it writes `filter-protocol` of that VRF, read by
+/// `zebra_route_map_check` with the route's own `vrf_id`). Only routes of
+/// that VRF are checked against it.
 pub fn render(cfg: &Config) -> String {
+    let guard = &cfg.routing.management_guard;
     let mut out = String::new();
-    for (v6, name, ip) in [(false, V4, "ip"), (true, V6, "ipv6")] {
-        let nets: Vec<&IpNet> = cfg
-            .routing
-            .management_guard
-            .active()
-            .filter(|n| n.addr().is_ipv6() == v6 && n.prefix_len() < n.max_prefix_len())
-            .collect();
-        if nets.is_empty() {
-            continue;
-        }
-        for (i, n) in nets.iter().enumerate() {
-            let _ = writeln!(
+    let mut vrf_lines: Vec<(String, String)> = Vec::new();
+    for table in guard.tables() {
+        for (v6, ip) in [(false, "ip"), (true, "ipv6")] {
+            let nets: Vec<&IpNet> = guard
+                .active_in(table)
+                .filter(|n| n.addr().is_ipv6() == v6 && n.prefix_len() < n.max_prefix_len())
+                .collect();
+            if nets.is_empty() {
+                continue;
+            }
+            let name = map_name(v6, table);
+            for (i, n) in nets.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "{ip} prefix-list {name} seq {} permit {n} ge {}",
+                    (i + 1) * 5,
+                    n.prefix_len() + 1
+                );
+            }
+            let _ = write!(
                 out,
-                "{ip} prefix-list {name} seq {} permit {n} ge {}",
-                (i + 1) * 5,
-                n.prefix_len() + 1
+                "route-map {name} deny 10\n match {ip} address prefix-list {name}\nexit\n\
+                 route-map {name} permit 65535\nexit\n"
             );
+            let line = format!("{ip} protocol any route-map {name}");
+            match table {
+                RoutingTable::Main => {
+                    let _ = writeln!(out, "{line}");
+                }
+                RoutingTable::Vrf(v) => vrf_lines.push((v.to_string(), line)),
+            }
         }
-        let _ = write!(
-            out,
-            "route-map {name} deny 10\n match {ip} address prefix-list {name}\nexit\n\
-             route-map {name} permit 65535\nexit\n\
-             {ip} protocol any route-map {name}\n"
-        );
+    }
+    let mut last: Option<&str> = None;
+    for (vrf, line) in &vrf_lines {
+        if last != Some(vrf.as_str()) {
+            if last.is_some() {
+                out.push_str("exit\n");
+            }
+            let _ = writeln!(out, "vrf {vrf}");
+            last = Some(vrf.as_str());
+        }
+        let _ = writeln!(out, " {line}");
+    }
+    if last.is_some() {
+        out.push_str("exit\n");
     }
     out
 }
 
-/// The zebra command that lists `net` and what is inside it.
-pub fn rib_command(net: &IpNet) -> String {
+/// The zebra command that lists `net` and what is inside it, in `table`.
+pub fn rib_command(table: &RoutingTable, net: &IpNet) -> String {
     let ip = if net.addr().is_ipv4() { "ip" } else { "ipv6" };
-    format!("show {ip} route {net} longer-prefixes json")
+    match table {
+        RoutingTable::Main => format!("show {ip} route {net} longer-prefixes json"),
+        RoutingTable::Vrf(v) => format!("show {ip} route vrf {v} {net} longer-prefixes json"),
+    }
 }
 
 /// zebra's `show ip route … json`: `{prefix: [route, …]}`, each route with
@@ -135,16 +180,114 @@ mod tests {
     use corerouter_model::mgmt_guard::GuardNetwork;
 
     fn guard(nets: &[(&str, bool)]) -> Config {
+        guard_in(
+            &nets
+                .iter()
+                .map(|(n, d)| (*n, *d, "main"))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn guard_in(nets: &[(&str, bool, &str)]) -> Config {
         let mut c = Config::default();
-        for (i, (n, disabled)) in nets.iter().enumerate() {
+        for (i, (n, disabled, vrf)) in nets.iter().enumerate() {
             c.routing.management_guard.networks.push(GuardNetwork {
                 id: ItemId(i as u32 + 1),
                 network: n.parse().unwrap(),
+                vrf: vrf.parse().unwrap(),
                 disabled: *disabled,
                 comment: String::new(),
             });
         }
         c
+    }
+
+    #[test]
+    fn a_vrf_network_gets_its_own_map_inside_the_vrf_context() {
+        let text = render(&guard_in(&[
+            ("192.168.0.0/24", false, "main"),
+            ("10.99.0.0/24", false, "mgmt"),
+            ("2001:db8:9::/64", false, "mgmt"),
+            ("10.98.0.0/24", false, "oob"),
+            ("10.97.0.0/24", true, "oob"),
+        ]));
+        assert_eq!(
+            text,
+            "ip prefix-list CR-MG-4 seq 5 permit 192.168.0.0/24 ge 25\n\
+             route-map CR-MG-4 deny 10\n match ip address prefix-list CR-MG-4\nexit\n\
+             route-map CR-MG-4 permit 65535\nexit\n\
+             ip protocol any route-map CR-MG-4\n\
+             ip prefix-list CR-MG-4-mgmt seq 5 permit 10.99.0.0/24 ge 25\n\
+             route-map CR-MG-4-mgmt deny 10\n match ip address prefix-list CR-MG-4-mgmt\nexit\n\
+             route-map CR-MG-4-mgmt permit 65535\nexit\n\
+             ipv6 prefix-list CR-MG-6-mgmt seq 5 permit 2001:db8:9::/64 ge 65\n\
+             route-map CR-MG-6-mgmt deny 10\n match ipv6 address prefix-list CR-MG-6-mgmt\nexit\n\
+             route-map CR-MG-6-mgmt permit 65535\nexit\n\
+             ip prefix-list CR-MG-4-oob seq 5 permit 10.98.0.0/24 ge 25\n\
+             route-map CR-MG-4-oob deny 10\n match ip address prefix-list CR-MG-4-oob\nexit\n\
+             route-map CR-MG-4-oob permit 65535\nexit\n\
+             vrf mgmt\n ip protocol any route-map CR-MG-4-mgmt\n ipv6 protocol any route-map CR-MG-6-mgmt\nexit\n\
+             vrf oob\n ip protocol any route-map CR-MG-4-oob\nexit\n"
+        );
+        // All of it to mgmtd; the VRF contexts hold only the guard's lines.
+        let conf = crate::conf::Conf::parse(&text).unwrap();
+        let by = crate::render::by_daemon(crate::render::OWNED, &conf);
+        assert_eq!(by.len(), 1, "{by:?}");
+        assert_eq!(by[0].0, crate::render::Daemon::Mgmtd);
+        let vrfs: Vec<_> = by[0]
+            .1
+            .nodes
+            .iter()
+            .filter(|n| n.line.starts_with("vrf "))
+            .collect();
+        assert_eq!(vrfs.len(), 2);
+        assert_eq!(vrfs[0].children.len(), 2);
+        assert_eq!(
+            rib_command(&"mgmt".parse().unwrap(), &"10.99.0.0/24".parse().unwrap()),
+            "show ip route vrf mgmt 10.99.0.0/24 longer-prefixes json"
+        );
+        assert_eq!(
+            rib_command(&RoutingTable::Main, &"2001:db8::/64".parse().unwrap()),
+            "show ipv6 route 2001:db8::/64 longer-prefixes json"
+        );
+    }
+
+    #[test]
+    fn the_vrf_context_as_frr_prints_it_keeps_only_the_guard_lines() {
+        // mgmtd's running config of a VRF the operator also gave a VNI.
+        let running = crate::conf::Conf::parse(
+            "vrf mgmt\n vni 100\n ip protocol any route-map CR-MG-4-mgmt\n ip protocol ospf route-map OPERATOR\nexit-vrf\n\
+             vrf blue\n vni 200\nexit-vrf\n",
+        )
+        .unwrap();
+        let mine: Vec<_> = running
+            .owned(|l| {
+                crate::render::daemons_of(crate::render::OWNED, l)
+                    .contains(&crate::render::Daemon::Mgmtd)
+            })
+            .nodes
+            .iter()
+            .filter_map(|n| crate::render::part_of(crate::render::Daemon::Mgmtd, n))
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "a VRF without guard lines is not ours: {mine:?}"
+        );
+        assert_eq!(mine[0].children.len(), 1, "{mine:?}");
+        // Taking the guard away deletes the line and leaves the VRF.
+        let old = crate::conf::Conf { nodes: mine };
+        let new = crate::conf::Conf::parse(&render(&guard(&[]))).unwrap();
+        let script = crate::conf::diff(&old, &new);
+        assert_eq!(
+            script,
+            [
+                "vrf mgmt",
+                " no ip protocol any route-map CR-MG-4-mgmt",
+                "exit"
+            ],
+            "{script:?}"
+        );
     }
 
     #[test]

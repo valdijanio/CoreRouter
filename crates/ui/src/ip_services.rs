@@ -44,6 +44,7 @@ const FIELDS: &[Field] = &[
     Field { param: "address", label: "Address", help: "ip_services.address", input: Input::Text(":: (every address)"), edit: true },
     Field { param: "port", label: "Port", help: "ip_services.port", input: Input::Text("443"), edit: true },
     Field { param: "available_from", label: "Available From", help: "ip_services.available_from", input: Input::Text("192.0.2.0/24, 2001:db8::/32"), edit: true },
+    Field { param: "vrf", label: "VRF", help: "ip_services.vrf", input: Input::Choice, edit: true },
 ];
 
 /// `www-ssl` also picks its certificate (G1.6zs).
@@ -52,6 +53,7 @@ const FIELDS_SSL: &[Field] = &[
     Field { param: "address", label: "Address", help: "ip_services.address", input: Input::Text(":: (every address)"), edit: true },
     Field { param: "port", label: "Port", help: "ip_services.port", input: Input::Text("443"), edit: true },
     Field { param: "available_from", label: "Available From", help: "ip_services.available_from", input: Input::Text("192.0.2.0/24, 2001:db8::/32"), edit: true },
+    Field { param: "vrf", label: "VRF", help: "ip_services.vrf", input: Input::Choice, edit: true },
     Field { param: "certificate", label: "Certificate", help: "ip_services.certificate", input: Input::Choice, edit: true },
 ];
 
@@ -67,11 +69,12 @@ const SPEC: Spec = Spec {
     preview: "ip.service.check",
 };
 
-const COLUMNS: [table::Column; 8] = [
+const COLUMNS: [table::Column; 9] = [
     col("Name").help("ip_services.name"),
     col("Status").help("ip_services.status"),
     col("Address").help("ip_services.address"),
     num("Port").help("ip_services.port"),
+    col("VRF").help("ip_services.vrf"),
     col("Available From").help("ip_services.available_from"),
     col("Certificate").help("ip_services.certificate"),
     num("Refused").help("ip_services.refused"),
@@ -135,6 +138,7 @@ pub(crate) fn row(r: &Value, l: crate::i18n::Lang) -> Row {
             cell("", &[(status.as_str(), status_kind(&status))]),
             address_text(r),
             s(r, "port"),
+            vrf_cell(&s(r, "vrf")),
             if from.is_empty() { tr_in(SCOPE, l, "everyone").to_owned() } else { from },
             // G1.6zs: only `www-ssl` has one; `none` is the router's own.
             match r.get("certificate").and_then(Value::as_str) {
@@ -151,12 +155,22 @@ pub(crate) fn row(r: &Value, l: crate::i18n::Lang) -> Row {
     }
 }
 
+/// G3.4zb: a VRF as a chip coloured by its name; `main` as plain text.
+fn vrf_cell(vrf: &str) -> String {
+    if vrf.is_empty() || vrf == "main" {
+        "main".to_owned()
+    } else {
+        cell("", &[(vrf, Kind::Hashed(crate::chip::name_hue(vrf)))])
+    }
+}
+
 fn values_of(r: &Value) -> BTreeMap<&'static str, String> {
     let mut v = BTreeMap::from([
         ("enabled", if flag(r, "enabled") { "yes" } else { "no" }.to_owned()),
         ("address", s(r, "address")),
         ("port", s(r, "port")),
         ("available_from", from_list(r)),
+        ("vrf", s(r, "vrf")),
     ]);
     if r.get("certificate").is_some() {
         v.insert("certificate", s(r, "certificate"));
@@ -329,7 +343,15 @@ impl PanelState for ServicesPanel {
 
     fn dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
         let certs = self.certificates.clone();
-        let options = move |param: &str| if param == "certificate" { certs.clone() } else { Vec::new() };
+        // G3.4zb: main and the VRFs.
+        let vrfs: Vec<String> = std::iter::once("main".to_owned())
+            .chain(app.cache.vrfs.iter().map(|r| s(r, "name")).filter(|n| !n.is_empty()))
+            .collect();
+        let options = move |param: &str| match param {
+            "certificate" => certs.clone(),
+            "vrf" => vrfs.clone(),
+            _ => Vec::new(),
+        };
         if let Some(m) = &mut self.modal {
             let spec = if m.item.as_deref() == Some("www-ssl") { &SPEC_SSL } else { &SPEC };
             if !m.show(app, ctx, area, spec, &options) {

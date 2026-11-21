@@ -13040,3 +13040,627 @@ continuação indentadas).
   existente (`qemu-img resize` + retirar o snapshot `tools`, porque voltar a um snapshot devolve o
   tamanho dele, **medido**). Testar: `cargo test -p xtask vm_lab` (tabela da decisão, `classify`,
   `round_of_ssh`, a limpeza num `/srv/lab` falso, `live_rounds` com um `ssh` falso).
+
+- 2026-11-21 — G0.11: Canal local por socket Unix (Linux). O daemon e a GUI com `--control` servem
+  `control-<porta>.sock` na pasta do token local (diretório 0700, socket 0600). O kernel informa o
+  uid e o pid de quem conecta (`SO_PEERCRED`). O usuário do sistema que roda o roteador e o root
+  agem como o token local sem arquivo nenhum; outro uid é recusado antes de qualquer pedido, com o
+  motivo, e não ocupa vaga. No socket: até 32 conexões, 24 por uid; pedido com token (login
+  `--user`) age como o token. `dial` (CLI, MCP, GUI) prefere o socket para alvo de loopback,
+  confere o uid de quem o serve e volta ao TCP com token se faltar; `COREROUTER_NO_UNIX_SOCKET=1`
+  força o TCP. O socket some quando o daemon sai; um socket velho é substituído pelo roteador mais
+  novo, como o arquivo de token. Conferido com os binários: daemon numa porta de loopback com pasta
+  própria, token apagado, `corerouter-cli run ip.address.add` entrou pelo socket; forçada ao TCP, a
+  CLI foi recusada por falta de token; `corerouter-cli mcp` rodou `user.active.list`; a GUI
+  (`--connect 127.0.0.1:<porta> --control`) gerenciou o daemon como `user: local (full)` e o
+  `screenshot` saiu pelo socket da própria GUI. Dois uids (root e `nobody`) na VM do laboratório:
+  `tests/unix_socket_root.rs`.
+
+- 2026-11-21 — G0.12: Força bruta distribuída contra um nome de usuário no canal de controle. Um nome com 10 falhas de
+  3 origens distintas (endereço IPv4 ou /64 IPv6) em 15 min fica bloqueado para login pela rede por
+  1 min, o dobro a cada novo bloqueio em 24 h, no máximo 30 min. A tentativa que chega ao limite e
+  as seguintes são recusadas antes do Argon2, mesmo com a senha certa. Ficam fora do bloqueio o
+  loopback, o token local e as origens conhecidas do usuário (de onde ele entrou nas últimas 24 h,
+  até 16; as falhas delas não contam). Comandos novos `user.lockout.list` e `user.lockout.clear
+  {user?}` (grupo `full`; Junos `clear system login lockout`), linha `system,account,warning` no log
+  do roteador a cada bloqueio, com as origens. Estado em `crates/control/src/lockout.rs`; o engine
+  só vê o trait `LoginLockouts` (`crates/engine/src/login_lockout.rs`), registrado pelo daemon
+  para os dois portões. Conferido no daemon real num namespace: 10 tentativas erradas de
+  10.9.0.2–4 por TLS bloquearam o `admin`; de 10.9.0.5 a senha certa foi recusada, por loopback
+  TLS entrou; `user.lockout.list` pelo token local mostrou o bloqueio; `user.lockout.clear` liberou.
+  Custo por login: uma busca no mapa e uma varredura de até 32 origens e 16 conhecidas, sob o lock
+  que a contagem por origem já toma; não cresce com usuários nem origens (tabela limitada a 1024
+  nomes; ~30 µs por nome novo com a tabela cheia, **estimado** pelo tempo do teste `the_table_stays_bounded_and_keeps_locked_names` em build de teste: 3072 nomes em 97 ms).
+
+- 2026-11-21 — G0.13: Prazos no relógio monotônico. O que mudou:
+
+  - `Session::steady_now` é o `Hal::monotonic_secs` quando a plataforma tem um, senão o relógio de
+    parede, como antes. Passam a usá-lo o abandono de tarefas (`tasks.rs`) e os timeouts das
+    entradas dinâmicas de address-list: comando, DHCP, PPP, aviso ao assinante, DNS e a checagem
+    de lockout.
+  - Os leases DHCP vão ao journal como hora Unix e por isso ficam no relógio de parede. Em vez de
+    trocar o relógio, o engine detecta o passo (o de parede andou diferente do monotônico entre
+    duas rodadas, 5 s ou mais) e chama `Server::clock_step`/`Server6::clock_step` no
+    `proto-dhcp`, que desloca o fim, o último contato, os alertas e as estatísticas. Cada lease
+    mantém o tempo que faltava, e o journal é regravado com as horas novas.
+  - Cada passo vira uma linha `system,clock,warning` no log do roteador.
+  - A ociosidade de login do canal de controle já usava `Instant` (`CLOCK_MONOTONIC` no std do
+    Linux) desde a G0.3; não mudou.
+  - O daemon com `--backend virtual` ganhou relógio monotônico (`VirtualHal::with_monotonic`), como
+    o `hal-linux`.
+
+  Testes com passo para frente (56 anos) e para trás (até 1970), mais passos pequenos:
+  `tasks::tests::abandonment_follows_the_monotonic_clock`, `clock_steps::*` (address-list e
+  leases DHCP com o journal regravado) e `a_clock_step_keeps_the_time_left` no `proto-dhcp` (v4 e
+  v6). Sem a correção, os testes de address-list e de DHCP falham no primeiro passo (conferido).
+  Laboratório com o daemon real, a placa Linux num netns e `date -s` na VM:
+  `scripts/clock-step-lab.sh`.
+
+- 2026-11-21 — G0.26c: Segunda VM de laboratório. O `cargo xtask vm-lab` aceita duas VMs, cada uma com disco, seed,
+  chave SSH, snapshots, `health.lock` e `root.lock` próprios (os da VM 2 em
+  `vm/corerouter-lab2/`; os da VM 1 continuam onde estavam, então uma worktree com `vm_lab.rs`
+  antigo segue funcionando na VM 1).
+
+  - **Para que serve cada uma:** a `corerouter-lab` (VM 1, 8 vCPU, 16 GiB) é das medições e a
+    `corerouter-lab2` (VM 2, 4 vCPU, 6 GiB) dos testes de funcionamento. A VM 2 tem 6 GiB, e não 8,
+    porque o host tinha 22,7 GB disponíveis e 19,5 GB de swap em uso (**medido**).
+  - **Escolha:** o `vm-lab run` sem `--vm` usa a VM livre, preferindo a 2; com as duas ocupadas,
+    vai para a que tem menos rodadas; `--perf` pede a 1. Uma rodada conta para a VM pelo
+    `HostKeyAlias` do ssh dela.
+  - **Opções novas:**
+    - `--vm 1|2` (ou `$COREROUTER_VM_LAB`) em qualquer subcomando;
+    - `status` e `unlock` sem `--vm` mostram as duas VMs (o `status` traz o mapa de CPUs);
+    - `vm-lab pick` imprime a VM que um `run` pegaria agora. Os roteiros que fazem `put`/`ssh`
+      antes do `run` passam a fixar a VM: `wifi-bond-lab.sh`, `hostap-hwsim.sh` e
+      `frr-topotests.sh` com `pick`; `dns-stress-lab.sh` e `ospf-stress-lab.sh` (medições) na 1.
+  - **`create --from 1`:** cria a VM 2 copiando o snapshot `tools` da VM 1
+    (`qemu-img convert -U -l snapshot.name=tools`, só leitura, com a VM 1 ligada), com seed,
+    MACs, portas e chave de host novos. Pronta em 75 s, 5 GiB no host (**medido**). As
+    ferramentas de terceiros vêm junto, sem nova instalação do usuário. Os três pacotes que faltavam
+    nas duas VMs (`qemu-system-x86`, `unzip`, `traceroute`, do interop com o CHR) foram instalados
+    a pedido do usuário; o snapshot `tools` das duas tem as 14 ferramentas.
+  - **CPUs por VM (`cputune`):**
+    - a VM 1 tem o CCD1 só para ela: vCPU i na CPU 8+i, um núcleo físico por vCPU, e o QEMU nas
+      irmãs SMT 24–31;
+    - a VM 2 fica nas CPUs 4–7 (QEMU em 20–23);
+    - o runner do CI fica em 0–7 e 16–23, com o sim do usuário em 2026-11-20 (`ci_runner.rs`
+      também grava o mapa no `create`);
+    - o `vm-lab pin` aplica o mapa ao vivo (`virsh vcpupin/emulatorpin --live --config`), sem
+      reiniciar; foi aplicado nas três VMs em 2026-11-20.
+  - **Docs e regras:** `docs/vm-lab.md` ganhou a seção "Duas VMs"; a regra do
+    `CLAUDE.md`/`AGENTS.md` virou "São duas VMs: ocupe-as pouco".
+
+  Como testar:
+  - `cargo test -p xtask vm_lab` (34 testes; os novos cobrem parse de `--vm`/`--perf`/env, a
+    escolha da VM, as travas e rodadas por VM, MACs e portas sem colisão, o mapa sem CPU
+    compartilhada com a VM 1, o `pin` e os caminhos por VM);
+  - `cargo xtask vm-lab status`;
+  - duas rodadas juntas:
+    `cargo xtask vm-lab run -- cargo test -p corerouter-hal-linux --test netns_address` e, ao
+    mesmo tempo, o mesmo com `--test netns_l2`.
+
+  Conferido em 2026-11-20 (**medido**):
+  - duas rodadas sem `--vm`, a segunda iniciada 20 s depois da primeira: a primeira caiu na VM 2
+    e a segunda, com a VM 2 ocupada, na VM 1 ("corerouter-lab2 1 round(s)"); as duas verdes
+    (`netns_address` e `netns_neigh` na 2; `netns_l2` e `netns_nic` na 1), com 40 s e 34 s de
+    compilação a frio;
+  - a VM 2 compilando em release não mudou a medição na VM 1 de forma visível. Números e
+    método em `## perf`.
+
+- 2026-11-21 — G0.26d: Medição silenciosa. Enquanto uma rodada `cargo xtask vm-lab run --perf` segura a trava da VM 1,
+  os processos do usuário no host (os `cargo`/`rustc` das outras sessões, o app, o desktop) saem
+  das CPUs da VM 1 (8–15 e 24–31) e voltam no fim. Não precisa de root (afinidade dos próprios
+  processos com `taskset`) e não muda configuração do sistema. O usuário escolheu essa opção em
+  vez de `AllowedCPUs` no `user.slice`, que exigiria root e deixaria o host com metade das CPUs o
+  tempo todo.
+
+  - **Só na medição:** só a rodada `--perf` exclusiva na VM 1, e só depois de pegar a trava. A
+    espera pela trava e o `--shared --perf` não mexem em nada. `--no-quiet` ou
+    `$COREROUTER_VM_QUIET=0` desligam.
+  - **Ordem:** o script da rodada avisa quando pega a trava, e o host faz a primeira varredura
+    (0,2–1,2 s para ~300 processos, **medido**). Depois cria um arquivo na VM; a rodada só começa o
+    comando quando ele aparece, esperando no máximo 15 s. Sem essa espera, a 1ª repetição de cada
+    bloco saía 1149–1433 ms contra ~860 (**medido**).
+  - **Durante:** a thread `vm-lab-quiet` varre o `/proc` a cada 2 s. No fim, cada processo recebe a
+    máscara que tinha; quem nasceu durante a rodada com a máscara reduzida ganha todas as CPUs.
+  - **Se o `run` morrer:** fica o estado em `vm/quiet.state`, e o próximo comando `vm-lab` devolve
+    tudo. Conferido com `kill -9` no meio da rodada: 310 processos devolvidos, nenhum preso
+    (**medido**).
+  - **O `status`** mostra a linha `quiet:` enquanto dura.
+  - **Docs:** `docs/vm-lab.md` ganhou a seção "Medição silenciosa"; a regra do
+    `CLAUDE.md`/`AGENTS.md` diz que a rodada `--perf` é só a medição (compilar antes com
+    `--shared --perf`).
+
+  Como testar:
+  - `cargo test -p xtask vm_lab`: 41 testes. Os de `quiet.rs` cobrem a lista de CPUs, a máscara,
+    o `/proc/<pid>/status`, o arquivo de estado, a regra de devolução, a marca entre pedaços do
+    stderr e um processo filho de verdade que sai de uma CPU e volta.
+  - Ao vivo:
+    1. `sleep 300 &`;
+    2. `cargo xtask vm-lab run --perf -- 'sleep 8'`;
+    3. `grep Cpus_allowed_list /proc/<pid do sleep>/status` antes, durante e depois:
+       `0-31`, depois `0-7,16-23`, depois `0-31`.
+
+- 2026-11-21 — G0.30f: `netns_icmp::udp_and_tcp_probes_walk_the_path`. O sintoma registrado na gap (`Reached("rst")` em
+  vez de `Reached("syn-ack")`, 2026-11-09) vinha do ouvinte TCP do teste, que ainda não escutava;
+  o #603 (2026-11-11) passou a esperar o "ready" dele e desligou o DAD do laboratório, e ele não
+  voltou. Na fila de 2026-11-21 (run 44843458759) a falha foi outra: o `send` de uma sonda devolveu
+  `Io("Cannot assign requested address (os error 99)")`.
+
+  Não reproduzido (**medido**, 2026-11-21, binário preso em 2 CPUs com 6 laços ocupados): 0 de 40
+  rodadas isoladas, 0 de 64 com 8 cópias em paralelo e 0 de 120 com 30 cópias em paralelo.
+  Descartado pelo fonte do kernel (`net/ipv6/addrconf.c` do master): endereço `tentative` sem
+  origem possível, porque o `nodad` nunca põe `IFA_F_TENTATIVE` (`ipv6_add_addr`). Hipótese que
+  sobra: o `connect` TCP do modo Paris (porta de origem fixa) achar a quádrupla ainda na tabela
+  (`__inet_hash_connect` → `EADDRNOTAVAIL`), sem caminho achado no `trace.rs` que deixe um socket
+  vivo ou em TIME_WAIT com ela.
+
+  - O `ask` do teste, quando o envio falha, diz o `Probe`, o erro e a saída de `ss -tanu` do
+    namespace (até 4 000 caracteres); `#[track_caller]` aponta a linha do caso. A próxima falha na
+    fila mostra se havia um socket na mesma quádrupla.
+
+- 2026-11-21 — G0.30k: Regressão noturna, parte a. Toda noite (06:17 UTC), na `main`, o job `regression` do
+  `nightly.yml` roda no runner próprio (`[self-hosted, corerouter]`):
+
+  - `scripts/nightly-regress.sh` compila o release, baixa sem root as ferramentas do laboratório de
+    DNS dos pacotes assinados do Ubuntu (`apt-get download` + `dpkg-deb -x`, guardadas no disco de
+    cache) e roda `dns-stress-lab.sh --userns --tests qps,hostile,ops --duration 10`;
+  - o `dns-stress-lab.sh` grava `metrics.jsonl` (helper `metric`): vazão na saturação e p99 na
+    metade da carga de cada cenário do `qps`, p99 de cada comando do `ops` com carga, RSS do daemon
+    depois de cada teste;
+  - `cargo xtask nightly compare` compara cada métrica com a última noite verde da branch
+    `nightly-data`. A margem é calibrada por métrica pelo ruído entre noites verdes seguidas (cerca
+    superior `Q3 + 3 × IQR` das variações das últimas 30, como o rustc-perf faz; nunca abaixo de
+    3 %). Com menos de 5 variações a métrica ainda calibra: passar de 15 % aparece no relatório sem
+    deixar a noite vermelha. Duas rodadas seguidas do mesmo build no host carregado da noite
+    (carga 60–80 em 32 núcleos) diferiram até 23× num p99 e 47 % em vazão (**medido**): uma margem
+    fixa daria alarme falso;
+  - piorou além da margem: abre ou comenta a issue "Regressão noturna" com as métricas, os dois
+    valores, a margem e os commits desde a última noite verde; uma noite de volta ao nível a fecha.
+    Laboratório que falha: a noite não conta e o `alert` abre "CI noturno quebrado". Nível novo
+    esperado: rodar o workflow à mão com `accept`.
+  - O hook do runner passa a aceitar `schedule` e `workflow_dispatch` na `main` (o `schedule`
+    sempre roda o workflow da `main`), e o `reset` e o subcomando novo `cargo xtask ci-runner hooks`
+    regravam os hooks do checkout na VM (troca atômica, sem recriar a VM).
+  - O job só roda com a variável do repositório `NIGHTLY_REGRESSION=on`, ligada depois de
+    `cargo xtask ci-runner hooks` (sem o hook novo o runner recusaria o `schedule` e o `alert`
+    abriria "CI noturno quebrado" à toa).
+  - `.github/actionlint.yaml` declara o rótulo `corerouter` para o actionlint local.
+
+  Ficam para a G0.30o: `ospf-stress-lab.sh`, `cargo xtask os boot-test` e `install-test`, que
+  precisam de root (BNG Blaster, namespaces com root) ou de KVM: a VM do runner tem `/dev/kvm`
+  (`root:kvm`), mas o usuário `runner` não está no grupo `kvm` e não há `qemu-system-x86_64`
+  (conferido em 2026-11-21).
+
+  Como testar: `cargo test -p xtask nightly` e `cargo test -p xtask hook`; à mão,
+  `scripts/nightly-regress.sh --history /tmp/h --out /tmp/n1`, copiar `/tmp/n1/metrics.jsonl` para
+  `/tmp/h/<data>-<commit>.green.jsonl` e rodar de novo com `--out /tmp/n2`: o `report.md` compara as
+  duas. Conferido assim neste host (23 métricas, `--duration 5`): a 2ª noite saiu `ok` com 12
+  métricas na seção "Ainda calibrando" e a lista de commits desde a 1ª. No runner: o `apt-get
+  download` dos 24 pacotes funciona sem root, e `nft`, `tc`, `taskset` e `python3` estão lá
+  (conferido por `cargo xtask ci-runner ssh`). O job em si só roda depois do merge (o `schedule` e o
+  `workflow_dispatch` usam o workflow da `main`) e de `cargo xtask ci-runner hooks`.
+
+- 2026-11-21 — G0.30m: `netns_link_dump::unmanaged_reads_the_links_once_per_batch` falhava e passava ao repetir na fila
+  (2026-11-13 e 2026-11-21: "one dump for 1000 checks", `left: 2`). Causa: cada `Hal::unmanaged`
+  copiava a lista inteira de links que o CoreRouter não gerencia, e o engine a remontava num
+  `BTreeMap` a cada comando. Com os 3 000 dummies que o teste vizinho deixa no namespace, 1 000
+  consultas levavam 270 ms numa build de debug sem carga (**medido**); com a máquina cheia passavam
+  do TTL de 1 s da resposta guardada e saía uma segunda leitura de links. No roteador, o mesmo custo
+  era O(n) por comando num lote: 4 000 `interface.remove` com 4 000 links de outro programa
+  copiavam 16 M entradas.
+
+  - `Hal::unmanaged` devolve `corerouter_hal::Unmanaged` (`Arc<BTreeMap<IfName, String>>`): o
+    `LinuxHal` entrega o mesmo mapa a todos os comandos do lote (um ponteiro, não uma cópia) e o
+    engine consulta por nome. Mudança pequena no trait de `crates/hal` (ponto quente): só o tipo de
+    retorno.
+  - O teste consulta com `contains_key` (antes, busca linear nas 3 011 chaves a cada volta) e diz
+    quanto tempo levou quando falha.
+
+  Taxa de falha com o binário preso em 2 CPUs e 6 laços ocupados nelas (**medido**, 2026-11-21,
+  build de debug): antes 11 de 30, depois 0 de 30. 1 000 consultas: 270 ms → 50–83 ms.
+
+  Como testar: `cargo xtask ci --only netns`, ou
+  `COREROUTER_NETNS_TESTS=1 taskset -c 0,1 unshare --user --map-root-user --net -- <binário netns_link_dump>`.
+
+- 2026-11-21 — G0.30n: Os testes de desligamento do daemon (`e2e::config_and_history_survive_sigterm_and_kill_9`,
+  `shutdown_checkpoint::sigterm_puts_the_journaled_commits_in_the_slot`) passaram a falhar ou a
+  sair FLAKY no `cargo xtask ci --affected` desde o G4.1zn (#705): "no exit after kill -TERM". A
+  thread principal do daemon ficava em estado D em `wb_wait_for_completion` (**medido**, pelo
+  `/proc/<pid>/task/*/wchan`) depois de "log files synced", no checkpoint do desligamento. Causa: o
+  checkpoint deixava as revisões duráveis com um `syncfs`, que descarrega o sistema de arquivos
+  inteiro e espera tudo o que os outros programas escreveram nele. Na máquina de desenvolvimento,
+  os builds das outras sessões; num roteador, os logs, o histórico dos gráficos ou um pacote sendo
+  baixado.
+
+  - `FileStorage::sync_files` faz o `fsync` de cada arquivo, até 16 ao mesmo tempo (threads
+    `config-fsync` num escopo, uma parte dos arquivos para cada): o sistema de arquivos junta as
+    descargas no mesmo commit do journal e não espera pelos outros programas. Uma thread que não
+    sobe deixa a parte dela para a thread atual. O `rustix` sai do `corerouter-storage-fs`.
+
+  Números (**medido**, NVMe ext4, 2026-11-21, 64 arquivos de 16 KiB): com outro processo deixando
+  2 GB para gravar no mesmo disco, `syncfs` 10,7–32 s; `fsync` em paralelo (8 ou 16) 0,10–0,23 s;
+  um por vez, 0,16–0,68 s. No disco calmo, `syncfs` 16–114 ms contra 68–112 ms em paralelo. O teste
+  do SIGTERM, com outro processo gravando 1,5 GB no disco do `TMPDIR`: antes 3 de 5 falham, depois
+  0 de 5. Sobre o dm-delay de 15 ms da VM (onde o G4.1zn mediu 1,8 s um por vez e 37–69 ms com
+  `syncfs`), o paralelo deve ficar perto do `syncfs`, porque as descargas concorrentes caem no mesmo
+  commit (**estimado**; não medido na VM).
+
+  Como testar: `cargo test -p corerouter-storage-fs` (teste novo
+  `the_revision_files_are_synced_at_once`) e
+  `cargo nextest run -p corerouter-daemon --test it e2e::config_and_history_survive_sigterm_and_kill_9`
+  com `dd if=/dev/zero of=<mesmo disco>/big bs=1M count=1500` rodando ao lado.
+
+- 2026-11-21 — G0.30p: `corerouter-mcp::it remote_reconnect::{a_restarted_router_is_redialled_on_the_next_call,
+  an_unreachable_router_is_a_clear_error_and_the_next_call_retries}` falhavam juntos no portão
+  local com a máquina carregada: "receive: Connection reset by peer … may or may not have run".
+  Causa: o teste esperava o roteador falso fechar a conexão (`wait_closed`) e chamava de novo. No
+  loopback, o FIN só é processado do lado do cliente no softirq, depois; nessa janela o
+  `Client::is_stale` ainda vê o socket vivo, o pedido sai pela conexão velha, o FIN chega e o
+  socket órfão do roteador responde com RST. O produto está certo (o pedido pode ter rodado, e ele
+  diz isso); o teste esperava pelo lado errado.
+
+  - `Remote::will_redial`: a próxima chamada abre conexão nova (nenhuma aberta, ou este lado já viu
+    o roteador fechá-la).
+  - Os dois testes esperam por ele (até 30 s) depois de `wait_closed`.
+
+  Taxa de falha (**medido**, 2026-11-21, `cargo nextest run -p corerouter-mcp --test it
+  remote_reconnect` em laço): antes 2 de 4 com a carga do host em ~70 e 2 de 52 com ~30; depois 0
+  de 52 com ~30.
+
+- 2026-11-21 — G0.33b: Checkpoint automático antes de uma atualização (G0.33b). `system.package.update`, `downgrade`,
+  `upload.start` e `download` (os que trocam a imagem; `check`, `scrub`, `confirm` não) salvam a
+  config em uso como `auto-<aaaammdd>-<hhmmss>` (UTC; `auto-r<revisão>` sem relógio, `-2` quando
+  dois caem no mesmo segundo), com o comentário "before system.package.update /caminho" (URL sem
+  `usuário:senha@`). O mesmo antes de um `ppp.secret.import` que adiciona ou troca 100 segredos ou
+  mais e antes de um `/import` do terminal com 100 comandos ou mais (fora do lote atômico, que não
+  desfaz um arquivo gravado). `config.checkpoint.add` sem `name` salva um à mão. Os automáticos
+  rodam entre si: ficam os 4 mais novos, e o mais velho sai também quando a cota de disco do
+  `/config` precisa do lugar; um checkpoint com nome nunca sai nem conta no limite dos automáticos
+  (nem estes no dos 16 com nome), e o prefixo `auto-` é recusado como nome. Uma gravação que falha
+  (Safe Mode com `force`, disco cheio só de checkpoints com nome) não para o update: o resultado
+  traz `checkpoint: {error}` e o log diz o motivo. `config.checkpoint.list` ganhou `auto` e
+  `in_config: false`, e o `/export` deixou de escrever os checkpoints como linhas `/config
+  checkpoint add` (bug da G0.33 visto aqui: um `/export` de um roteador com checkpoint trazia a
+  linha, e o `/import` dele falhava no lote atômico). O `ab-test` do QEMU confere o checkpoint no
+  resultado do update e no slot B depois do boot.
+
+  Testar: `corerouter-cli run config.checkpoint.add '{}'` (três vezes ou mais: `rotated` mostra
+  quem saiu), `run ppp.secret.import` com 100 segredos (`checkpoint` no relatório), `shell` e
+  `/import file=` de um script com 120 linhas ("checkpoint auto-… saved first"), depois
+  `config.checkpoint.restore name=auto-…`. Conferido no daemon real (virtual): rodízio dos 4, o
+  nomeado intocado, a restauração desfez as 120 linhas do `/import` (**medido**). Custo: um
+  checkpoint por update (uma serialização da config, ~2 KB no laboratório; uma config de 56 MB
+  custaria uma escrita desse tamanho, **estimado**).
+
+- 2026-11-21 — G1.22: Varredura SFP/DOM fora do lock do `Session`. A leitura de um módulo são até quatro pedidos
+  ethtool netlink que o kernel atende com o `rtnl_lock` (Linux 6.18.59,
+  `net/ethtool/netlink.c:526`); um driver preso no barramento I²C responde depois de segundos. O
+  `scan_modules` do tick lia até 64 portas assim, com o lock: comandos, GUI e MCP esperavam.
+
+  - **HAL:** `sff::ModuleReader` (`Send`, sem acesso à HAL) e `Hal::module_reader()`; o
+    `hal-linux` devolve um leitor que chama a mesma `nic::sfp_module`. O laboratório virtual não
+    tem leitor (lê barato) e continua sendo lido pelo tick.
+  - **Engine (`dom_watch`):** `Session::module_scan()` pega sob o lock só a lista de portas e o
+    leitor; `ModuleScan::read` lê com o lock solto; `Session::module_scan_feed` anota as leituras
+    (limiares e linhas da G1.20, portas sem gaiola). Porta que deixou de ser Ethernet no meio da
+    leitura é ignorada. Com leitor, o tick não lê módulo nenhum, nem a primeira varredura do boot.
+    Fora do lock o teto sobe de 64 para 1024 portas por varredura.
+  - **Daemon:** serviço `module-scan` (supervisionado; bate a cada 1 s, varre a cada `SCAN_SECS`).
+    Um driver travado prende só essa thread: a linha do `system.service.print` para de bater
+    ("no heartbeat (stuck?)") e o roteador segue respondendo. Portas lidas uma depois da outra: o
+    kernel as serializa no `rtnl_lock`, e threads em paralelo só disputariam esse lock com os
+    applies de rota e endereço.
+
+  Como testar:
+  - `cargo test -p corerouter-daemon module_scan`: com uma HAL cujos módulos levam 200 ms, seis
+    comandos durante a varredura (consulta e mudança) respondem em < 50 ms e o tick não lê nada
+    sob o lock; sem leitor, o tick segura o lock pela varredura inteira (o comportamento antigo).
+  - `cargo test -p corerouter-engine --test it module_scan`.
+  - Daemon real: `unshare --user --map-root-user --net` com 4 pares veth, `--backend linux`:
+    `system.service.print {"name":"module-scan"}` mostra `running`, "8 ports read"; a GUI
+    conectada responde em 4–5 ms.
+
+- 2026-11-21 — G1.3i: O resto da E/S do tick sem o lock do `Session`. Medido antes (bench novo
+  `netns_tick_io`): o que passava de 1 ms era o `ipv6_learned`, chamado pelo olhar de rotas do
+  tick (a cada segundo com até 4096 rotas de config) e por toda `ip.route.list`. Ele despejava
+  **a tabela de rotas IPv6 inteira** e todos os endereços de todas as famílias, para achar os
+  poucos aprendidos por RA. Com 100 000 rotas v6 de BGP (o FRR instala no kernel, a config não
+  as conta), o tick segurava o lock 72–282 ms a cada segundo. `resources` (os gráficos: quatro
+  arquivos do `/proc`, 12–50 µs) e o resto do tick (expiração de listas dinâmicas e recuperação
+  USB, só quando acontecem) ficam como estão.
+
+  - **Fora do lock:** o `LinkReader` do Linux (G1.3f) lê também o estado IPv6 de todos os links:
+    endereços aprendidos, estados de DAD (G1.28) e rotas `ra`. Ao juntar a amostra, a HAL guarda
+    o dos links gerenciados. `ipv6_learned` e `address_states` respondem dele por até 3 s, com os
+    prazos descontados da idade da leitura. Um `apply` o descarta. O v6 é relido no máximo a cada
+    ~1 s: os eventos de link (G1.3d), que pedem leitor por rajada, não o releem.
+  - **Menos trabalho no kernel:**
+    - as rotas `ra` vêm de um dump com `NETLINK_GET_STRICT_CHK` e `rtm_protocol = RTPROT_RA`. O
+      kernel filtra antes de serializar (`ip_valid_fib_dump_req`, `net/ipv4/fib_frontend.c:974`,
+      e `rt6_dump_route`, `net/ipv6/route.c:6090`, Linux 6.18.59);
+    - o dump de endereços pede só `AF_INET6`;
+    - sem nenhuma porta gerenciada aceitando RA (o roteador comum), a varredura de rotas é pulada
+      de todo: a leitura fora do lock fica em 0,35 ms com 100 000 rotas, contra 22 ms com RA.
+
+  Como testar:
+  - `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux --test netns_v6_sample`:
+    - a amostra responde o mesmo que o kernel;
+    - vem só a rota `ra`, não a de BGP;
+    - o estado de DAD aparece;
+    - o apply invalida a amostra;
+    - RA desligado limpa o aprendido.
+  - `COREROUTER_NETNS_BENCH=1 unshare --user --map-root-user --net -- cargo bench -p corerouter-daemon --bench netns_tick_io`
+    (`COREROUTER_TICK_IO_RA=0` para portas sem RA).
+
+- 2026-11-21 — G1.6qg: Safe Mode com prazo que sobrevive à conexão. É como o `commit confirmed N` do Junos e o
+  `commit-confirm N` do VyOS: `config.safe-mode.enter {timeout_secs?, detach: true}` fica ligado
+  depois que a conexão que o abriu fecha. Sem `timeout_secs`, o prazo é de 600 s, os 10 min dos
+  dois. Serve para script e para o `corerouter-cli run`, que abre uma conexão por comando.
+
+  - **Quem confirma.** `exit`, `cancel` e uma nova entrada podem vir do **mesmo usuário**, de
+    qualquer conexão. Para o token local, todas as conexões contam como um usuário só. Os outros
+    usuários precisam de `force: true`, como no Safe Mode comum.
+  - **Prazo.** Entrar de novo com `detach: true` reinicia o prazo e mantém o ponto de entrada.
+    Entrar de novo sem `detach` é recusado, com o motivo: a conexão nova viraria dona e desfaria
+    tudo ao fechar. Um Safe Mode comum vira destacado quando o dono entra de novo com
+    `detach: true`.
+  - **Avisos.** Todo login recebe `safe_mode` no `auth.whoami`, e a CLI e o MCP o imprimem
+    (`WARNING: Safe Mode (detached) entered by admin … N change(s) are undone in T s unless
+    config.safe-mode.exit confirms them`).
+  - **Log.** Registra a entrada, o fechamento da conexão dona ("the changes are undone in T s
+    unless …") e o fim.
+  - **Estado.** O `state.inspect` traz `detached`, `owner_user` e `owner_connected`.
+  - **CLI.** `corerouter-cli run config.safe-mode.enter` continua recusado sem `detach` (G1.6qf),
+    e a mensagem agora mostra a forma destacada.
+  - **GUI.** O botão Safe Mode diz no hover que é destacado e que vale mesmo com a janela
+    fechada. O clique direito ganha "Detach: keep it 10 min after this window closes", e o
+    "Re-arm" mantém o modo destacado.
+  - **Reinício.** Se o daemon reiniciar no meio, ele sobe com a config da entrada, como no Safe
+    Mode comum.
+
+  Como testar: `cargo test -p corerouter-engine --test it safe_mode`,
+  `cargo test -p corerouter-cli --test local` (contra o canal de controle de verdade) e
+  `cargo test -p corerouter-ui -- safe_mode`. À mão:
+
+  ```sh
+  corerouter-cli --connect 127.0.0.1:7979 run config.safe-mode.enter '{"timeout_secs":15,"detach":true}'
+  corerouter-cli --connect 127.0.0.1:7979 run system.identity.set '{"name":"x"}'
+  # 15 s depois, sem ninguém conectado: identidade de volta
+  ```
+
+  Conferido com o daemon (laboratório virtual, `--control`) e a CLI, 2026-11-21 (**medido**):
+  - Entrou destacado com 15 s por `run`, mudou a identidade por outro `run` e não fez mais nada:
+    o daemon desfez sozinho entre 15 e 17 s depois da entrada (sondagem a cada 1 s). O log
+    registra o fechamento da conexão e o fim por prazo.
+  - Confirmado por outro `run` (`exit`): a mudança fica depois do prazo.
+  - Daemon morto no meio, com uma mudança não confirmada: subiu com a config da entrada.
+  - GUI: "Detach" pelo clique direito, depois a GUI morta. O Safe Mode continua (`owner_connected:
+    false`) e a CLI, com o mesmo usuário, o cancela sem `force`. O "Re-arm 1 min" da GUI manteve
+    `detached: true`.
+  - Prints em `docs/changes/G1.6qg-screenshots/`: o hover no tema claro e os menus no escuro.
+
+  Desempenho: nenhum caminho quente. O prazo é conferido no `tick` de 1 s que já existia, e o
+  aviso do login é uma leitura de campo.
+
+- 2026-11-21 — G3.4za: Guarda da gerência dentro de VRF. A G3.4z valia só para a tabela main. Agora cada rede da guarda
+  fica numa tabela de roteamento (`routing.management-guard.add {network, vrf?}`): `main` ou uma
+  VRF. Sem `vrf`, o roteador usa a tabela onde a rede é conectada.
+
+  - **No FRR.** As redes de uma VRF ganham prefix-list e route-map próprios (`CR-MG-4-<vrf>`,
+    `CR-MG-6-<vrf>`) e a linha `ip protocol any route-map …` vai dentro de `vrf <nome>` (FRR 10.7.1,
+    `zebra/zebra_cli.c:3380`: o `ip protocol` também é comando do nó VRF e grava o
+    `filter-protocol` daquela VRF). A main continua com `CR-MG-4`, como a G3.4z gravou. Do contexto
+    `vrf <nome>` o CoreRouter só é dono das linhas `ip protocol … CR-MG-` e nunca apaga o contexto,
+    que é do kernel e pode ter outras linhas do operador (`vni`).
+  - **As sessões.** Uma sessão fica na tabela da porta do seu endereço local. O serviço
+    `mgmt-guard` pergunta ao kernel com a VRF como interface de saída (`ip route get … vrf <nome>`:
+    a regra `l3mdev` leva a consulta à tabela da VRF, como as respostas do socket). A rede
+    conectada e a guarda que protege são as da mesma tabela. O mesmo prefixo em outra VRF é outra
+    rede.
+  - **Leitura da RIB, aviso, lockout.** A contagem de recusadas lê a RIB da VRF
+    (`show ip route vrf <nome> <rede> longer-prefixes json`). O aviso diz `(VRF <nome>)` e o
+    comando que resolve leva a VRF. Tirar ou mover para outra tabela a guarda da rede da própria
+    sessão, com uma rota aprendida que a cobriria, é recusado como lockout.
+  - **Validação.** VRF que não existe é recusada no `add`/`set` (com a lista das VRFs). Tirar uma
+    VRF que a guarda usa é recusado no commit. A prévia avisa quando a rede é conectada em outra
+    tabela ("a guard in main does not protect it (choose vrf mgmt)").
+  - **Janela.** Coluna VRF (selo colorido pelo nome; `main` em texto) e campo VRF no modal (main e
+    as VRFs; vazio: o roteador escolhe), ambos com ⓘ em inglês e português. O Protect leva a VRF.
+  - **Migração.** Config gravada sem `vrf` carrega como `main`, e `main` não é gravado (teste
+    `a_guard_saved_before_vrfs_is_in_main_and_a_vrf_one_round_trips`).
+
+  Como testar: `cargo test -p corerouter-engine -- mgmt_guard management_guard`,
+  `cargo test -p corerouter-hal-frr -- mgmt_guard`, `cargo xtask netns` (`netns_fib_match_vrf`:
+  consulta com e sem a VRF num namespace) e
+  `cargo xtask vm-lab run -- scripts/mgmt-guard-vrf-lab.sh`.
+
+  Conferido no laboratório da VM 2, 23 de 23 checagens ok (2026-11-21, FRR 10.7.1, **medido**). O
+  laboratório usa dois operadores, um na main e um na VRF `mgmt`, e dois vizinhos: iBGP na main e
+  OSPF na VRF.
+  - O BGP instala `192.168.0.2/32` sobre a `ether1` e o OSPF da VRF instala `10.99.0.2/32` na
+    tabela da VRF. Os dois logins novos ficam sem resposta.
+  - A saúde, o resumo e o log apontam as duas sessões. A da VRF sai com `(VRF mgmt)` e com o
+    comando `{"network":"10.99.0.0/24","vrf":"mgmt"}`.
+  - Guarda da main: o `/32` do BGP sai do kernel 220 ms depois do `add`. A `198.18.7.0/24` fica nas
+    423 leituras a cada 10 ms.
+  - Guarda da VRF, sem dizer a VRF: a prévia escolhe `mgmt`. O `/32` do OSPF sai da tabela da VRF
+    53 ms depois. A `198.18.9.0/24` fica nas 441 leituras.
+  - O FRR mostra `ip protocol any route-map CR-MG-4-mgmt` dentro de `vrf mgmt`. Os dois operadores
+    entram de novo.
+  - A lista conta `2 (bgp 2)` na main e `2 (ospf 2)` na VRF.
+  - O operador da VRF não consegue tirar a guarda da própria rede (lockout).
+  - O commit seguinte não digita nada no mgmtd: o render bate com o que o FRR imprime.
+  - Tirar as guardas (pelo console, `force`) devolve os `/32` às duas tabelas e não deixa `CR-MG`
+    no FRR.
+
+  Na GUI (daemon do laboratório virtual com `--control`, prints em
+  `docs/changes/G3.4za-screenshots/`): a lista com a coluna VRF e o modal com o aviso de tabela
+  errada, nos temas claro e escuro.
+
+  Desempenho: a consulta ao kernel continua uma por par (peer, local) por segundo. A VRF de cada
+  sessão sai de um mapa de endereço para tabela, montado uma vez por rodada (O(endereços +
+  sessões), como antes). O índice da VRF é lido uma vez por lote.
+
+- 2026-11-21 — G3.4zb: VRF de gerência para os serviços, como o `/ip service … vrf=` do RouterOS, o `mgmt_junos` do
+  Junos e o `Mgmt-intf` do IOS-XE.
+
+  - **Config.** `ip.service.www-ssl.set`, `www.set` e `metrics.set` aceitam `vrf` (`main` ou uma
+    VRF; config antiga carrega como `main`, e `main` não é gravado).
+  - **Bind na VRF.** O ouvinte recebe `SO_BINDTODEVICE` no dispositivo da VRF antes do `bind()`
+    (`apps/corerouter-daemon/src/service/listen_vrf.rs`). Ele só aceita conexões que chegam pelas
+    portas da VRF e responde pela tabela dela, fora da tabela que o OSPF e o BGP alimentam. A mesma
+    porta em duas VRFs não é conflito.
+  - **Porta TLS de controle.** `corerouter-daemon --listen-vrf <vrf>` faz o mesmo para `--listen` e
+    `--ws-listen`. Se a VRF ainda não existe (primeiro boot, VRF removida), o daemon não sai: avisa
+    no log e tenta de novo a cada 2 s até ela aparecer. Antes, uma falha de bind derrubava o daemon
+    no boot, o que seria um lockout.
+  - **Lockout.** O check do `www-ssl` (G1.6p) passa a considerar a VRF por onde a sessão chegou.
+    Mover o serviço para outra VRF, ou da VRF de volta para a main (com `tcp_l3mdev_accept=0` a
+    main não atende a VRF), é recusado. Safe Mode e `force` passam. O `this_session` do
+    `ip.service.print` respeita a VRF.
+  - **Validação.** VRF que não existe é recusada, com a lista. Remover uma VRF que um serviço usa é
+    recusado no commit.
+  - **Prévia.** "Answers in: VRF mgmt only / main".
+  - **Janela.** IP › Services ganha a coluna VRF (selo por hash) e o campo VRF no modal, ambos com
+    ⓘ em inglês e português.
+  - **Docs.** `docs/mgmt-vrf.md` junta a guarda (G3.4z, G3.4za), os serviços e a porta de controle.
+  - **SSH.** O daemon ainda não tem servidor SSH (pendente na G0.8). Quando tiver, entra na mesma
+    lista.
+
+  Como testar: `cargo test -p corerouter-engine -- ip_service lockout`,
+  `cargo test -p corerouter-model -- web`, `cargo test -p corerouter-daemon -- listen_vrf` e
+  `cargo xtask vm-lab run -- scripts/mgmt-vrf-services-lab.sh`.
+
+  Conferido no laboratório da VM 2, 16 de 16 checagens ok (2026-11-21, kernel da VM,
+  `tcp_l3mdev_accept=0`, **medido**):
+  - O daemon sobe com `--listen 0.0.0.0:8729 --listen-vrf mgmt` antes de a VRF existir e não sai.
+    Quando a config cria a VRF, a porta abre em `0.0.0.0%mgmt:8729`.
+  - `www-ssl` e `metrics` passam para `*%mgmt:443` e `*%mgmt:9100`.
+  - O operador da VRF chega aos três (TLS 8729, HTTPS 404 sem arquivos da GUI, `/metrics` 200). O
+    operador da main não chega a nenhum.
+  - Uma rota `10.99.0.2/32 proto ospf` na main, sobre o operador da VRF, não corta a sessão nem o
+    `www-ssl` dele.
+  - O caminho de volta (`www-ssl` para a main pelo console local) devolve o `www-ssl` ao operador da
+    main.
+  - Depois de reiniciar o daemon, os três ouvintes voltam na VRF e o operador da VRF entra.
+
+  Na GUI (daemon do laboratório virtual com `--control`, prints em
+  `docs/changes/G3.4zb-screenshots/`): IP › Services com a coluna VRF e o modal com o campo VRF e
+  "Answers in", nos temas escuro e claro. No laboratório virtual o `www-ssl` na VRF mostra o erro
+  real, porque o host não tem a VRF `mgmt`.
+
+  Desempenho: nenhum caminho quente. O bind acontece uma vez por mudança de config. A thread de
+  espera só existe enquanto a VRF falta e acorda a cada 2 s.
+
+- 2026-11-21 — G3.9fk: Laboratório BGP do host (`scripts/bgp-crcr-userns.sh`) depois de um `bgpd` relançado. Rodado de
+  novo em 2026-11-21 com a sequência da gap (`restart extcomm announce filters`), 4 vezes antes da
+  correção: os casos seguintes ao `bgpd` relançado (`extcomm`, `announce`, `filters`) passaram nas
+  4 (o sintoma de 2026-10-29 não aparece mais com a `main` de hoje). O que falhava era o próprio
+  `restart`, em 2 de 4: "uptime null → 7". Ele esperava a sessão `established` do lado do CR1 e lia
+  o `uptime_secs` do lado do CR2, que ainda não tinha lido a sessão do `bgpd` dele.
+
+  - `cr_uptime`/`cr_uptime_known`: o caso espera o CR2 mostrar a sessão (até 30 s) antes de ler o
+    tempo dela; sem isso, falha dizendo o estado do CR2.
+
+  Depois: 5 de 5 rodadas verdes (**medido**, 2026-11-21, host com carga 35–60 em 32 núcleos). E
+  uma rodada com todos os casos que matam ou relançam o `bgpd` antes dos de política
+  (`restart gr hardreset cbit llgr extcomm announce filters`): todos verdes, a ordem não importa.
+
+  Como testar: `scripts/bgp-crcr-userns.sh restart extcomm announce filters` (sem root).
+
+- 2026-11-21 — G4.1zn: Os comandos de configuração ficam rápidos também num disco lento (o SSD USB do notebook da fase
+  C).
+
+  **O que custava (medido, 2026-11-20):**
+  - Todo commit gravava em disco duas vezes, segurando o lock do `Session`, conforme o `strace` na
+    VM: o `rev-N.json` da revisão anterior (escreve, `fsync`, `rename`) e a linha do journal da
+    config (`fdatasync`).
+  - O arquivo de revisão repetia o que o journal já guarda. No boot, as revisões do slot em diante
+    são refeitas pelas linhas do journal, e os arquivos delas são ignorados.
+  - No notebook (`dev.659`, SSD USB):
+    - `ip.dns.get`, sem gravação: p50 12 ms;
+    - `ip.dns.set`: p50 41 ms, ou seja, ~29 ms das duas descargas;
+    - um pico de ~500 ms a cada ~80 commits, em todos os comandos que gravam (`set` 489 ms,
+      `static.add` + `remove` 537 ms, lote 505 ms).
+  - O pico não vinha do checkpoint por tamanho: o histórico tinha 16,7 KB e o journal estava longe
+    do orçamento.
+
+  **A correção:**
+  - `engine`, `history_files::save`: quando o journal leva o commit, as revisões que ele reconstrói
+    (a do slot e as mais novas) ficam sem arquivo.
+    - A próxima gravação do slot (um checkpoint, ou o desligamento limpo da G0.27) grava esses
+      arquivos antes, de uma vez: `ConfigStorage::save_revisions`, um método novo com padrão.
+    - Se o journal recusar ou falhar, os arquivos são gravados antes do slot, como antes.
+    - Mexe no histórico/journal da config, ponto quente da G0.33. A G0.33 não toca no
+      `history_files.rs`, e o merge com ela (#699) foi limpo.
+  - `storage-fs`:
+    - `save_revisions` grava e renomeia todos os arquivos sem descarga própria e depois faz um
+      `syncfs` só, antes do slot. Uma queda antes disso deixa arquivos de que o slot no disco não
+      precisa (o boot os ignora).
+    - **Medido** na VM, 64 arquivos num ext4 sobre dm-delay com 15 ms por descarga: 1,8–1,9 s com um
+      `fsync` cada, 37–69 ms com um `syncfs`.
+    - Toda descarga é medida. Uma acima de 100 ms vai ao log do roteador ("config disk slow: …",
+      no máximo uma linha a cada 10 s, com quantas foram e a pior), para a flash lenta aparecer
+      antes do operador sentir.
+  - `scripts/dns-stress-lab.sh`: `--config-flush-ms N` põe o `/config` do roteador local num ext4
+    sobre dm-delay com N ms por descarga (um SSD USB na VM), formatado sem o `ext4lazyinit` em
+    segundo plano.
+
+  Como testar:
+  - VM: `cargo xtask vm-lab run -- env REBUILD=1 scripts/dns-stress-lab.sh --daemon build --tests ops --config-flush-ms 15`.
+  - Notebook, pelo cabo: `--dut remote … --tests ops`.
+  - Sem root: `cargo test -p corerouter-engine --test it -- history_files config_journal` e
+    `cargo test -p corerouter-storage-fs`.
+
+  **O que não ficou medido por dentro:** a causa exata do pico de ~500 ms do notebook. O ext4 do
+  `/config` dele não tem `perf` na imagem. Ele sumiu em 200 commits seguidos, em duas rodadas, e o
+  log de descargas lentas não registrou nenhuma. A hipótese (**estimado**): cada commit também criava
+  um arquivo e, com o histórico cheio de 64, apagava o mais antigo; esse vaivém de metadados e o
+  descarte (TRIM) do SSD USB seguravam o commit do journal do ext4.
+
+- 2026-11-21 — G4.3cf: O `pppoe_policer_accuracy` deixava o namespace `crxsub` inválido ("setting the network namespace
+  failed: Invalid argument") na etapa de 10 mil assinantes da rodada completa do `xdp-root`, e os
+  testes seguintes que usam o `crxsub` caíam juntos. Achado em 2026-10-25 às 03:35, 20 minutos
+  antes de o G0.26 (#226) pôr a trava exclusiva do `vm-lab run`: até ali, duas sessões rodavam ao
+  mesmo tempo na VM, e os testes usam nomes fixos de namespace (`docs/vm-lab.md`, "Limites": "um
+  apaga o do outro"). A mensagem é do `ip netns exec` do iproute2 quando `/run/netns/crxsub` existe
+  mas o bind mount do nsfs já não está lá: o que um `ip netns del crxsub` de outra rodada deixa.
+
+  Rodado de novo na VM 2 (funcionamento), a rodada completa (`COREROUTER_REQUIRE_XDP=1 cargo xtask
+  xdp-root`, 18 testes do `xdp_root`, 4 do `shaper_root` e o `policer_race_root`), 3 vezes seguidas:
+  todas verdes, 328, 341 e 330 s; a etapa de 10 mil assinantes do policer com pior erro −0,82 %,
+  −1,65 % e −1,77 % (limite ±5 %), e os testes depois dela (que usam o `crxsub`) verdes (**medido**,
+  2026-11-21).
+
+- 2026-11-21 — fix-ci-runner-cache: Runner próprio do CI: o disco de cache não enche mais. Em 2026-11-21 os três targets do cargo
+  (51–53 GB cada) encheram os 196 GB do disco de cache da `corerouter-ci` com 35 jobs desde o
+  último reset, e todo lote falhou com "No space left on device" (o #706 saiu vermelho por isso,
+  **medido**). Duas correções em `xtask/src/ci_runner.rs`:
+
+  - `reset --if-due` também reseta, e limpa os targets, com o disco de cache a 75 % ou mais, sem
+    esperar os 40 jobs. Depois de uma limpeza, uma rodada completa por vaga deixa ~27 GB por target
+    (**medido** em 2026-10-29), ~50 % do disco com o swap de 17 GB.
+  - `reset --wipe-cache` dizia "wiped" e não limpava: o `rm -rf` ficava no cache de páginas e no
+    journal do ext4, e o `virsh destroy` logo depois desfazia a remoção (os 186 GB voltaram depois
+    do boot, **medido**). A limpeza termina com `sync -f`, e o `reset` roda `sync` na VM antes de
+    desligá-la à força, o que também protege o cache que fica.
+  - Runner órfão: a unidade tem `KillMode=process` e `PrivateTmp=yes`, então um `systemctl stop`
+    deixa o `Runner.Listener` vivo numa `/tmp` já apagada. Na limpeza à mão do dia, a vaga 2 ficou
+    assim: três lotes falharam com "Cannot create temporary file in /tmp/" (SIGABRT no linker), e
+    a unidade religada não conseguia a sessão ("A session for this runner already exists",
+    **medido**). O caminho do `reset` que para e religa os serviços ("a job started while
+    stopping") agora encerra os órfãos antes; `docs/ci-runner.md` avisa para nunca parar os
+    runners com `systemctl` à mão.
+
+  Como testar: `cargo test -p xtask ci_runner`; no runner, `cargo xtask ci-runner reset --if-due`
+  com o disco abaixo e acima de 75 %, e `cargo xtask ci-runner ssh df -h /var/cache/corerouter-ci`.
+
+- 2026-11-21 — regra-vm-lab: Regra nova no `CLAUDE.md`/`AGENTS.md` ("A VM é uma só: ocupe-a pouco", pedido do usuário em
+  2026-11-20): conferir funcionamento primeiro no host sem root, bateria curta na VM enquanto
+  ajusta, a bateria inteira uma vez só no fim e compilação com `vm-lab run --shared`. Motivo: na
+  rodada da fase C a fila de entrada levou 8–10 min do PR à `main` (**medido**, #697, #699,
+  #700, #702), e o que atrasou as sessões foi a VM única: a G3.4z esperou a rodada do DNS, que já
+  segurava a VM havia 919 s (**medido**).
+
+  Registra a G0.26c: uma segunda VM de laboratório para testes de funcionamento.

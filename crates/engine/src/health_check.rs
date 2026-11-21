@@ -130,6 +130,39 @@ pub const DROPS: (f64, f64) = (100.0, 10_000.0);
 pub const ERRORS_ERROR: f64 = 100.0;
 /// OOM kills this recent (s) are reported.
 pub const OOM_WINDOW: u64 = 3600;
+
+/// G1.6qj: a process the OOM killer took, dated by its kernel line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OomVictim {
+    pub comm: String,
+    pub pid: u32,
+    /// Seconds ago.
+    pub age_s: u64,
+    pub anon_rss_kb: Option<u64>,
+}
+
+/// FRR's daemons, as the kernel names them.
+const FRR_COMMS: &[&str] = &["mgmtd", "zebra", "staticd", "bgpd", "ospfd", "ospf6d", "ldpd", "bfdd", "watchfrr"];
+
+/// "corerouter-daemon (o próprio daemon, há 12 min, 410 MiB)".
+fn victim_text(v: &OomVictim) -> String {
+    // The kernel keeps 15 bytes of the name.
+    let who = if "corerouter-daemon".starts_with(v.comm.as_str()) && v.comm.len() >= 10 {
+        "corerouter-daemon, o próprio daemon (o init o reiniciou)".to_owned()
+    } else if FRR_COMMS.contains(&v.comm.as_str()) {
+        format!("{}, do FRR", v.comm)
+    } else {
+        v.comm.clone()
+    };
+    let age = match v.age_s {
+        0..60 => format!("há {} s", v.age_s),
+        _ => format!("há {} min", v.age_s / 60),
+    };
+    match v.anon_rss_kb {
+        Some(kb) => format!("{who} (pid {}, {age}, {} MiB)", v.pid, kb / 1024),
+        None => format!("{who} (pid {}, {age})", v.pid),
+    }
+}
 /// RSS: one CPU taking this share of the receive softirqs, with at least
 /// [`RSS_MIN_CPUS`] CPUs and [`RSS_MIN_RATE`] softirqs a second.
 pub const RSS_SHARE: f64 = 50.0;
@@ -195,6 +228,9 @@ pub struct Inputs {
     pub cgnat_conntrack: Option<crate::cgnat_conntrack::Fit>,
     /// OOM kills seen in the last [`OOM_WINDOW`] seconds.
     pub oom_recent: Option<u64>,
+    /// G1.6qj: the deaths of the last [`OOM_WINDOW`] seconds the kernel
+    /// log dated, newest first (even those from before this daemon).
+    pub oom_victims: Vec<OomVictim>,
     /// NTP client enabled and its state.
     pub ntp: Option<(bool, NtpState)>,
     /// Something configured depends on the clock (RADIUS servers in use):
@@ -600,12 +636,30 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
     }
 
     // OOM kills.
-    match i.oom_recent {
+    // G1.6qj: the kernel log dates deaths the count of /proc/vmstat cannot
+    // (from before this daemon, on a machine up for more than the window).
+    let dated = u64::try_from(i.oom_victims.len()).unwrap_or(u64::MAX);
+    let recent = match i.oom_recent {
+        Some(n) => Some(n.max(dated)),
+        None if dated > 0 => Some(dated),
+        None => None,
+    };
+    match recent {
         None => push("oom", "OOM kills", Severity::Unknown, None, no_data(), None),
         Some(0) => push("oom", "OOM kills", Severity::Ok, None, "nenhum processo morto por falta de memória na última hora".into(), None),
-        Some(n) => push("oom", "OOM kills", Severity::Error, Some(n.to_string()),
-            format!("{n} processo(s) morto(s) por falta de memória na última hora"),
-            Some("O kernel matou processos para liberar memória: veja o OS Log e quem cresce na aba Processes.")),
+        Some(n) => {
+            let mut reason = format!("{n} processo(s) morto(s) por falta de memória na última hora");
+            if !i.oom_victims.is_empty() {
+                let names: Vec<String> = i.oom_victims.iter().take(3).map(victim_text).collect();
+                reason.push_str(": ");
+                reason.push_str(&names.join("; "));
+                if i.oom_victims.len() > 3 {
+                    reason.push_str(&format!(" e mais {}", i.oom_victims.len() - 3));
+                }
+            }
+            push("oom", "OOM kills", Severity::Error, Some(n.to_string()), reason,
+                Some("O kernel matou processos para liberar memória: veja o OS Log (filtro «Killed process») e quem cresce na aba Processes."))
+        }
     }
 
     // NTP and the clock (G1.6zh: "relógio não ajustado" with what to do).
@@ -877,7 +931,7 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
             let unguarded: Vec<String> = f
                 .iter()
                 .filter(|f| !f.guarded)
-                .map(|f| crate::mgmt_guard::protect_command(&f.connected))
+                .map(|f| crate::mgmt_guard::protect_command(&f.vrf, &f.connected))
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect();
@@ -1254,6 +1308,29 @@ fn ospf_lsdb(i: &Inputs, out: &mut Vec<Check>) {
 }
 
 impl Session {
+    /// G1.6qj: the OOM deaths of the last [`OOM_WINDOW`] the OS Log read
+    /// from the kernel, newest first; none without a wall clock (a line's
+    /// time is the boot's wall time plus its kernel stamp).
+    fn oom_victims(&self) -> Vec<OomVictim> {
+        let (Some(now), Some(book)) = (self.now(), self.ext::<crate::oslog::OsLogBook>()) else {
+            return Vec::new();
+        };
+        let now_us = now.saturating_mul(1_000_000);
+        book.oom_kills
+            .iter()
+            .rev()
+            .filter(|d| d.time_us != 0 && d.time_us <= now_us.saturating_add(60_000_000))
+            .map(|d| (d, now_us.saturating_sub(d.time_us) / 1_000_000))
+            .filter(|(_, age)| *age < OOM_WINDOW)
+            .map(|(d, age_s)| OomVictim {
+                comm: d.kill.comm.clone(),
+                pid: d.kill.pid,
+                age_s,
+                anon_rss_kb: d.kill.anon_rss_kb,
+            })
+            .collect()
+    }
+
     /// The rules' inputs now.
     pub(crate) fn health_inputs(&mut self) -> Inputs {
         let mut i = Inputs::default();
@@ -1262,6 +1339,7 @@ impl Session {
         if let (Some((t, Some(kills))), Some(a)) = (reading, self.ext_mut::<HealthAlerts>()) {
             i.oom_recent = Some(a.oom_seen(t, kills));
         }
+        i.oom_victims = self.oom_victims();
         if let Some(m) = self.ext::<ResourceMonitor>()
             && let Some(l) = &m.last
         {
@@ -1498,6 +1576,7 @@ mod tests {
             cgnat_pool_full: 0,
             cgnat_conntrack: None,
             oom_recent: Some(0),
+            oom_victims: Vec::new(),
             ntp: Some((true, NtpState::Synchronized)),
             ntp_needed: false,
             ntp_clock: NtpClock { clock: ClockState::Slewing, offset_ms: Some(1.5), ..NtpClock::default() },
@@ -1974,5 +2053,52 @@ mod tests {
             }
         }
         assert_eq!(warnings, 1, "logged once, not on every reading");
+    }
+
+    /// G1.6qj: a machine up for days whose daemon was killed by the OOM
+    /// killer and restarted: /proc/vmstat cannot date the kill, the kernel
+    /// log can, and the check names who died. Older than the window: ok.
+    #[test]
+    fn oom_kills_dated_by_the_kernel_log() {
+        use corerouter_hal::oslog::{OsLine, OsSource};
+        let mut s = Session::virtual_lab();
+        let now = 1_795_000_000u64;
+        s.safe_mode_mut().clock = Some(now);
+        let line = |ago: u64, pid: u32, comm: &str| OsLine {
+            time_us: (now - ago) * 1_000_000,
+            severity: 3,
+            source: OsSource::Kernel,
+            unit: String::new(),
+            device: String::new(),
+            pid: None,
+            message: format!("Out of memory: Killed process {pid} ({comm}) total-vm:812344kB, anon-rss:419840kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:1532kB oom_score_adj:-900"),
+            boot: "b1".into(),
+        };
+        let check = |s: &mut Session| {
+            let h = s.execute("system.health.check", &serde_json::json!({})).unwrap();
+            h["checks"].as_array().unwrap().iter().find(|c| c["key"] == "oom").unwrap().clone()
+        };
+        {
+            let book = s.ext_mut::<crate::oslog::OsLogBook>().unwrap();
+            book.push(line(2 * OOM_WINDOW, 90, "unbound"));
+        }
+        let c = check(&mut s);
+        assert_ne!(c["severity"], "error", "{c}");
+        {
+            let book = s.ext_mut::<crate::oslog::OsLogBook>().unwrap();
+            book.push(line(720, 812, "corerouter-daem"));
+            book.push(line(720, 812, "corerouter-daem")); // the journal's copy
+            book.push(line(30, 4100, "bgpd"));
+        }
+        let c = check(&mut s);
+        assert_eq!(c["severity"], "error", "{c}");
+        assert_eq!(c["value"], "2", "{c}");
+        let reason = c["reason"].as_str().unwrap();
+        assert!(reason.contains("bgpd, do FRR (pid 4100, há 30 s, 410 MiB)"), "{reason}");
+        assert!(reason.contains("corerouter-daemon, o próprio daemon (o init o reiniciou) (pid 812, há 12 min"), "{reason}");
+        assert!(reason.find("bgpd").unwrap() < reason.find("corerouter").unwrap(), "newest first: {reason}");
+        // An hour later both left the window.
+        s.safe_mode_mut().clock = Some(now + OOM_WINDOW);
+        assert_ne!(check(&mut s)["severity"], "error");
     }
 }

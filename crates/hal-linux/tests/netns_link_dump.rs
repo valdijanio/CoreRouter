@@ -161,12 +161,18 @@ fn unmanaged_reads_the_links_once_per_batch() {
     ip_batch(&["link add um1 type dummy".to_owned()]);
     let mut hal = LinuxHal::new();
     hal.apply(&Config::default(), &Config::default()).unwrap();
+    let um1: corerouter_model::IfName = "um1".parse().unwrap();
     let before = dumps();
+    // Each check is a lookup in the shared answer, not a copy of every
+    // link (G0.30m): 1 000 of them fit well inside the TTL even with the
+    // 3 000 links of the test above left behind on a starved machine.
+    let start = std::time::Instant::now();
     for _ in 0..1000 {
         let u = hal.unmanaged();
-        assert!(u.iter().any(|(n, _)| n.as_str() == "um1"), "{u:?}");
+        assert!(u.contains_key(&um1), "{u:?}");
     }
-    assert_eq!(dumps() - before, 1, "one dump for 1000 checks");
+    let took = start.elapsed();
+    assert_eq!(dumps() - before, 1, "one dump for 1000 checks in {took:?}");
     // An apply moves the epoch: read again.
     hal.apply(&Config::default(), &Config::default()).unwrap();
     let before = dumps();
@@ -175,7 +181,7 @@ fn unmanaged_reads_the_links_once_per_batch() {
     // A link made since, seen once the answer is older than the TTL.
     ip_batch(&["link add um2 type dummy".to_owned()]);
     std::thread::sleep(corerouter_hal_linux::UNMANAGED_TTL + std::time::Duration::from_millis(100));
-    assert!(hal.unmanaged().iter().any(|(n, _)| n.as_str() == "um2"));
+    assert!(hal.unmanaged().keys().any(|n| n.as_str() == "um2"));
     ip_batch(&["link del um1".to_owned(), "link del um2".to_owned()]);
 }
 

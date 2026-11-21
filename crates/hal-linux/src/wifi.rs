@@ -833,6 +833,7 @@ mod io {
             if let Ok(c) = Ctrl::connect(dir, &sock)
                 && ping(&c)
             {
+                crate::wifi::oom_score_default(&dir.join("wpa_supplicant.pid"), "wpa_supplicant");
                 return Ok(c);
             }
             if Instant::now() >= deadline {
@@ -2036,6 +2037,29 @@ mod io {
             assert!(e.contains("cannot start /nonexistent/wpa"), "{e}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+}
+
+/// G1.6zz: a long-lived helper started by the daemon back to the kernel's
+/// default `oom_score_adj` (0). The value is copied at fork (kernel/fork.c),
+/// so without this the supplicant or hostapd would keep the daemon's −900
+/// (`corerouter-init`'s `DAEMON_OOM_SCORE_ADJ`) and a leak of theirs would
+/// not be the first to go. Raising the value needs no privilege; a pid file
+/// not there yet (or a host where the daemon runs at 0) only skips it.
+pub(crate) fn oom_score_default(pid_file: &std::path::Path, who: &str) {
+    let Some(pid) = std::fs::read_to_string(pid_file)
+        .ok()
+        .and_then(|t| t.trim().parse::<u32>().ok())
+    else {
+        return;
+    };
+    let path = format!("/proc/{pid}/oom_score_adj");
+    let now = std::fs::read_to_string(&path).ok();
+    if now.as_deref().map(str::trim) == Some("0") || now.is_none() {
+        return;
+    }
+    if let Err(e) = std::fs::write(&path, "0") {
+        log::warn!("{who} (pid {pid}): oom_score_adj not reset to 0: {e}");
     }
 }
 

@@ -35,11 +35,14 @@ impl Hal for Host {
     fn poll(&mut self) -> Vec<LinkState> {
         self.lab.poll()
     }
-    fn unmanaged(&mut self) -> Vec<(IfName, String)> {
-        vec![(
-            "lo".parse().unwrap(),
-            "the kernel loopback, kept by the OS".into(),
-        )]
+    fn unmanaged(&mut self) -> corerouter_hal::Unmanaged {
+        std::sync::Arc::new(
+            [(
+                "lo".parse().unwrap(),
+                "the kernel loopback, kept by the OS".into(),
+            )]
+            .into(),
+        )
     }
     fn now_unix(&self) -> Option<u64> {
         None

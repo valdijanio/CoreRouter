@@ -162,9 +162,13 @@ pub trait RoutingReader: Send {
     /// G3.4z: the routes of the routing daemon's RIB inside `net` (the
     /// network and every longer prefix in it), as zebra holds them:
     /// installed, or taken out by the management guard. Small: a guarded
-    /// network holds a handful.
-    fn rib_inside(&mut self, net: ipnet::IpNet) -> Result<Vec<RibRoute>, HalError> {
-        let _ = net;
+    /// network holds a handful. G3.4za: in `table` (main or a VRF).
+    fn rib_inside(
+        &mut self,
+        table: &corerouter_model::RoutingTable,
+        net: ipnet::IpNet,
+    ) -> Result<Vec<RibRoute>, HalError> {
+        let _ = (table, net);
         Err(HalError::Unsupported("reading the RIB".into()))
     }
 

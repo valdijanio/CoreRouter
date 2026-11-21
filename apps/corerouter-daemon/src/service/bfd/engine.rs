@@ -37,6 +37,9 @@ pub(crate) struct Spec {
     pub min_ttl: u8,
     pub users: Vec<String>,
     pub profile: String,
+    /// G3.6n: how long a new session first listens to be resumed Up
+    /// (`Session::resume`), µs; 0: it starts at once.
+    pub resume_us: u64,
 }
 
 /// A state change the clients must hear about.
@@ -535,7 +538,10 @@ impl Worker {
                 let port = if spec.key.multihop { self.ports.1 } else { self.ports.0 };
                 let dst = SocketAddr::new(spec.key.peer, port);
                 self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                let s = Session::new(discr, spec.cfg.clone(), now, self.seed ^ u64::from(discr));
+                let mut s = Session::new(discr, spec.cfg.clone(), now, self.seed ^ u64::from(discr));
+                if spec.resume_us > 0 {
+                    s.resume(now + spec.resume_us);
+                }
                 let slot = Slot {
                     discr,
                     spec: *spec,

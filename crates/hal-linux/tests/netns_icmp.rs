@@ -244,7 +244,11 @@ fn lab(n: u8) -> Lab {
     }
 }
 
-/// Send one probe, wait up to 2 s for its answer.
+/// Send one probe, wait up to 2 s for its answer. A failed send says what
+/// was sent and which sockets the namespace had (G0.30f: one
+/// "Cannot assign requested address" in CI, 2026-11-21, not reproduced in
+/// 224 rounds here; `#[track_caller]` points at the case).
+#[track_caller]
 fn ask(
     sock: &mut dyn ProbeSocket,
     dst: &str,
@@ -258,7 +262,19 @@ fn ask(
         ttl,
         size,
     };
-    sock.send(&probe).unwrap();
+    if let Err(e) = sock.send(&probe) {
+        let ss = Command::new("ss")
+            .args(["-tanu"])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .chars()
+                    .take(4000)
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        panic!("send {probe:?}: {e:?}\nsockets:\n{ss}");
+    }
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         if let Some(r) = sock.recv(Duration::from_millis(200)).unwrap()
@@ -272,6 +288,7 @@ fn ask(
 
 /// Retry while neighbor discovery / ARP settle (the first probe of a fresh
 /// link can be lost).
+#[track_caller]
 fn ask_retry(sock: &mut dyn ProbeSocket, dst: &str, seq: u16, ttl: Option<u8>, size: u16) -> Reply {
     for i in 0..5 {
         if let Some(r) = ask(sock, dst, seq.wrapping_add(i * 1000), ttl, size) {

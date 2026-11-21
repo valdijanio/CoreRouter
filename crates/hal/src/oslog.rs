@@ -737,6 +737,60 @@ pub fn fuzz_check(data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// One death by the kernel's OOM killer, from its line in the kernel log
+/// (G1.6qj). `__oom_kill_process` (mm/oom_kill.c) writes, at level 3:
+/// `<why>: Killed process <pid> (<comm>) total-vm:<kB>kB, anon-rss:<kB>kB,
+/// file-rss:<kB>kB, shmem-rss:<kB>kB, UID:<uid> pgtables:<kB>kB
+/// oom_score_adj:<adj>`, `<why>` being `Out of memory` (global), `Memory
+/// cgroup out of memory` or `Out of memory (oom_kill_allocating_task)`.
+/// `UID`, `pgtables` and `oom_score_adj` came in Linux 5.4 (commits
+/// 8ac3f8fe91a2, 70cb6d267790): fields are looked up by name, any may be
+/// missing and new ones at the end are ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OomKill {
+    pub pid: u32,
+    /// Up to 15 bytes (`TASK_COMM_LEN`); may hold spaces and parentheses.
+    pub comm: String,
+    /// Resident anonymous memory when it was killed, kB.
+    pub anon_rss_kb: Option<u64>,
+    pub oom_score_adj: Option<i32>,
+    /// Killed for its memory cgroup's limit, not for the machine's.
+    pub memcg: bool,
+}
+
+/// The death [`OomKill`] `message` reports, if it is one. Hostile text:
+/// bounded, never panics.
+pub fn oom_kill(message: &str) -> Option<OomKill> {
+    const MARK: &str = ": Killed process ";
+    let at = message.get(..MAX_MESSAGE.min(message.len()))?.find(MARK)?;
+    let why = message.get(..at)?;
+    if !why.ends_with("out of memory") && !why.starts_with("Out of memory") {
+        return None;
+    }
+    let memcg = why.starts_with("Memory cgroup");
+    let rest = message.get(at + MARK.len()..)?;
+    let (pid, rest) = rest.split_once(" (")?;
+    let pid: u32 = pid.parse().ok()?;
+    // The name ends at the last ")" before the fields (or of the line, in
+    // a kernel that writes none): a comm may hold ") ".
+    let end = rest.rfind(") total-vm:").or_else(|| rest.rfind(')'))?;
+    let comm = rest.get(..end)?;
+    if comm.is_empty() || comm.len() > 64 {
+        return None;
+    }
+    let fields = rest.get(end + 1..).unwrap_or("");
+    let field = |name: &str| -> Option<&str> {
+        fields.split([' ', ',']).find_map(|w| w.strip_prefix(name))
+    };
+    Some(OomKill {
+        pid,
+        comm: comm.to_owned(),
+        anon_rss_kb: field("anon-rss:").and_then(|v| v.trim_end_matches("kB").parse().ok()),
+        oom_score_adj: field("oom_score_adj:").and_then(|v| v.parse().ok()),
+        memcg,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1071,11 +1125,65 @@ mod tests {
         }
     }
 
+    /// G1.6qj: the kernel's line, today's and before Linux 5.4, a memcg
+    /// one and names with spaces and parentheses.
+    #[test]
+    fn oom_kill_lines() {
+        let k = oom_kill("Out of memory: Killed process 8225 (unbound) total-vm:812344kB, anon-rss:602112kB, file-rss:0kB, shmem-rss:0kB, UID:107 pgtables:1532kB oom_score_adj:0").unwrap();
+        assert_eq!(
+            (
+                k.pid,
+                k.comm.as_str(),
+                k.anon_rss_kb,
+                k.oom_score_adj,
+                k.memcg
+            ),
+            (8225, "unbound", Some(602_112), Some(0), false)
+        );
+        let k = oom_kill("Out of memory: Killed process 12 (corerouter-daem) total-vm:1kB, anon-rss:9kB, file-rss:0kB, shmem-rss:0kB").unwrap();
+        assert_eq!(
+            (k.comm.as_str(), k.anon_rss_kb, k.oom_score_adj),
+            ("corerouter-daem", Some(9), None)
+        );
+        let k = oom_kill("Memory cgroup out of memory: Killed process 7 (a) b) c) total-vm:1kB, anon-rss:2kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:4kB oom_score_adj:-900").unwrap();
+        assert_eq!(
+            (k.comm.as_str(), k.oom_score_adj, k.memcg),
+            ("a) b) c", Some(-900), true)
+        );
+        let k =
+            oom_kill("Out of memory (oom_kill_allocating_task): Killed process 3 (tail)").unwrap();
+        assert_eq!((k.pid, k.comm.as_str(), k.anon_rss_kb), (3, "tail", None));
+        for not in [
+            "Killed process 3 (tail)",
+            "foo: Killed process 3 (tail) total-vm:1kB",
+            "Out of memory: Killed process x (tail)",
+            "Out of memory: Killed process 3 () total-vm:1kB",
+            "Out of memory and no killable processes...",
+            "oom_reaper: reaped process 3 (tail), now anon-rss:0kB",
+        ] {
+            assert_eq!(oom_kill(not), None, "{not}");
+        }
+        // The fixture's four deaths of unbound.
+        let n = KMSG
+            .lines()
+            .filter_map(|l| l.split_once(';'))
+            .filter(|(_, m)| oom_kill(m).is_some())
+            .count();
+        assert_eq!(n, 4);
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(2000))]
         #[test]
         fn fuzz_oracle_holds(raw in proptest::collection::vec(any::<u8>(), 0..400)) {
             prop_assert!(fuzz_check(&raw).is_ok());
+        }
+
+        #[test]
+        fn oom_kill_never_panics(raw in "(Out of memory|Memory cgroup out of memory)?: Killed process [0-9]{0,12} \\(.{0,40}\\).{0,120}") {
+            if let Some(k) = oom_kill(&raw) {
+                prop_assert!(!k.comm.is_empty() && k.comm.len() <= 64);
+            }
         }
 
         #[test]

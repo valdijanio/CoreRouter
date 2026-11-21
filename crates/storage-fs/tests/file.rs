@@ -344,7 +344,7 @@ fn revisions_are_files_of_their_own() {
     add(&mut s, "10.0.3.1/24");
     assert_eq!(fs::read(dir.0.join(revision_file(1))).unwrap(), first);
     // G4.1zn: journaled commits leave their revision files to the
-    // checkpoint, which writes them together (one syncfs on Linux).
+    // checkpoint, which writes them together (their fsyncs at once).
     assert!(!dir.0.join(revision_file(2)).exists());
     assert_eq!(s.checkpoint(), Ok(true));
     #[cfg(unix)]
