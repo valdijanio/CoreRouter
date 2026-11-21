@@ -3681,3 +3681,17 @@ Com o disco da VM sem atraso: `ip.dns.set` 14 / 74 → 12 / 15, lote 15 / 121 �
 
 O desligamento limpo, que agora também grava os arquivos adiados, levou 72–111 ms na VM (antes,
 12–84 ms).
+
+- 2026-11-21, G0.31g, **medido** (máquina de desenvolvimento, release, bench `lock_hold` com
+  60 000 rotas, 1000 VLANs, 10 000 regras e 100 000 entradas de lista; host com outras sessões
+  compilando). Tempo com o lock preso:
+
+  | medida | antes | depois |
+  |---|---|---|
+  | `held/ip.route.list/after_change` (commit da identidade) | 27,5 ms | 0,13 ms |
+  | `held/ip.route.list/after_route_change` (uma rota mudou) | ~27 ms (**estimado**: a mesma reconstrução) | 0,13 ms |
+  | `held/ip.route.page/after_route_change` | ~27 ms (**estimado**) | 0,47 ms |
+  | `held/ip.route.page/after_built` (a leitura que adota a montagem) | — | 0,38 ms |
+
+  Sem a lixeira, a leitura que adotava a montagem segurava 5,6 ms, quase tudo `free` da tabela
+  velha (`perf record`: `_int_free`, `malloc_consolidate`, `unlink_chunk`).
