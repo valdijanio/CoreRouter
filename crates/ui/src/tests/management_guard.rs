@@ -62,7 +62,7 @@ fn covered() -> Session {
         interface: Some("ether2".parse().unwrap()),
         gateway: Some("10.0.1.2".parse().unwrap()),
     };
-    s.mgmt_guard_feed(pairs.into_iter().map(|p| (p, Ok(entry.clone()))).collect());
+    s.mgmt_guard_feed(pairs.into_iter().map(|p| (p.pair(), Ok(entry.clone()))).collect());
     s
 }
 
