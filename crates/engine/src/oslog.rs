@@ -8,9 +8,11 @@
 //! thread and only takes the session lock to hand lines over) or, without
 //! it, by the backend's `Hal::os_log` (the lab's made-up lines).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use corerouter_hal::oslog::{MAX_MESSAGE, MAX_UNIT, OsLine, OsLogBatch, SourceState, clean};
+use corerouter_hal::oslog::{
+    MAX_MESSAGE, MAX_UNIT, OomKill, OsLine, OsLogBatch, OsSource, SourceState, clean, oom_kill,
+};
 
 /// Rows kept.
 pub const CAPACITY: usize = 20_000;
@@ -65,6 +67,21 @@ pub struct OsLogBook {
     /// Lines pushed and of them repeats folded into a row.
     pub lines_in: u64,
     pub repeats: u64,
+    /// G1.6qj: the OOM killer's deaths the kernel log reported, oldest
+    /// first, at most [`MAX_OOM_KILLS`] (the health check dates them).
+    pub oom_kills: VecDeque<Dated>,
+}
+
+/// OOM deaths kept: past this many in an hour the count, not the list,
+/// is what matters.
+pub const MAX_OOM_KILLS: usize = 64;
+
+/// An OOM death and when (wall clock µs, 0 unknown) in which boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dated {
+    pub kill: OomKill,
+    pub time_us: u64,
+    pub boot: String,
 }
 
 /// FNV-1a: stable, so tests (and two runs) agree on keys.
@@ -179,6 +196,12 @@ impl OsLogBook {
         line.unit = clean(&line.unit, MAX_UNIT);
         line.device = clean(&line.device, MAX_UNIT);
         line.severity = line.severity.min(7);
+        // Before the folding of repeats: each death counts.
+        if line.source == OsSource::Kernel
+            && let Some(kill) = oom_kill(&line.message)
+        {
+            self.oom_seen(kill, line.time_us, &line.boot);
+        }
         self.lines_in = self.lines_in.saturating_add(1);
         self.seq = self.seq.saturating_add(1);
         let seq = self.seq;
@@ -225,6 +248,26 @@ impl OsLogBook {
             }
         }
         Pushed::New(seq)
+    }
+
+    /// G1.6qj: one OOM death more, unless it is one already kept (the
+    /// journal can repeat a kernel line kmsg gave).
+    fn oom_seen(&mut self, kill: OomKill, time_us: u64, boot: &str) {
+        if self
+            .oom_kills
+            .iter()
+            .any(|d| d.kill.pid == kill.pid && d.boot == boot && d.time_us.abs_diff(time_us) < 1_000_000)
+        {
+            return;
+        }
+        self.oom_kills.push_back(Dated {
+            kill,
+            time_us,
+            boot: boot.to_owned(),
+        });
+        while self.oom_kills.len() > MAX_OOM_KILLS {
+            self.oom_kills.pop_front();
+        }
     }
 
     /// Add a batch and take its word on the sources and the boot; gives

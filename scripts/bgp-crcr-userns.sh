@@ -69,6 +69,9 @@ mount -t tmpfs tmpfs /var/lib
 mkdir -p /var/run/frr /etc/frr /var/lib/frr /run/netns
 export LD_LIBRARY_PATH=$FRR_DIR/root/usr/lib/x86_64-linux-gnu:$FRR_DIR/root/usr/lib/x86_64-linux-gnu/frr
 FRR=$FRR_DIR/root/usr/lib/frr
+# BFDD_BIN: another bfdd (G3.6n: the image's, with os/patches/frr, through
+# a wrapper that runs it with the image's loader and libraries).
+BFDD=${BFDD_BIN:-$FRR/bfdd}
 bin=$CARGO_TARGET_DIR/release
 CASES=("$@")
 [ ${#CASES[@]} -gt 0 ] || CASES=(ebgp ebgp6 mpbgp md5 filters extcomm announce nexthop-self rr maxprefix restart gr hardreset cbit llgr bfd convergence scale)
@@ -141,11 +144,13 @@ frr_start() {
   local ns=$1 p; shift
   mkdir -p "/etc/frr/$ns" "/var/lib/frr/$ns" "/var/run/frr/$ns"
   for p in zebra bgpd ospfd staticd bfdd; do : > "/etc/frr/$ns/$p.conf"; done
+  # BFD_DEBUG=1: bfdd's view of its data plane and sessions in frr-<ns>.log.
+  [ -z "${BFD_DEBUG:-}" ] || printf 'log stdout debugging\ndebug bfd peer\ndebug bfd network\ndebug bfd distributed\n' > "/etc/frr/$ns/bfdd.conf"
   [ -f "$W/$ns.bgpd" ] && cp "$W/$ns.bgpd" "/etc/frr/$ns/bgpd.conf"
   for p in "$@"; do
     case $p in
       mgmtd|staticd) ip netns exec "$ns" "$FRR/$p" -N "$ns" -u root -g root -d --limit-fds 4096 ;;
-      bfdd) ip netns exec "$ns" "$FRR/bfdd" -N "$ns" -u root -g root -d --limit-fds 4096 \
+      bfdd) ip netns exec "$ns" "$BFDD" -N "$ns" -u root -g root -d --limit-fds 4096 \
               -f "/etc/frr/$ns/bfdd.conf" --dplaneaddr "unix:/var/run/frr/$ns/bfdd_dplane.sock" ;;
       *) ip netns exec "$ns" "$FRR/$p" -N "$ns" -u root -g root -d --limit-fds 4096 -f "/etc/frr/$ns/$p.conf" ;;
     esac </dev/null >>"$W/frr-$ns.log" 2>&1
@@ -707,7 +712,7 @@ cbit_round() { # cbit_round <label> <CR1 extra> <CR2 extra> <what to kill: stack
   [ "$kept" = no ] && sleep 2
   case $what in
     stack|frr)
-      ip netns exec c1 "$FRR/bfdd" -N c1 -u root -g root -d --limit-fds 4096 -f /etc/frr/c1/bfdd.conf --dplaneaddr unix:/var/run/frr/c1/bfdd_dplane.sock </dev/null >>"$W/frr-c1.log" 2>&1
+      ip netns exec c1 "$BFDD" -N c1 -u root -g root -d --limit-fds 4096 -f /etc/frr/c1/bfdd.conf --dplaneaddr unix:/var/run/frr/c1/bfdd_dplane.sock </dev/null >>"$W/frr-c1.log" 2>&1
       ip netns exec c1 "$FRR/bgpd" -N c1 -u root -g root -d --limit-fds 4096 -f /etc/frr/c1/bgpd.conf </dev/null >>"$W/frr-c1.log" 2>&1 ;;
   esac
   case $what in
@@ -733,7 +738,15 @@ case_cbit() {
   grep -q '^frr yes ' "$W/cbit-summary.txt" && grep -q '^stack yes ' "$W/cbit-summary.txt" \
     && result cbit OK "BFD + graceful restart: CR1's route kept with bgpd+bfdd or the whole stack killed ($s)" \
     || result cbit FAIL "BFD + graceful restart: $s"
-  grep -q '^daemon no ' "$W/cbit-summary.txt" && result cbit INFO "known gap: corerouter-daemon alone killed takes BFD down and the routes with it ($s)"
+  # G3.6n: with the image's bfdd (os/patches/frr/0008) the daemon alone
+  # killed keeps the routes too; FRR's own packages still lose them.
+  if grep -q '^daemon yes ' "$W/cbit-summary.txt"; then
+    result cbit OK "G3.6n: corerouter-daemon alone killed, BFD and the routes kept ($s)"
+  elif [ -n "${BFDD_BIN:-}" ]; then
+    result cbit FAIL "G3.6n: corerouter-daemon alone killed took BFD down with the patched bfdd ($s)"
+  else
+    result cbit INFO "unpatched bfdd (FRR's packages; BFDD_BIN= the image's): corerouter-daemon alone killed takes BFD down and the routes with it ($s)"
+  fi
 }
 
 # G3.9fj, RFC 9494. CR1 restarts gracefully with Restart Time 5 s; kill -9
