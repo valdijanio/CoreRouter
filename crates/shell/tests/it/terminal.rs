@@ -784,11 +784,18 @@ fn a_big_export_imports_back() {
     }
     a.router.files.insert("big.rsc".into(), script);
     let out = a.ok("/import file=big.rsc");
-    assert!(out.contains("checkpoint auto-") && out.contains("saved first"), "{out}");
+    assert!(
+        out.contains("checkpoint auto-") && out.contains("saved first"),
+        "{out}"
+    );
     let exported = a.export();
     // G0.33b: the 300 lines saved a checkpoint first; it is not exported.
     assert!(!exported.contains("checkpoint"), "{exported}");
-    let list = a.router.session.execute("config.checkpoint.list", &json!({})).unwrap();
+    let list = a
+        .router
+        .session
+        .execute("config.checkpoint.list", &json!({}))
+        .unwrap();
     assert_eq!(list[0]["comment"], "before /import of 300 commands");
     let mut b = Term::new();
     b.router.files.insert("cfg.rsc".into(), exported);

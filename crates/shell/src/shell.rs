@@ -1208,7 +1208,11 @@ impl Shell {
             Box::new(move |sh, replies| {
                 let note = match reply(&replies, 0) {
                     Ok(v) => {
-                        let name = v.get("name").and_then(Value::as_str).unwrap_or("?").to_owned();
+                        let name = v
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                            .to_owned();
                         Line::styled(
                             Style::Dim,
                             format!(

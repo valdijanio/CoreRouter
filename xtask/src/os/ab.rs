@@ -787,7 +787,10 @@ fn scenario_update(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
     )?;
     // G0.33b: the config before the update, kept as an automatic checkpoint.
     let auto = u["checkpoint"]["name"].as_str().unwrap_or("").to_owned();
-    check(auto.starts_with("auto-"), format!("update without its checkpoint: {u}"))?;
+    check(
+        auto.starts_with("auto-"),
+        format!("update without its checkpoint: {u}"),
+    )?;
     vm.wait_exit(&mut log, 120)?;
     drop(vm);
     let mut vm = ctx.boot("update/trial-b", false, &[])?;
