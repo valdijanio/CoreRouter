@@ -128,8 +128,20 @@ os pacotes desempacotados, se o host não tiver `apt-get download`).
 
 Os laboratórios que precisam de root ou de KVM (`ospf-stress-lab.sh`, `os boot-test`,
 `install-test`) ainda não entram: o `runner` não tem sudo, não está no grupo `kvm` e a VM não
-tem QEMU (gap G0.30o). O hook
-novo vale depois de `cargo xtask ci-runner hooks` (ou do próximo `reset`).
+tem QEMU (gap G0.30o).
+
+**Ligar (uma vez):** o hook novo vale depois de `cargo xtask ci-runner hooks` (ou do próximo
+`reset`); só então ligue o job, que até lá fica pulado:
+
+```bash
+cargo xtask ci-runner hooks
+```
+
+```bash
+gh variable set NIGHTLY_REGRESSION -R valdijanio/CoreRouter --body on
+```
+
+Desligar: `gh variable delete NIGHTLY_REGRESSION -R valdijanio/CoreRouter`.
 
 ## Etapa do usuário (uma vez)
 

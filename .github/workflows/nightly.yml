@@ -70,10 +70,11 @@ jobs:
   # G0.30k: os laboratórios inteiros, comparados com a última noite verde. Só na `main`: o hook
   # do runner recusa qualquer outra coisa (schedule e workflow_dispatch na main, docs/ci-runner.md).
   # Sem runner online o job espera na fila do Actions (até 24 h) e a próxima noite espera por ele
-  # (concurrency).
+  # (concurrency). Ligado pela variável do repositório NIGHTLY_REGRESSION=on, depois de
+  # `cargo xtask ci-runner hooks` (sem o hook novo o runner recusa o schedule e a noite cairia).
   regression:
     name: regressão
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && vars.NIGHTLY_REGRESSION == 'on'
     runs-on: [self-hosted, corerouter]
     timeout-minutes: 120
     permissions:
