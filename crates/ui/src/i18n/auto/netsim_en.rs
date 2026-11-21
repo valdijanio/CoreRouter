@@ -9,7 +9,7 @@ A simulation: virtual routers in this router's memory, running simplified OSPF, 
 ## What it is for
 Seeing what a failure or a change does **before** doing it: which routes move, how long it takes, how many prefixes are lost. Never a replacement for FRR in production."##),
     (r##"netsim.clock"##, r##"## What it is
-The virtual clock. ⏯ plays and pauses, ⏭ runs to the next instant something happens, ⏮ starts the preset again at t = 0, ×N is how many virtual seconds pass per second.
+The virtual clock. **Play/Pause** plays and pauses, **Step** runs to the next instant something happens, **Restart** starts the preset again at t = 0, ×N is how many virtual seconds pass per second.
 
 ## Good to know
 Same seed, same commands: the same run, every time (it can become a test)."##),

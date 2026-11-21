@@ -172,7 +172,7 @@ Segundos entre KEEPALIVEs. Vazio: um terço do hold time (RFC 4271 §10). Tem qu
 O `local.role` do RouterOS: `ibgp` (mesmo AS), `ibgp-rr` (iBGP em que este roteador é o refletor de rotas e o vizinho é cliente, RFC 4456) ou `ebgp`; os papéis `ebgp-provider`, `-customer`, `-peer`, `-rs` e `-rs-client` são anunciados no OPEN (RFC 9234) e deixam os dois lados pegarem um vazamento de rotas (route leak).
 
 ## Padrão
-Vazio: pelo AS remoto (o nosso → ibgp, outro → ebgp).
+Vazio: pelo AS remoto (o nosso: ibgp, outro: ebgp).
 
 ## Recomendado
 Trânsito: `ebgp-provider` do nosso lado é errado — o papel é o **nosso**: com um trânsito somos `ebgp-customer`."##),

@@ -46,7 +46,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("New Queue Type…", r##"Novo tipo de fila…"##),
     ("New Simple Queue", r##"Nova fila simples"##),
     ("New Simple Queue…", r##"Nova fila simples…"##),
-    ("Not kept: the history would pass the graphing memory cap (Graphs → Settings).", r##"Não guardado: o histórico passaria do teto de memória dos gráficos (Graphs → Settings)."##),
+    ("Not kept: the history would pass the graphing memory cap (Graphs › Settings).", r##"Não guardado: o histórico passaria do teto de memória dos gráficos (Graphs › Settings)."##),
     ("Origin", r##"Origem"##),
     ("PCQ Addresses", r##"Endereços PCQ"##),
     ("PCQ Classifier", r##"Classificador PCQ"##),
@@ -106,7 +106,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
 
 /// Explanations: (key, Markdown).
 pub(super) const HELP: &[(&str, &str)] = &[
-    ("menu.queues", "## O que faz\nControla a banda por alvo, como o `/queue` do RouterOS: **Simple Queues** (um endereço, prefixo ou interface com upload/download máximos, burst e o tipo de fila), **Per-IP (PCQ)** (uma taxa igual para cada endereço de uma rede, sem uma fila por cliente) e **Queue Types** (fq-codel, cake, pfifo/bfifo, pcq).\n\nAs filas **dinâmicas** (selo D) vêm das sessões PPPoE/IPoE (perfil ou RADIUS) e dos leases e redes do DHCP; mude a taxa na origem.\n\n## Como funciona\nO download é moldado (EDT + `fq`: os pacotes esperam e saem no ritmo, com CoDel segurando a latência); o upload é policiado. A primeira fila que casa vale (como no RouterOS), e o aviso ⚠ mostra alvo encoberto ou sobreposto."),
+    ("menu.queues", "## O que faz\nControla a banda por alvo, como o `/queue` do RouterOS: **Simple Queues** (um endereço, prefixo ou interface com upload/download máximos, burst e o tipo de fila), **Per-IP (PCQ)** (uma taxa igual para cada endereço de uma rede, sem uma fila por cliente) e **Queue Types** (fq-codel, cake, pfifo/bfifo, pcq).\n\nAs filas **dinâmicas** (selo D) vêm das sessões PPPoE/IPoE (perfil ou RADIUS) e dos leases e redes do DHCP; mude a taxa na origem.\n\n## Como funciona\nO download é moldado (EDT + `fq`: os pacotes esperam e saem no ritmo, com CoDel segurando a latência); o upload é policiado. A primeira fila que casa vale (como no RouterOS), e o selo **warning** mostra alvo encoberto ou sobreposto."),
     (
         "queues.pcq",
         r##"## O que é
@@ -167,7 +167,7 @@ Como no RouterOS, a **primeira fila que casa vence**: um alvo dentro do alvo de 
     ),
     (
         "queues.simple.burst_time",
-        r##"A janela da **média** que decide a rajada (não é a duração da rajada!). Exemplo do RouterOS: 1M, rajada 2M, limiar 1,5M, 8 s → 6 s a 2M, depois 1M. A média é amostrada em 16 fatias de `burst-time/16`."##,
+        r##"A janela da **média** que decide a rajada (não é a duração da rajada!). Exemplo do RouterOS: 1M, rajada 2M, limiar 1,5M, 8 s: 6 s a 2M, depois 1M. A média é amostrada em 16 fatias de `burst-time/16`."##,
     ),
     (
         "queues.simple.disabled",
@@ -339,7 +339,7 @@ Guarda o histórico desta fila nos gráficos (`queue:<nome>`: taxas, descartes e
 Ligado nas filas fixas, desligado nas dinâmicas. Numa dinâmica a marca fica pelo nome (`<pppoe-ana>`): o cliente que reconecta continua no mesmo histórico.
 
 ## Custo
-~440 KiB por fila (um ano de pontos), dentro do teto de memória dos gráficos; o que não couber fica de fora e aparece em Graphs → Settings."##),
+~440 KiB por fila (um ano de pontos), dentro do teto de memória dos gráficos; o que não couber fica de fora e aparece em Graphs › Settings."##),
     ("queues.view.packets", r##"Pacotes contados pela fila desde que ela foi instalada no plano de dados."##),
     ("queues.view.pause", r##"Congela o gráfico para olhar com calma. Os pontos continuam chegando por trás; Continuar volta ao agora."##),
     ("queues.view.pcq", r##"Numa fila com tipo PCQ: quantos endereços (sub-fluxos) estão ativos agora, cada um com o seu limite."##),

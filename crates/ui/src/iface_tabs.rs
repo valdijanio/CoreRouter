@@ -556,8 +556,8 @@ pub(crate) fn tab_bar(ui: &mut Ui, tab: &mut Tab, view: Option<&NicView>) {
     ui.horizontal(|ui| {
         for t in tabs {
             let label = match (t, alert) {
-                (Tab::Sfp, Some(true)) => RichText::new("SFP ⚠").color(ui.visuals().error_fg_color),
-                (Tab::Sfp, Some(false)) => RichText::new("SFP ⚠").color(ui.visuals().warn_fg_color),
+                (Tab::Sfp, Some(true)) => RichText::new("SFP !").color(ui.visuals().error_fg_color),
+                (Tab::Sfp, Some(false)) => RichText::new("SFP !").color(ui.visuals().warn_fg_color),
                 _ => RichText::new(t.label()),
             };
             ui.selectable_value(tab, t, label);

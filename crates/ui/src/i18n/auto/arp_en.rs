@@ -84,7 +84,7 @@ RFC 4861 §7.3.2: reachable, stale, delay, probe, incomplete, failed, plus perma
         "arp.static",
         "## Static ARP entry
 
-A fixed IP → MAC pair on an interface (`/ip arp add`), permanent in the kernel. A wrong MAC cuts the host off: the modal warns when the host answers with another MAC now.",
+A fixed IP-to-MAC pair on an interface (`/ip arp add`), permanent in the kernel. A wrong MAC cuts the host off: the modal warns when the host answers with another MAC now.",
     ),
     (
         "arp.static_count",

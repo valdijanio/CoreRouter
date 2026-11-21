@@ -48,7 +48,7 @@ Uma simulação: roteadores virtuais na memória deste roteador, rodando OSPF, B
 ## Para que serve
 Ver o que uma falha ou uma mudança faz **antes** de fazê-la: quais rotas mudam, quanto tempo leva, quantos prefixos se perdem. Nunca substitui o FRR em produção."##),
     (r##"netsim.clock"##, r##"## O que é
-O relógio virtual. ⏯ roda e pausa, ⏭ avança até o próximo instante em que algo acontece, ⏮ recomeça a topologia em t = 0, ×N é quantos segundos virtuais passam por segundo.
+O relógio virtual. **Play/Pause** roda e pausa, **Step** avança até o próximo instante em que algo acontece, **Restart** recomeça a topologia em t = 0, ×N é quantos segundos virtuais passam por segundo.
 
 ## Bom saber
 Mesma semente, mesmos comandos: a mesma execução, sempre (pode virar teste)."##),

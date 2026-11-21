@@ -178,7 +178,7 @@ Os selos acima da tabela contam a tabela inteira; um clique filtra.",
         "arp.static",
         "## Entrada ARP estática
 
-Um par IP → MAC fixo numa interface (RouterOS `/ip arp add`). Fica `permanent` no kernel e nunca expira. Use para equipamentos críticos, para portas `reply-only` (onde só o estático alcança o host) ou para corrigir um vizinho que responde errado.
+Um par IP-MAC fixo numa interface (RouterOS `/ip arp add`). Fica `permanent` no kernel e nunca expira. Use para equipamentos críticos, para portas `reply-only` (onde só o estático alcança o host) ou para corrigir um vizinho que responde errado.
 
 **Cuidado:** um MAC diferente do que o host usa corta o host. O modal avisa quando o host responde agora com outro MAC.",
     ),

@@ -570,7 +570,7 @@ pub(crate) fn rows_of(routes: &[Route], view: &View, lang: i18n::Langs) -> Vec<R
 }
 
 fn group_row(key: &str, first: &Route, paths: usize, open: bool, lang: i18n::Langs) -> Row {
-    // The default fonts lack ▸/▾ (i18n MISSING_GLYPHS).
+    // The default fonts lack ▸/▾ (`tests/glyphs.rs`).
     let arrow = if open { "-" } else { "+" };
     // G1.27j: mixed origins or the default route split between uplinks:
     // amber, with the notice in the Reason column.
