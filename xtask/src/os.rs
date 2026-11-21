@@ -375,7 +375,7 @@ fn package_cmd(root: &Path, images: &Path, args: &[String]) -> Result<(), String
     let mut cmd = Command::new(&tool);
     cmd.arg("package").arg("--images").arg(images);
     if !args.iter().any(|a| a == "--key") {
-        cmd.arg("--keys").arg(out_dir(root)?.join("keys"));
+        cmd.arg("--keys").arg(out::dev_keys(root, &out_dir(root)?)?);
     }
     let st = cmd
         .args(args)
@@ -1139,7 +1139,8 @@ pub(crate) fn build_with(
     // G1.6b: the image key (private: outside the tree and the image) and
     // what `corerouter-image seal` puts in the manifest.
     let image_tool = ab::tool(root)?;
-    let (image_key, signing_pub) = ab::ensure_key(&d.top, &image_tool, key.as_deref())?;
+    let (image_key, signing_pub) =
+        ab::ensure_key(&out::dev_keys(root, &d.top)?, &image_tool, key.as_deref())?;
     // processo: the public keys the image trusts. A development image: its
     // own key and the release keys of `os/keys/release/` (a test router
     // takes both). A release image: only the release keys.

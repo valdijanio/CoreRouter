@@ -19,7 +19,7 @@ traz em `/etc/corerouter/image-keys/` (seção "A/B e atualização segura" de
 
 | Chave | Privada | Pública | Quem a usa |
 |---|---|---|---|
-| Desenvolvimento | `<out>/keys/dev-image-key.pk8`, sem senha, gerada no primeiro `os build` | `<out>/keys/pub/` | `os build`, `os push`, testes no QEMU |
+| Desenvolvimento | `~/.config/corerouter/dev-image-key/dev-image-key.pk8`, sem senha, gerada no primeiro `os build`, uma para todos os checkouts (G1.6qm) | `~/.config/corerouter/dev-image-key/pub/` | `os build`, `os push`, testes no QEMU |
 | Release | `~/.config/corerouter/release-key/release-image-key.enc`, **cifrada com senha** | `os/keys/release/<id>.pub`, no repositório | só `os release` |
 
 E quem confia em quê:
