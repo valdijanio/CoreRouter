@@ -1802,6 +1802,12 @@ minutos sem resposta, manda olhar o console.
   (`docs/frr-many-interfaces.md`). Os mesmos foram preparados para o FRR
   (`docs/frr-upstream/ospfd-many-interfaces/`). **Saída:** apagar cada um quando o FRR da imagem
   o trouxer.
+- **Patch no FRR (G3.6n):** `0008-bfdd-dplane-software-fallback.patch` faz funcionar o BFD em
+  software para onde o `bfdd` devolve as sessões quando o plano de dados (o motor do daemon) cai:
+  ele passa a ouvir (sem plano de dados, `bfd_vrf_start_sockets` abre os sockets) e uma sessão Up
+  continua Up com os tempos negociados. Assim um `kill -9` ou uma atualização só do daemon não
+  derrubam o BGP do vizinho (`docs/bfd.md`, "Reinício do daemon com o BFD no ar"; o `frr-test`
+  confere). **Saída:** apagar quando o FRR da imagem trouxer a correção.
 - **O que o `frr-test` prova** (`cargo xtask os frr-test`, `xtask/src/os/frr.rs`): dois
   roteadores da imagem no QEMU, sem root, com os `ether1` ligados por um par de sockets UDP do
   QEMU no loopback do host. Cada um é configurado só por comandos (13, os mesmos de CLI/MCP):

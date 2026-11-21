@@ -156,6 +156,59 @@ cria a retirada de rota estática do kernel) e BFD no link de sync do par BNG (G
 `ppp.redundancy.set bfd=… access_bfd=…`; o motor avisa o par pelo `tap` das `Options`, na
 própria thread, sem o lock do `Session`; veja `docs/bng-ha.md` §2.13).
 
+## Reinício do daemon com o BFD no ar (G3.6n)
+
+O motor roda no `corerouter-daemon`, como plano de dados do `bfdd`. Um `kill -9` ou uma
+atualização só do daemon derrubavam o BGP do vizinho, embora o `bgpd`, o `zebra` e o
+encaminhamento do kernel continuassem vivos. **Medido** no laboratório do host
+(`scripts/bgp-crcr-userns.sh cbit`, BFD 100 ms × 3, FRR 10.7.1, 2026-11-21): o CR2 perdeu a rota
+do CR1 476 ms depois do `kill -9` e 162 de 389 pings se perderam (416–423 ms na G3.9fj).
+
+**Causa, no fonte do FRR 10.7.1** (`BFD_DEBUG=1` no laboratório):
+- quando o plano de dados desconecta, o `bfdd` devolve as sessões ao BFD em software
+  (`_bfd_session_unregister_dplane`, `bfdd/dplane.c`) com o estado que o plano de dados informou,
+  Up;
+- só que o `bfd_vrf_start_sockets` (`bfdd/bfd.c`) não abre os sockets de recepção quando há
+  `--dplaneaddr`: o software transmite e não ouve;
+- e os tempos dele continuam os lentos de uma sessão nova (`xmt_TO` e `cur_timers` em 1 s): o
+  primeiro pacote sai depois de 0,75–1 s, depois da detecção do vizinho (300 ms);
+- no log: o daemon some às 00:13:45, o `bfdd` declara Down às 00:13:48 (`path-down`, a detecção
+  lenta de 3 s), o vizinho já tinha caído.
+
+**Decisão: corrigir o `bfdd` e retomar a sessão do nosso lado** (não um processo de BFD à parte,
+nem AdminDown):
+- `os/patches/frr/0008-bfdd-dplane-software-fallback.patch`: o software ouve enquanto não há plano
+  de dados (os sockets abrem e fecham com a contagem de sessões em software, que já existia), e
+  uma sessão Up devolvida a ele usa os tempos negociados que o plano de dados informou e manda um
+  pacote na hora (RFC 5880 §6.8.3, §6.8.4, §6.8.7). O texto do patch serve para o envio ao FRR
+  (`docs/upstream.md`).
+- Na volta, o `bfdd` entrega a sessão Down: o `DP_ADD_SESSION` não leva estado nem o
+  discriminador remoto (`bfddp_packet.h`). O motor então espera ouvir antes de mandar
+  (`Session::resume`, `corerouter_proto_bfd::session`): metade da detecção provável do vizinho
+  (o nosso intervalo × o multiplicador / 2, de 20 ms a 1,5 s). Se o primeiro pacote diz Up e traz o
+  nosso discriminador como Your Discriminator, a sessão é esta, e continua Up (RFC 5880 §6.8.1:
+  o discriminador é único da sessão; §6.8.6: só um pacote com o nosso discriminador é aceito). Com
+  qualquer outro pacote, ou no fim da espera, ela começa do jeito normal. Sem a espera, o motor
+  novo mandaria Down e o vizinho cairia (o teste `a_restarted_engine_resumes_the_session_without_a_down_on_the_peer`
+  mostra Up → Down → Up no vizinho sem ela).
+- Enquanto o `bfdd` ainda segura a porta 3784 (de outro usuário, `frr`, então fora do grupo
+  `SO_REUSEPORT`), as sessões que ele entrega esperam e são tentadas de novo a cada 20 ms
+  (`dp_waiting`), em vez de se perderem.
+
+**Por que não as outras:**
+- **AdminDown antes de um reinício planejado** (RFC 5882 §3.2: o cliente não age): não cobre o
+  `kill -9` nem uma queda do daemon, e o `bfdd` do lado de cá ainda cairia pela detecção lenta.
+  Fica para o reboot planejado da máquina inteira (gap G3.6o).
+- **Um processo próprio de BFD** que sobrevive ao daemon (o caminho do Junos, `ppmd` na PFE):
+  resolve sem depender do FRR, mas leva o motor, as sessões BNG (G3.6h) e o estado para outro
+  processo, com um canal novo até o daemon. Ficou como alternativa se o FRR não aceitar o patch.
+
+**Limites:**
+- Durante a ausência do daemon o BFD é o do `bfdd`: sem autenticação (o `bfddp` não a leva; uma
+  sessão com chave cai como antes) e sem dampening.
+- A porta de origem muda duas vezes (RFC 5881 §4 pede a mesma porta por sessão); o FRR, o nosso
+  motor e o RouterOS (**estimado**: não demultiplexam por porta) não conferem.
+
 ## Desempenho e paralelismo
 
 Medido em 2026-10-27, AMD Ryzen AI MAX+ 395 (32 threads), build release, dois motores nossos no

@@ -69,6 +69,9 @@ mount -t tmpfs tmpfs /var/lib
 mkdir -p /var/run/frr /etc/frr /var/lib/frr /run/netns
 export LD_LIBRARY_PATH=$FRR_DIR/root/usr/lib/x86_64-linux-gnu:$FRR_DIR/root/usr/lib/x86_64-linux-gnu/frr
 FRR=$FRR_DIR/root/usr/lib/frr
+# BFDD_BIN: another bfdd (G3.6n: the image's, with os/patches/frr, through
+# a wrapper that runs it with the image's loader and libraries).
+BFDD=${BFDD_BIN:-$FRR/bfdd}
 bin=$CARGO_TARGET_DIR/release
 CASES=("$@")
 [ ${#CASES[@]} -gt 0 ] || CASES=(ebgp ebgp6 mpbgp md5 filters extcomm announce nexthop-self rr maxprefix restart gr hardreset cbit llgr bfd convergence scale)
@@ -147,7 +150,7 @@ frr_start() {
   for p in "$@"; do
     case $p in
       mgmtd|staticd) ip netns exec "$ns" "$FRR/$p" -N "$ns" -u root -g root -d --limit-fds 4096 ;;
-      bfdd) ip netns exec "$ns" "$FRR/bfdd" -N "$ns" -u root -g root -d --limit-fds 4096 \
+      bfdd) ip netns exec "$ns" "$BFDD" -N "$ns" -u root -g root -d --limit-fds 4096 \
               -f "/etc/frr/$ns/bfdd.conf" --dplaneaddr "unix:/var/run/frr/$ns/bfdd_dplane.sock" ;;
       *) ip netns exec "$ns" "$FRR/$p" -N "$ns" -u root -g root -d --limit-fds 4096 -f "/etc/frr/$ns/$p.conf" ;;
     esac </dev/null >>"$W/frr-$ns.log" 2>&1
@@ -704,7 +707,7 @@ cbit_round() { # cbit_round <label> <CR1 extra> <CR2 extra> <what to kill: stack
   [ "$kept" = no ] && sleep 2
   case $what in
     stack|frr)
-      ip netns exec c1 "$FRR/bfdd" -N c1 -u root -g root -d --limit-fds 4096 -f /etc/frr/c1/bfdd.conf --dplaneaddr unix:/var/run/frr/c1/bfdd_dplane.sock </dev/null >>"$W/frr-c1.log" 2>&1
+      ip netns exec c1 "$BFDD" -N c1 -u root -g root -d --limit-fds 4096 -f /etc/frr/c1/bfdd.conf --dplaneaddr unix:/var/run/frr/c1/bfdd_dplane.sock </dev/null >>"$W/frr-c1.log" 2>&1
       ip netns exec c1 "$FRR/bgpd" -N c1 -u root -g root -d --limit-fds 4096 -f /etc/frr/c1/bgpd.conf </dev/null >>"$W/frr-c1.log" 2>&1 ;;
   esac
   case $what in

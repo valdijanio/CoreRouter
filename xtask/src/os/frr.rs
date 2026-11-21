@@ -513,7 +513,12 @@ fn bfd_of(vm: &mut Vm, log: &mut std::fs::File) -> Result<(String, u64, u64), St
 /// takes it back Up (`Session::resume`). r2's session stays Up the whole
 /// time, with no state change, and r1's comes back with the same
 /// discriminator.
-fn bfd_survives(r1: &mut Vm, r2: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), String> {
+fn bfd_survives(
+    r1: &mut Vm,
+    r2: &mut Vm,
+    log: &mut std::fs::File,
+    nums: &mut Numbers,
+) -> Result<(), String> {
     let (state, changes, _) = bfd_of(r2, log)?;
     check(state == "up", format!("r2: BFD {state} before the kill"))?;
     let (_, _, discr) = bfd_of(r1, log)?;
@@ -527,21 +532,34 @@ fn bfd_survives(r1: &mut Vm, r2: &mut Vm, log: &mut std::fs::File, nums: &mut Nu
         seen.push(format!("{:.1}s {s}", t0.elapsed().as_secs_f64()));
         check(
             s == "up" && c == changes,
-            format!("r2: BFD went {s} after r1's daemon was killed ({} state changes): {seen:?}", c.saturating_sub(changes)),
+            format!(
+                "r2: BFD went {s} after r1's daemon was killed ({} state changes): {seen:?}",
+                c.saturating_sub(changes)
+            ),
         )?;
     }
     let back = until(r1, log, 30, "routing.bfd.session.list", "{}", |v| {
         v["result"]["sessions"][0]["state"] == "up"
     })?;
     let now = sh(r1, log, "pidof corerouter-daemon")?;
-    check(now != pid, format!("r1: the daemon was not restarted ({pid})"))?;
+    check(
+        now != pid,
+        format!("r1: the daemon was not restarted ({pid})"),
+    )?;
     check(
         back["result"]["sessions"][0]["local_discr"].as_u64() == Some(discr),
         format!("r1: the session came back with another discriminator: {back}"),
     )?;
     let (s, c, _) = bfd_of(r2, log)?;
-    check(s == "up" && c == changes, format!("r2: BFD {s}, {c} changes after r1 took it back"))?;
-    let bfdd = sh(r1, log, "grep -ciE 'fallback|software' /var/log/frr-bfdd.log; echo")?;
+    check(
+        s == "up" && c == changes,
+        format!("r2: BFD {s}, {c} changes after r1 took it back"),
+    )?;
+    let bfdd = sh(
+        r1,
+        log,
+        "grep -ciE 'fallback|software' /var/log/frr-bfdd.log; echo",
+    )?;
     nums.put(
         "r1: kill -9 of corerouter-daemon (BFD by bfdd in software, then back)",
         format!(

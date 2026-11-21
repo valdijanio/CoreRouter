@@ -311,10 +311,15 @@ impl Session {
 
     /// The earliest time [`Session::on_timer`] has work.
     pub fn next_deadline(&self) -> Option<u64> {
-        [self.next_tx, self.detect_at, self.forget_auth_at, self.resume_until]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.next_tx,
+            self.detect_at,
+            self.forget_auth_at,
+            self.resume_until,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// §6.8.7: no periodic packets when the peer asks for none (Required
@@ -412,7 +417,10 @@ impl Session {
         // §6.8.1 bfd.AuthSeqKnown: forgotten after two Detection Times of silence.
         self.forget_auth_at = (self.cfg.auth.is_some() && detect > 0).then_some(now + 2 * detect);
         let resumed = self.resume_until.take().is_some_and(|until| {
-            now < until && self.state == State::Down && p.state == State::Up && p.your_discr == self.local_discr
+            now < until
+                && self.state == State::Down
+                && p.state == State::Up
+                && p.your_discr == self.local_discr
         });
         if resumed {
             out.change = self.set_state(State::Up, Diag::None);
@@ -681,7 +689,11 @@ mod tests {
         w.run(400 * MS);
         assert_eq!((w.a.state(), w.b.state()), (State::Up, State::Up));
         assert!(!w.a.resuming());
-        assert!(w.changes.iter().all(|(who, _)| *who == 'a'), "the peer never changed: {:?}", w.changes);
+        assert!(
+            w.changes.iter().all(|(who, _)| *who == 'a'),
+            "the peer never changed: {:?}",
+            w.changes
+        );
         assert_eq!(w.changes.len(), 1, "{:?}", w.changes);
         assert_eq!(w.a.remote_discr(), 0x2222);
         // And it stays up (the Poll Sequence of the fast timers ends).
@@ -709,7 +721,10 @@ mod tests {
         let p = Packet::decode(&raw[..m]).unwrap();
         let r = a.receive(&raw[..m], &p, 20 * MS).unwrap();
         assert!(r.change.is_none() && a.state() == State::Down && !a.resuming());
-        assert!(a.next_deadline().is_some_and(|t| t <= 20 * MS + 1_000 * MS), "sending again");
+        assert!(
+            a.next_deadline().is_some_and(|t| t <= 20 * MS + 1_000 * MS),
+            "sending again"
+        );
         // Silence for the whole wait: it starts sending at its end.
         let mut c = Session::new(0x3333, fast(), 0, 3);
         c.resume(75 * MS);
@@ -717,7 +732,15 @@ mod tests {
         assert!(c.on_timer(75 * MS).send);
         assert!(!c.resuming() && c.state() == State::Down);
         // Only a Down session waits.
-        let mut d = Session::new(0x4444, Config { admin_down: true, ..fast() }, 0, 4);
+        let mut d = Session::new(
+            0x4444,
+            Config {
+                admin_down: true,
+                ..fast()
+            },
+            0,
+            4,
+        );
         d.resume(75 * MS);
         assert!(!d.resuming());
     }
