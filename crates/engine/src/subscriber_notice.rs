@@ -277,7 +277,7 @@ impl Session {
     /// (IPv4 and IPv6: the PPP helper is IPv4 only).
     fn notice_put(&mut self, items: &[(Name, IpAddr, u64, String)]) {
         use corerouter_hal::DynamicChange;
-        let now = self.now();
+        let now = self.steady_now();
         let mut drop = HashSet::new();
         for (list, ip, _, _) in items {
             if let Some(e) = self.dynamic_addresses.find(list, &AddrMatch::Net(ipnet::IpNet::from(*ip))) {
@@ -321,7 +321,7 @@ impl Session {
     /// set otherwise).
     pub fn notice_resolved(&mut self, list: &str, host: &str, ips: &[IpAddr], ttl: u64) {
         let Ok(name) = list.parse::<Name>() else { return };
-        let now = self.now();
+        let now = self.steady_now();
         let items: Vec<(Name, IpAddr, u64, String)> = ips
             .iter()
             .take(32)

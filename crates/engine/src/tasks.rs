@@ -406,7 +406,7 @@ impl Session {
 
     pub(crate) fn expire_tasks(&mut self) {
         self.log_finished_tasks();
-        if let Some(now) = self.now() {
+        if let Some(now) = self.steady_now() {
             self.tasks.expire(now);
         }
     }
@@ -444,7 +444,7 @@ impl Session {
         runner
             .spawn(&format!("{kind}-{id}"), wrapped)
             .map_err(|e| EngineError::Hal(format!("cannot start the task: {e}")))?;
-        let now = self.now();
+        let now = self.steady_now();
         self.tasks.entries.insert(
             id,
             Entry {
@@ -526,7 +526,7 @@ impl Session {
 
     pub(crate) fn task_list(&mut self) -> Value {
         self.expire_tasks();
-        let now = self.now();
+        let now = self.steady_now();
         Value::Array(
             self.tasks
                 .entries
@@ -566,7 +566,7 @@ impl Session {
     /// Events after `after_seq` (at most `max`), the summary and the state.
     pub(crate) fn task_poll(&mut self, id: u64, after_seq: u64, max: usize) -> Result<Value> {
         self.log_finished_tasks();
-        let now = self.now();
+        let now = self.steady_now();
         let e = self.task(id)?;
         if now.is_some() {
             e.seen = now;
@@ -841,6 +841,71 @@ mod tests {
         s.tick(1_000 + 2 * ABANDON_SECS + KEEP_SECS);
         assert!(s.task_list().as_array().unwrap().is_empty());
         assert!(s.task_poll(id, 0, 1).is_err());
+    }
+
+    /// G0.13: abandonment counts on the monotonic clock: an NTP step of the
+    /// wall clock (ahead or back) is not time without a poll.
+    #[test]
+    fn abandonment_follows_the_monotonic_clock() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct Clocks {
+            inner: corerouter_hal::VirtualHal,
+            wall: Arc<AtomicU64>,
+            mono: Arc<AtomicU64>,
+        }
+        impl corerouter_hal::Hal for Clocks {
+            fn describe(&self) -> String {
+                "clocks".into()
+            }
+            fn discover_links(
+                &mut self,
+            ) -> std::result::Result<Vec<corerouter_hal::LinkInfo>, corerouter_hal::HalError> {
+                self.inner.discover_links()
+            }
+            fn apply(
+                &mut self,
+                a: &corerouter_model::Config,
+                b: &corerouter_model::Config,
+            ) -> std::result::Result<(), corerouter_hal::HalError> {
+                self.inner.apply(a, b)
+            }
+            fn poll(&mut self) -> Vec<corerouter_hal::LinkState> {
+                self.inner.poll()
+            }
+            fn now_unix(&self) -> Option<u64> {
+                Some(self.wall.load(Ordering::SeqCst))
+            }
+            fn monotonic_secs(&self) -> Option<u64> {
+                Some(self.mono.load(Ordering::SeqCst))
+            }
+        }
+        let wall = Arc::new(AtomicU64::new(1_000));
+        let mono = Arc::new(AtomicU64::new(5));
+        let mut s = Session::new(Box::new(Clocks {
+            inner: corerouter_hal::VirtualHal::default(),
+            wall: wall.clone(),
+            mono: mono.clone(),
+        }));
+        s.set_runner(test_runner::sim());
+        let id = s
+            .start_task("test", "forever".into(), |ctx| {
+                while ctx.sleep(Duration::from_secs(3600)) {}
+                Ok(())
+            })
+            .unwrap();
+        // NTP steps 56 years ahead, then back to 1970: one second each.
+        for w in [1_800_000_000, 10] {
+            wall.store(w, Ordering::SeqCst);
+            mono.fetch_add(1, Ordering::SeqCst);
+            s.tick(w);
+            assert_eq!(s.task_list()[0]["state"], "running", "step to {w}");
+        }
+        assert_eq!(s.task_list()[0]["age_secs"], 2);
+        // Abandoned when ABANDON_SECS really passed without a poll.
+        mono.fetch_add(ABANDON_SECS - 2, Ordering::SeqCst);
+        s.tick(10);
+        let p = wait_done(&mut s, id);
+        assert!(p["reason"].as_str().unwrap().contains("abandoned"), "{p}");
     }
 
     /// Audit #12: stop and poll were plain queries with no owner check.

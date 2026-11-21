@@ -19,6 +19,7 @@ mod cgnat_battery;
 mod cgnat_blocks;
 mod cgnat_capacity;
 mod cgnat_conntrack;
+mod clock_steps;
 mod command_sweep;
 mod config_journal;
 mod connections;

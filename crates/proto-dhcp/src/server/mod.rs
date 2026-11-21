@@ -1752,6 +1752,31 @@ impl Server {
         out
     }
 
+    /// The wall clock stepped by `delta` seconds (NTP, an operator; G0.13):
+    /// every Unix time the server keeps moves with it, so leases, offers,
+    /// conflict holds and alert timers keep the time they had left. The
+    /// caller (the engine) tells a step apart from elapsed time with the
+    /// monotonic clock, and rewrites the journal afterwards. The ms timers
+    /// (probes, conflict checks, parked offers) already run on the
+    /// monotonic clock.
+    pub fn clock_step(&mut self, delta: i64) {
+        use crate::shift_secs;
+        self.leases.shift(delta);
+        for s in self.seen.values_mut() {
+            s.first = shift_secs(s.first, delta);
+            s.last = shift_secs(s.last, delta);
+            s.alerted = shift_secs(s.alerted, delta);
+        }
+        for v in self.alert_probe.values_mut() {
+            *v = shift_secs(*v, delta);
+        }
+        for v in self.full_logged.values_mut() {
+            *v = shift_secs(*v, delta);
+        }
+        self.stats.shift(delta);
+        self.last_tick = shift_secs(self.last_tick, delta);
+    }
+
     /// Run once a second: leases, offers and holds that ran out; alerts
     /// that timed out.
     pub fn tick(&mut self, now: Now) -> Vec<Effect> {

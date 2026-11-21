@@ -530,3 +530,15 @@ mod tests {
         assert!(validate(&c)[0].path.ends_with("host_name"));
     }
 }
+
+/// `t` (Unix seconds) moved by a wall-clock step of `delta` seconds; 0
+/// ("never") stays 0 (G0.13).
+pub fn shift_secs(t: u64, delta: i64) -> u64 {
+    if t == 0 {
+        0
+    } else if delta >= 0 {
+        t.saturating_add(delta.unsigned_abs())
+    } else {
+        t.saturating_sub(delta.unsigned_abs()).max(1)
+    }
+}
