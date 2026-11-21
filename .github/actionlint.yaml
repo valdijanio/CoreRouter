@@ -1,0 +1,4 @@
+# actionlint (local): the self-hosted runner's label (docs/ci-runner.md).
+self-hosted-runner:
+  labels:
+    - corerouter

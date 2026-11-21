@@ -3,6 +3,10 @@
 # e os testes em namespace. Falhou: abre (ou comenta) a issue "CI noturno quebrado", como o
 # `main-red`; verde de novo: fecha. A regressão gravada de cada proptest (`proptest-regressions/`)
 # roda antes dos casos novos em toda camada, com qualquer `PROPTEST_CASES`.
+# G0.30k: o job `regression` roda os laboratórios que não precisam de root no runner próprio
+# (docs/ci-runner.md) e compara os números com a última noite verde; piorou além da margem de
+# cada métrica (calibrada pelo ruído entre noites verdes): abre ou comenta a issue "Regressão
+# noturna"; voltou: fecha. O histórico fica na branch `nightly-data`.
 # Actions fixadas por SHA; o comentário diz a versão.
 
 name: nightly
@@ -13,6 +17,11 @@ on:
     - cron: "17 6 * * *"
   # Rodar à mão (Actions → nightly → Run workflow).
   workflow_dispatch:
+    inputs:
+      accept:
+        description: "Regressão: aceitar o nível desta noite como o novo normal (grava a noite como verde)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -58,9 +67,96 @@ jobs:
           kernel: "true"
       - run: cargo xtask ci --only netns
 
+  # G0.30k: os laboratórios inteiros, comparados com a última noite verde. Só na `main`: o hook
+  # do runner recusa qualquer outra coisa (schedule e workflow_dispatch na main, docs/ci-runner.md).
+  # Sem runner online o job espera na fila do Actions (até 24 h) e a próxima noite espera por ele
+  # (concurrency).
+  regression:
+    name: regressão
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, corerouter]
+    timeout-minutes: 120
+    permissions:
+      contents: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      SHA: ${{ github.sha }}
+      ACCEPT: ${{ inputs.accept || false }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup
+      - name: Histórico (branch nightly-data)
+        run: |
+          set -euo pipefail
+          data="$RUNNER_TEMP/nightly-data"
+          rm -rf "$data"
+          if git ls-remote --exit-code --heads origin nightly-data >/dev/null; then
+            git fetch -q origin nightly-data
+            git worktree add -f "$data" FETCH_HEAD
+          else
+            git worktree add -f --detach "$data"
+            git -C "$data" checkout -q --orphan nightly-data
+            git -C "$data" rm -rq . || true
+          fi
+          mkdir -p "$data/nights"
+      - name: Laboratórios e comparação
+        run: scripts/nightly-regress.sh --history "$RUNNER_TEMP/nightly-data/nights" --out "$RUNNER_TEMP/nightly"
+      - name: Resumo
+        if: always()
+        run: |
+          out="$RUNNER_TEMP/nightly"
+          { echo "## Regressão noturna: $(cat "$out/verdict" 2>/dev/null || echo broken)"; echo; cat "$out/report.md" 2>/dev/null || true; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: nightly-regression
+          path: ${{ runner.temp }}/nightly
+          retention-days: 30
+      - name: Gravar a noite e abrir, comentar ou fechar a issue "Regressão noturna"
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/nightly" data="$RUNNER_TEMP/nightly-data"
+          verdict=$(cat "$out/verdict")
+          short=${SHA:0:7}
+          if [ "$verdict" = broken ]; then
+            echo "::error::um laboratório falhou: a noite não é comparada nem gravada (veja o artefato nightly-regression)"
+            exit 1
+          fi
+          kind=$verdict
+          [ "$verdict" = regressed ] && [ "$ACCEPT" = true ] && kind=ok
+          color=$([ "$kind" = ok ] && echo green || echo red)
+          cp "$out/metrics.jsonl" "$data/nights/$(date -u +%Y%m%d)-${short}.${color}.jsonl"
+          git -C "$data" add nights
+          git -C "$data" -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -qm "noite ${short}: ${verdict}$([ "$kind" != "$verdict" ] && echo ' (aceita)' || true)"
+          git -C "$data" push -q origin HEAD:refs/heads/nightly-data
+          label="regressao-noturna"
+          gh label create "$label" --color FBCA04 \
+            --description "Um laboratório piorou além da margem em relação à última noite verde" 2>/dev/null || true
+          open=$(gh issue list --label "$label" --state open --json number --jq '.[0].number // empty')
+          if [ "$verdict" = regressed ] && [ "$kind" != ok ]; then
+            body="A noite do commit \`${short}\` da \`main\` piorou em relação à última noite verde.
+
+          $(cat "$out/report.md")
+
+          Log e números: ${RUN_URL} (artefato \`nightly-regression\`). Reproduzir: \`scripts/nightly-regress.sh --history <pasta com as noites da branch nightly-data> --out /tmp/n\`. Se o nível novo é o esperado, rode o workflow à mão com \`accept\`."
+            if [ -n "$open" ]; then
+              gh issue comment "$open" --body "$body"
+            else
+              gh issue create --title "Regressão noturna" --label "$label" --body "$body"
+            fi
+          elif [ -n "$open" ]; then
+            gh issue close "$open" --comment "A noite do commit \`${short}\` voltou ao nível da última noite verde$([ "$kind" != "$verdict" ] && echo ' (nível novo aceito à mão)' || true) (${RUN_URL})."
+          fi
+
   alert:
     name: issue
-    needs: [test, netns]
+    needs: [test, netns, regression]
     if: always() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -80,7 +176,7 @@ jobs:
           gh label create "$label" --color D93F0B \
             --description "O CI noturno (camada lenta) falhou" 2>/dev/null || true
           open=$(gh issue list --label "$label" --state open --json number --jq '.[0].number // empty')
-          failed=$(echo "$RESULTS" | jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"')
+          failed=$(echo "$RESULTS" | jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | "\(.key): \(.value.result)"')
           short=${SHA:0:7}
           if [ -n "$failed" ]; then
             body="O CI noturno falhou no commit \`${short}\` da \`main\`:

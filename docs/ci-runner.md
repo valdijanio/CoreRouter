@@ -39,8 +39,9 @@ Três camadas, cada uma suficiente para o caso comum:
    ou cria `queue/*`.
 2. **Hook do runner** (`ACTIONS_RUNNER_HOOK_JOB_STARTED=/etc/corerouter-ci/job-started.sh`, do
    root, posto pelo `EnvironmentFile` da unit, fora do alcance do job): roda antes de cada job e
-   o **reprova antes do primeiro passo** se não for `push` em `refs/heads/main` ou
-   `workflow_dispatch` em `refs/heads/queue/*` de `valdijanio/CoreRouter`. Variável ausente
+   o **reprova antes do primeiro passo** se não for `push`, `schedule` ou `workflow_dispatch` em
+   `refs/heads/main`, ou `workflow_dispatch` em `refs/heads/queue/*`, de `valdijanio/CoreRouter`
+   (o `schedule` sempre roda o workflow da `main`; G0.30k). Variável ausente
    reprova (falha fechada). Isto vale mesmo que um PR de fork altere o `ci.yml` para pedir
    `runs-on: self-hosted`: o `pull_request` usa o workflow do próprio PR, então só o roteamento
    não bastaria. Cada veredicto vai para `/var/lib/corerouter-ci/jobs.log` (`status` mostra os
@@ -96,6 +97,39 @@ ping), endereços das faixas privadas e IPv6 não. O `create` falha se algo vaza
   poderoso do que o que se protege. Aqui o runner é persistente, mas só recebe código confiável
   (hook), não tem sudo nem rede local, e o disco volta ao snapshot a cada N jobs. Se um dia houver
   PR de fora no runner, o próximo passo é o JIT com um GitHub App de escopo mínimo.
+
+## Regressão noturna (G0.30k)
+
+O job `regression` do `.github/workflows/nightly.yml` roda aqui toda noite (06:17 UTC), só na
+`main`: `scripts/nightly-regress.sh` compila o release, roda o laboratório de DNS num namespace
+de usuário (`dns-stress-lab.sh --userns`, testes `qps`, `hostile` e `ops`, 10 s por medição; as
+ferramentas vêm dos pacotes assinados do Ubuntu por `apt-get download`, sem root, e ficam no
+disco de cache) e junta os números em `metrics.jsonl` (uma linha por métrica: vazão na
+saturação, p99 na metade da carga, p99 de cada comando com carga, RSS do daemon depois de cada
+teste). `cargo xtask nightly compare` compara cada métrica com a última noite verde:
+
+- **margem por métrica**, calibrada pelo ruído: as variações entre noites verdes seguidas (até
+  30) dão a cerca superior `Q3 + 3 × IQR`, como no rustc-perf, nunca abaixo de 3 %. Com menos de
+  5 variações a métrica ainda calibra: passar de 15 % aparece no relatório, mas não deixa a noite
+  vermelha (duas rodadas do mesmo build num host carregado diferiram até 23× num p99, **medido**
+  em 2026-11-21; uma margem fixa daria alarme falso). As primeiras 5 noites só aprendem o ruído;
+- piorou além da margem: a noite fica vermelha e a issue **"Regressão noturna"** (rótulo
+  `regressao-noturna`) abre ou ganha um comentário com as métricas, os dois valores, a margem e
+  os commits desde a última noite verde; a próxima noite que voltar ao nível a fecha;
+- um laboratório falhou: a noite não conta, o job fica vermelho e o `alert` abre "CI noturno
+  quebrado";
+- **nível novo esperado** (uma mudança que troca vazão por segurança, por exemplo): rode o
+  workflow à mão (Actions → nightly → Run workflow) com `accept`; a noite entra como verde.
+
+O histórico é a branch `nightly-data` (`nights/<data>-<commit>.<green|red>.jsonl`), escrita só
+pelo job. Para repetir à mão: `git worktree add /tmp/nd origin/nightly-data` e
+`scripts/nightly-regress.sh --history /tmp/nd/nights --out /tmp/n` (com `--tools` apontando para
+os pacotes desempacotados, se o host não tiver `apt-get download`).
+
+Os laboratórios que precisam de root ou de KVM (`ospf-stress-lab.sh`, `os boot-test`,
+`install-test`) ainda não entram: o `runner` não tem sudo, não está no grupo `kvm` e a VM não
+tem QEMU (gap G0.30o). O hook
+novo vale depois de `cargo xtask ci-runner hooks` (ou do próximo `reset`).
 
 ## Etapa do usuário (uma vez)
 
