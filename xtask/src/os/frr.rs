@@ -555,8 +555,12 @@ fn oom(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), S
     // names the victim.
     let h = until(vm, log, 30, "system.health.check", "{}", |v| {
         v["result"]["checks"].as_array().is_some_and(|c| {
-            c.iter()
-                .any(|c| c["key"] == "oom" && c["reason"].as_str().is_some_and(|r| r.contains("tail (pid")))
+            c.iter().any(|c| {
+                c["key"] == "oom"
+                    && c["reason"]
+                        .as_str()
+                        .is_some_and(|r| r.contains("tail (pid"))
+            })
         })
     })?;
     let reason = h["result"]["checks"]

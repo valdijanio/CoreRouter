@@ -780,9 +780,7 @@ pub fn oom_kill(message: &str) -> Option<OomKill> {
     }
     let fields = rest.get(end + 1..).unwrap_or("");
     let field = |name: &str| -> Option<&str> {
-        fields
-            .split([' ', ','])
-            .find_map(|w| w.strip_prefix(name))
+        fields.split([' ', ',']).find_map(|w| w.strip_prefix(name))
     };
     Some(OomKill {
         pid,
@@ -1132,12 +1130,28 @@ mod tests {
     #[test]
     fn oom_kill_lines() {
         let k = oom_kill("Out of memory: Killed process 8225 (unbound) total-vm:812344kB, anon-rss:602112kB, file-rss:0kB, shmem-rss:0kB, UID:107 pgtables:1532kB oom_score_adj:0").unwrap();
-        assert_eq!((k.pid, k.comm.as_str(), k.anon_rss_kb, k.oom_score_adj, k.memcg), (8225, "unbound", Some(602_112), Some(0), false));
+        assert_eq!(
+            (
+                k.pid,
+                k.comm.as_str(),
+                k.anon_rss_kb,
+                k.oom_score_adj,
+                k.memcg
+            ),
+            (8225, "unbound", Some(602_112), Some(0), false)
+        );
         let k = oom_kill("Out of memory: Killed process 12 (corerouter-daem) total-vm:1kB, anon-rss:9kB, file-rss:0kB, shmem-rss:0kB").unwrap();
-        assert_eq!((k.comm.as_str(), k.anon_rss_kb, k.oom_score_adj), ("corerouter-daem", Some(9), None));
+        assert_eq!(
+            (k.comm.as_str(), k.anon_rss_kb, k.oom_score_adj),
+            ("corerouter-daem", Some(9), None)
+        );
         let k = oom_kill("Memory cgroup out of memory: Killed process 7 (a) b) c) total-vm:1kB, anon-rss:2kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:4kB oom_score_adj:-900").unwrap();
-        assert_eq!((k.comm.as_str(), k.oom_score_adj, k.memcg), ("a) b) c", Some(-900), true));
-        let k = oom_kill("Out of memory (oom_kill_allocating_task): Killed process 3 (tail)").unwrap();
+        assert_eq!(
+            (k.comm.as_str(), k.oom_score_adj, k.memcg),
+            ("a) b) c", Some(-900), true)
+        );
+        let k =
+            oom_kill("Out of memory (oom_kill_allocating_task): Killed process 3 (tail)").unwrap();
         assert_eq!((k.pid, k.comm.as_str(), k.anon_rss_kb), (3, "tail", None));
         for not in [
             "Killed process 3 (tail)",
@@ -1150,7 +1164,11 @@ mod tests {
             assert_eq!(oom_kill(not), None, "{not}");
         }
         // The fixture's four deaths of unbound.
-        let n = KMSG.lines().filter_map(|l| l.split_once(';')).filter(|(_, m)| oom_kill(m).is_some()).count();
+        let n = KMSG
+            .lines()
+            .filter_map(|l| l.split_once(';'))
+            .filter(|(_, m)| oom_kill(m).is_some())
+            .count();
         assert_eq!(n, 4);
     }
 
