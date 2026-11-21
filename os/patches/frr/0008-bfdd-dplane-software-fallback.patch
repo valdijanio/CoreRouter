@@ -22,20 +22,31 @@ took the BGP session down with a Cease/BFD Down (RFC 9384) while bgpd,
 zebra and the kernel's forwarding were untouched; the neighbor lost its
 routes 416-423 ms after the data plane died.
 
+And the way back has a third: when the data plane connects again,
+_bfd_session_register_dplane() calls bfd_session_disable(), which tells
+the clients the session went down (path-down), and DP_ADD_SESSION
+carries no state, so the data plane starts the session Down and the
+peer goes down too.
+
 Open the listening sockets while no data plane is attached (the session
 count that starts them in bfd_session_enable() and stops them in
 bfd_session_disable(), when the sessions move to a data plane that
-connects, already tracks the software sessions), and give a fallen back
-Up session the negotiated timers the data plane reported in its state
+connects, already tracks the software sessions); give a fallen back Up
+session the negotiated timers the data plane reported in its state
 changes (RFC 5880, sections 6.8.3, 6.8.4 and 6.8.7), sending one packet
-at once.
+at once; and hand an Up session back without telling the clients it
+went down, with a new DP_ADD_SESSION flag, SESSION_RESUME, so the data
+plane can resume it Up when the peer's packets carry its discriminator
+(and report Down otherwise). A data plane that ignores the flag starts
+the session Down, as before.
+
+Measured (a CoreRouter data plane killed with kill -9 and restarted 3 s
+later, BFD 100 ms x 3, eBGP with graceful restart): the neighbor kept its
+routes and its BGP and BFD sessions; before, it lost them 476 ms after
+the kill.
 
 Signed-off-by: CoreRouter <noreply@corerouter>
 ---
- bfdd/bfd.c    |  8 ++++++--
- bfdd/dplane.c | 22 ++++++++++++++++++++++
- 2 files changed, 28 insertions(+), 2 deletions(-)
-
 --- a/bfdd/bfd.c
 +++ b/bfdd/bfd.c
 @@ -2913,8 +2913,12 @@
@@ -55,7 +66,39 @@ Signed-off-by: CoreRouter <noreply@corerouter>
  	if (!bfd_vrf_is_perm(bvrf->vrf->name))
 --- a/bfdd/dplane.c
 +++ b/bfdd/dplane.c
-@@ -677,6 +677,28 @@
+@@ -100,7 +100,7 @@
+ static bool bfd_dplane_client_connecting(struct bfd_dplane_ctx *bdc);
+ static void bfd_dplane_ctx_free(struct bfd_dplane_ctx *bdc);
+ static int _bfd_dplane_add_session(struct bfd_dplane_ctx *bdc,
+-				   struct bfd_session *bs);
++				   struct bfd_session *bs, bool resume);
+ 
+ /*
+  * BFD data plane helper functions.
+@@ -636,11 +636,21 @@
+ 	if (bs->bdc != NULL)
+ 		return;
+ 
++	/*
++	 * A session Up in software moves Up: bfd_session_disable() would tell
++	 * the clients it went down (path-down) and they would drop their
++	 * sessions for a handover. The data plane resumes it, or reports Down.
++	 */
++	bool resume = bs->ses_state == PTM_BFD_UP;
++
++	if (resume)
++		bs->ses_state = PTM_BFD_DOWN;
++
+ 	/* Disable software session. */
+ 	bfd_session_disable(bs);
+ 
+ 	/* Move session to data plane. */
+-	_bfd_dplane_add_session(bdc, bs);
++	_bfd_dplane_add_session(bdc, bs, resume);
+ }
+ 
+ static struct bfd_dplane_ctx *bfd_dplane_ctx_new(int sock)
+@@ -677,6 +687,28 @@
  
  	/* Fallback to software. */
  	bfd_session_enable(bs);
@@ -84,6 +127,56 @@ Signed-off-by: CoreRouter <noreply@corerouter>
  }
  
  static void bfd_dplane_ctx_free(struct bfd_dplane_ctx *bdc)
+@@ -766,8 +798,9 @@
+ }
+ 
+ static int _bfd_dplane_add_session(struct bfd_dplane_ctx *bdc,
+-				   struct bfd_session *bs)
++				   struct bfd_session *bs, bool resume)
+ {
++	struct bfddp_message msg = {};
+ 	int rv;
+ 
+ 	/* Associate session. */
+@@ -779,7 +812,10 @@
+ 	bs->ses_state = PTM_BFD_DOWN;
+ 
+ 	/* Enqueue message to data plane client. */
+-	rv = bfd_dplane_update_session(bs);
++	_bfd_dplane_session_fill(bs, &msg);
++	if (resume)
++		msg.data.session.flags |= htonl(SESSION_RESUME);
++	rv = bfd_dplane_enqueue(bdc, &msg, ntohs(msg.header.length));
+ 	if (rv != 0)
+ 		bs->bdc = NULL;
+ 
+@@ -1104,7 +1140,7 @@
+ 
+ 	/* Select a data plane client to install session. */
+ 	TAILQ_FOREACH (bdc, &bglobal.bg_dplaneq, entry) {
+-		if (_bfd_dplane_add_session(bdc, bs) == 0)
++		if (_bfd_dplane_add_session(bdc, bs, false) == 0)
+ 			return 0;
+ 	}
+ 
+--- a/bfdd/bfddp_packet.h
++++ b/bfdd/bfddp_packet.h
+@@ -109,6 +109,15 @@
+ 	SESSION_PASSIVE = (1 << 5),
+ 	/** Set when session is administrative down. */
+ 	SESSION_SHUTDOWN = (1 << 6),
++	/**
++	 * Set when a session bfdd had Up moves to this data plane (it ran in
++	 * software while no data plane was attached): the data plane may resume
++	 * it Up when the peer's packets carry its discriminator, instead of
++	 * starting it Down, which would take the peer down. bfdd did not tell
++	 * its clients the session went down; the data plane reports the state
++	 * it finds.
++	 */
++	SESSION_RESUME = (1 << 7),
+ };
+ 
+ /**
 -- 
 2.43.0
 

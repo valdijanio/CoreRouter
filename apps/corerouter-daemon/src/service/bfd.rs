@@ -276,7 +276,9 @@ fn dp_spec(cfg: &corerouter_model::Config, m: &corerouter_proto_bfd::dplane::DpS
     spec.cfg.detect_mult = m.detect_mult.max(1);
     spec.cfg.passive = m.passive();
     spec.cfg.admin_down = m.shutdown();
-    spec.resume_us = resume_us(&spec.cfg);
+    // G3.6n: only a session bfdd had Up (its patched fallback ran it while
+    // this daemon was away) waits to be resumed.
+    spec.resume_us = if m.resume() && !m.shutdown() { resume_us(&spec.cfg) } else { 0 };
     // G3.9fj: bfdd's SESSION_CBIT (`bgpd`'s `bfd check-control-plane-failure`)
     // is not followed: this engine dies with the daemon while the kernel
     // keeps forwarding, so C = 1 would be a lie (RFC 5880 §6.8.7). Sending
@@ -366,9 +368,8 @@ struct Controller {
 /// (its Detect Mult × our transmit interval, RFC 5880 §6.8.4, with its
 /// multiplier taken as ours), so a peer that sends at our rate is heard at
 /// least once and the silence it sees stays under its Detection Time.
-/// Without FRR's fix of the software fallback (os/patches/frr/0008) bfdd
-/// takes the sessions down when we restart, and this only delays the first
-/// Down packet.
+/// Only for a session bfdd hands over with `SESSION_RESUME`
+/// (os/patches/frr/0008: it ran Up in software while we were away).
 fn resume_us(cfg: &corerouter_proto_bfd::session::Config) -> u64 {
     (u64::from(cfg.desired_min_tx) * u64::from(cfg.detect_mult.max(1)) / 2).clamp(20_000, 1_500_000)
 }

@@ -733,7 +733,15 @@ case_cbit() {
   grep -q '^frr yes ' "$W/cbit-summary.txt" && grep -q '^stack yes ' "$W/cbit-summary.txt" \
     && result cbit OK "BFD + graceful restart: CR1's route kept with bgpd+bfdd or the whole stack killed ($s)" \
     || result cbit FAIL "BFD + graceful restart: $s"
-  grep -q '^daemon no ' "$W/cbit-summary.txt" && result cbit INFO "known gap: corerouter-daemon alone killed takes BFD down and the routes with it ($s)"
+  # G3.6n: with the image's bfdd (os/patches/frr/0008) the daemon alone
+  # killed keeps the routes too; FRR's own packages still lose them.
+  if grep -q '^daemon yes ' "$W/cbit-summary.txt"; then
+    result cbit OK "G3.6n: corerouter-daemon alone killed, BFD and the routes kept ($s)"
+  elif [ -n "${BFDD_BIN:-}" ]; then
+    result cbit FAIL "G3.6n: corerouter-daemon alone killed took BFD down with the patched bfdd ($s)"
+  else
+    result cbit INFO "unpatched bfdd (FRR's packages; BFDD_BIN= the image's): corerouter-daemon alone killed takes BFD down and the routes with it ($s)"
+  fi
 }
 
 # G3.9fj, RFC 9494. CR1 restarts gracefully with Restart Time 5 s; kill -9

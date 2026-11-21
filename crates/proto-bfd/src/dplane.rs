@@ -42,6 +42,9 @@ pub const SESSION_ECHO: u32 = 1 << 3;
 pub const SESSION_IPV6: u32 = 1 << 4;
 pub const SESSION_PASSIVE: u32 = 1 << 5;
 pub const SESSION_SHUTDOWN: u32 = 1 << 6;
+/// G3.6n (os/patches/frr/0008): bfdd had the session Up (in software,
+/// while no data plane was attached); the data plane may resume it.
+pub const SESSION_RESUME: u32 = 1 << 7;
 
 pub const RBIT_CPI: u32 = 1 << 0;
 pub const RBIT_DEMAND: u32 = 1 << 1;
@@ -84,6 +87,10 @@ impl DpSession {
     }
     pub fn shutdown(&self) -> bool {
         self.flags & SESSION_SHUTDOWN != 0
+    }
+    /// G3.6n: bfdd hands a session it had Up (`SESSION_RESUME`).
+    pub fn resume(&self) -> bool {
+        self.flags & SESSION_RESUME != 0
     }
 }
 

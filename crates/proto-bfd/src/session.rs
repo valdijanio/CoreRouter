@@ -296,7 +296,10 @@ impl Session {
     /// not ours), so the session goes on Up, without the Down → Init → Up
     /// that would take it, and its clients, down on the peer. Any other
     /// packet, or the end of the wait, starts it the normal way (§6.8.7: a
-    /// Down session sends at once). Only a Down session waits.
+    /// Down session sends at once) and reports Up → Down, as the session the
+    /// clients last heard of was Up (bfdd hands it over with
+    /// `SESSION_RESUME` without telling them otherwise). Only a Down session
+    /// waits.
     pub fn resume(&mut self, until: u64) {
         if self.state == State::Down {
             self.resume_until = Some(until);
@@ -416,14 +419,29 @@ impl Session {
         self.detect_at = (detect > 0).then_some(now + detect);
         // §6.8.1 bfd.AuthSeqKnown: forgotten after two Detection Times of silence.
         self.forget_auth_at = (self.cfg.auth.is_some() && detect > 0).then_some(now + 2 * detect);
-        let resumed = self.resume_until.take().is_some_and(|until| {
-            now < until
-                && self.state == State::Down
-                && p.state == State::Up
-                && p.your_discr == self.local_discr
+        let resuming = self
+            .resume_until
+            .take()
+            .filter(|_| self.state == State::Down);
+        let resumed = resuming.is_some_and(|until| {
+            now < until && p.state == State::Up && p.your_discr == self.local_discr
         });
         if resumed {
             out.change = self.set_state(State::Up, Diag::None);
+        } else if resuming.is_some() {
+            // Not the session the clients knew Up: they hear it went down;
+            // the next packet runs the normal handshake.
+            let diag = if matches!(p.state, State::Down | State::AdminDown) {
+                Diag::NeighborSignaledDown
+            } else {
+                Diag::ControlDetectionTimeExpired
+            };
+            self.local_diag = diag;
+            out.change = Some(Change {
+                from: State::Up,
+                to: State::Down,
+                diag,
+            });
         } else if self.state != State::AdminDown {
             out.change = if p.state == State::AdminDown {
                 if self.state != State::Down {
@@ -489,11 +507,21 @@ impl Session {
             self.forget_auth_at = None;
             self.rcv_seq.known = false;
         }
-        // G3.6n: nobody spoke while it waited: a Down session as any other.
+        // G3.6n: nobody spoke while it waited: the session the clients
+        // knew Up is down (§6.8.4, as a Detection Time of silence), and it
+        // starts as any Down session.
         if let Some(at) = self.resume_until
             && at <= now
         {
             self.resume_until = None;
+            if self.state == State::Down && out.change.is_none() {
+                self.local_diag = Diag::ControlDetectionTimeExpired;
+                out.change = Some(Change {
+                    from: State::Up,
+                    to: State::Down,
+                    diag: Diag::ControlDetectionTimeExpired,
+                });
+            }
             if self.periodic_allowed() && !out.send {
                 out.send = true;
                 self.schedule_tx(now);
@@ -720,7 +748,12 @@ mod tests {
         let m = p.encode(&mut raw);
         let p = Packet::decode(&raw[..m]).unwrap();
         let r = a.receive(&raw[..m], &p, 20 * MS).unwrap();
-        assert!(r.change.is_none() && a.state() == State::Down && !a.resuming());
+        let c = r.change.unwrap();
+        assert_eq!(
+            (c.from, c.to, c.diag),
+            (State::Up, State::Down, Diag::ControlDetectionTimeExpired)
+        );
+        assert!(a.state() == State::Down && !a.resuming());
         assert!(
             a.next_deadline().is_some_and(|t| t <= 20 * MS + 1_000 * MS),
             "sending again"
@@ -729,7 +762,12 @@ mod tests {
         let mut c = Session::new(0x3333, fast(), 0, 3);
         c.resume(75 * MS);
         assert!(!c.on_timer(74 * MS).send);
-        assert!(c.on_timer(75 * MS).send);
+        let f = c.on_timer(75 * MS);
+        assert!(f.send);
+        assert_eq!(
+            f.change.map(|c| (c.from, c.to)),
+            Some((State::Up, State::Down))
+        );
         assert!(!c.resuming() && c.state() == State::Down);
         // Only a Down session waits.
         let mut d = Session::new(
