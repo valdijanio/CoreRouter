@@ -35,7 +35,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Install and Reboot",
         [],
         None,
-        "{path: string (package file on the router), confirm?: auto|manual, timeout?: u32 (30..3600 s, default 300), reboot?: bool (default yes), force?: bool (reboot even in Safe Mode, which the reboot undoes, or with uncommitted changes, which are lost)} → {job, kind}",
+        "{path: string (package file on the router), confirm?: auto|manual, timeout?: u32 (30..3600 s, default 300), reboot?: bool (default yes), force?: bool (reboot even in Safe Mode, which the reboot undoes, or with uncommitted changes, which are lost)} → {job, kind, checkpoint?: {name, revision, rotated} | {error} (G0.33b: the automatic checkpoint saved before the image changes)}",
         always,
         update
     ),
@@ -44,7 +44,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Downgrade",
         [],
         None,
-        "{path?: string (older package; without it the other slot boots), confirm?: auto|manual, timeout?: u32 (30..3600 s), reboot?: bool, force?: bool (reboot even in Safe Mode, which the reboot undoes, or with uncommitted changes, which are lost)} → {job, kind}",
+        "{path?: string (older package; without it the other slot boots), confirm?: auto|manual, timeout?: u32 (30..3600 s), reboot?: bool, force?: bool (reboot even in Safe Mode, which the reboot undoes, or with uncommitted changes, which are lost)} → {job, kind, checkpoint?: {name, revision, rotated} | {error} (G0.33b: the automatic checkpoint saved before the image changes)}",
         always,
         downgrade
     ),
@@ -75,7 +75,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Upload Package",
         [],
         None,
-        "{size: u64 (bytes of the .crpkg), check?: bool (only check it, default no), downgrade?: bool (an older package), confirm?: auto|manual, timeout?: u32 (30..3600 s, default 300), reboot?: bool (default yes), force?: bool (reboot even in Safe Mode, which the reboot undoes, or with uncommitted changes, which are lost)} → {job, kind, upload, chunk}",
+        "{size: u64 (bytes of the .crpkg), check?: bool (only check it, default no), downgrade?: bool (an older package), confirm?: auto|manual, timeout?: u32 (30..3600 s, default 300), reboot?: bool (default yes), force?: bool (reboot even in Safe Mode, which the reboot undoes, or with uncommitted changes, which are lost)} → {job, kind, checkpoint?: {name, revision, rotated} | {error} (G0.33b: the automatic checkpoint saved before the image changes), upload, chunk}",
         always,
         upload_start
     ),
@@ -96,7 +96,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Download Package",
         [],
         None,
-        "{url: string (http:// or https:// of a .crpkg), check?: bool (only check it), downgrade?: bool, ssl_verify?: bool (default yes), confirm?: auto|manual, timeout?: u32 (30..3600 s), reboot?: bool, force?: bool (reboot even in Safe Mode, which the reboot undoes, or with uncommitted changes, which are lost)} → {job, kind}",
+        "{url: string (http:// or https:// of a .crpkg), check?: bool (only check it), downgrade?: bool, ssl_verify?: bool (default yes), confirm?: auto|manual, timeout?: u32 (30..3600 s), reboot?: bool, force?: bool (reboot even in Safe Mode, which the reboot undoes, or with uncommitted changes, which are lost)} → {job, kind, checkpoint?: {name, revision, rotated} | {error} (G0.33b: the automatic checkpoint saved before the image changes)}",
         always,
         download
     ),
@@ -276,6 +276,12 @@ pub(crate) fn queue(s: &mut Session, kind: JobKind, p: &Value) -> Result<Value> 
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    // G0.33b: the config as it is before the image changes, as a
+    // checkpoint (auto-<date>, the newest 4 kept): the A/B snapshot goes
+    // with the slot, this one stays on /config whatever boots next.
+    let checkpoint = kind
+        .replaces_image()
+        .then(|| super::config_checkpoint::before_change(s, &kind.describe()));
     let p = s
         .ext_mut::<Packages>()
         .ok_or_else(|| EngineError::Internal("package state".into()))?;
@@ -292,7 +298,11 @@ pub(crate) fn queue(s: &mut Session, kind: JobKind, p: &Value) -> Result<Value> 
         tuning,
         config_format: corerouter_model::FORMAT_VERSION,
     });
-    Ok(json!({"job": id, "kind": name}))
+    let mut out = json!({"job": id, "kind": name});
+    if let (Some(c), Some(o)) = (checkpoint, out.as_object_mut()) {
+        o.insert("checkpoint".into(), c);
+    }
+    Ok(out)
 }
 
 fn update(s: &mut Session, p: &Value) -> Result<Value> {
@@ -696,6 +706,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out["kind"], "update");
+        // G0.33b: the config before the update, as an automatic checkpoint.
+        let name = out["checkpoint"]["name"].as_str().unwrap().to_owned();
+        assert!(name.starts_with("auto-"), "{out}");
+        let list = s.execute("config.checkpoint.list", &json!({})).unwrap();
+        assert_eq!(list[0]["name"], name.as_str());
+        assert_eq!(list[0]["comment"], "before system.package.update /tmp/x.crpkg");
         let busy = s
             .execute("system.package.check", &json!({"path": "/tmp/y"}))
             .unwrap_err();
@@ -857,5 +873,33 @@ mod tests {
         let big = "A".repeat(MAX_CHUNK / 3 * 4 + 8);
         let e = s.execute("system.package.upload.chunk", &json!({"upload": id, "offset": 0, "data": big})).unwrap_err();
         assert!(e.to_string().contains("at most"), "{e}");
+    }
+
+    /// G0.33b: only the jobs that change the image save one; a failed
+    /// save never stops the update, and a URL's password stays out.
+    #[test]
+    fn which_jobs_save_an_automatic_checkpoint() {
+        let mut s = Session::virtual_lab();
+        ab(&mut s);
+        let out = s.execute("system.package.check", &json!({"path": "/tmp/y"})).unwrap();
+        assert!(out.get("checkpoint").is_none(), "{out}");
+        let job = take_job(&mut s).unwrap();
+        finish(&mut s, job.id, "check", Ok(json!({})));
+        assert!(s.execute("config.checkpoint.list", &json!({})).unwrap().as_array().unwrap().is_empty());
+        let kind = JobKind::Download {
+            url: "https://op:secret@pkgs.example/x.crpkg".into(),
+            verify: true,
+            downgrade: false,
+            check: false,
+        };
+        assert_eq!(kind.describe(), "system.package.download https://pkgs.example/x.crpkg");
+        // Safe Mode with force: the reboot undoes it; nothing to keep, the
+        // update goes on and says why there is no checkpoint.
+        s.execute("config.safe-mode.enter", &json!({})).unwrap();
+        let out = s
+            .execute("system.package.downgrade", &json!({"force": true}))
+            .unwrap();
+        assert!(out["checkpoint"]["error"].as_str().unwrap().contains("Safe Mode"), "{out}");
+        assert_eq!(out["kind"], "downgrade");
     }
 }

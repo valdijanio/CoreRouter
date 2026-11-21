@@ -743,7 +743,7 @@ fn test(s: &mut Session, p: &Value) -> Result<Value> {
     // The portal answers on the router: an input rule that drops the
     // subscriber's SYN to the port takes the page away.
     let dynamic: Vec<_> = {
-        let now = s.now();
+        let now = s.steady_now();
         s.dynamic_addresses.entries().iter().map(|e| e.data_plane(now)).collect()
     };
     let cfg = s.store().running();

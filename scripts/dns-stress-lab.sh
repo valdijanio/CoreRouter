@@ -58,7 +58,8 @@
 #   soak      moderate load for --soak-secs: RSS, threads, fds, cache, p99
 #
 # Results: $OUT/results.md (a table per test), $OUT/*.csv and $OUT/raw/;
-# exit 1 if a check failed.
+# $OUT/metrics.jsonl, one number per line for the nightly comparison
+# (G0.30k, `cargo xtask nightly compare`); exit 1 if a check failed.
 set -euo pipefail
 # Decimal points, not commas ($EPOCHREALTIME, awk, printf).
 export LC_ALL=C
@@ -176,7 +177,15 @@ if [ -z "$OUT" ]; then
 	if [ -d /srv/lab ]; then OUT=/srv/lab/dns-stress/$(date +%Y%m%d-%H%M%S); else OUT=$W/out; fi
 fi
 RESULTS=$OUT/results.md
+METRICS=$OUT/metrics.jsonl
 FAILED=0
+# metric <name> <value> <unit> <higher|lower>: a line of $METRICS (G0.30k:
+# the nightly run compares each with the last green night). Names are
+# stable across runs: a renamed metric starts a new series.
+metric() {
+	[ -n "$2" ] || return 0
+	printf '{"metric":"%s","value":%s,"unit":"%s","better":"%s"}\n' "$1" "$2" "$3" "$4" >>"$METRICS"
+}
 TLS_PORT=8729
 
 if [ $SELFTEST = 1 ]; then
@@ -886,6 +895,11 @@ alive_check() { # <what>: the daemon is still the same process and answers
 		fail "$1: panic in the daemon's log: $(grep -iE 'panic' "$W/dut/daemon.log" | head -n 2 | cut -c1-300)"
 	fi
 	q_one h1.up.lab A | grep -q NOERROR || { fail "$1: the forwarder stopped answering"; return 1; }
+	# The daemon's memory after each test (G0.30k: a leak shows night by night).
+	if local_dut; then
+		metric "dns.rss_mib.$(printf '%s' "$1" | tr -c 'a-zA-Z0-9-' _)" \
+			"$(awk '/^VmRSS:/ {print int($2 / 1024)}' "/proc/$DPID/status" 2>/dev/null)" MiB lower
+	fi
 }
 # Under max_concurrent_queries (100): a warm-up that overflowed it would
 # leave names out of the cache.
@@ -923,11 +937,13 @@ sat_and_half() { # <label> <query file> [setup command before each run]
 	local sat=$DP cpu
 	cpu=$(thr_cpu "$W/t0" "$W/t1" "$DUR")
 	say "| $label | saturação | $(dp_row) | $cpu |"
+	metric "dns.qps.${METRIC_CPUS:-x}.$tag.sat.qps" "$(echo "$sat" | awk '{print $1}')" qps higher
 	half=$(($(echo "$sat" | awk '{print $1}') / 2))
 	[ "$half" -ge 100 ] || half=100
 	[ -n "${3:-}" ] && eval "$3"
 	dp "$tag-half" "$file" "$DUR" -c 8 -T 2 -q 2000 -Q "$half"
 	say "| $label | $half/s (metade) | $(dp_row) | |"
+	metric "dns.qps.${METRIC_CPUS:-x}.$tag.half.p99_us" "$(dpf 9)" us lower
 }
 
 ###########################################################################
@@ -966,6 +982,7 @@ test_qps() {
 	local list=${DUT_CPUS_LIST:-$DUT_CPUS} cpus
 	local_dut || list=remote
 	for cpus in ${list//;/ }; do
+		METRIC_CPUS=cpus${cpus//[^0-9]/_}
 		if local_dut; then
 			daemon_stop
 			daemon_start "$cpus"
@@ -1935,6 +1952,7 @@ test_ops() {
 		statistics) label="ip.dns.statistics.print" ;; batch) label="lote atômico (static.add + ip.dns.set)" ;; get) label="ip.dns.get" ;;
 		esac
 		say "| $label | $p50 | $p99 | $mx | $(dp_row) |"
+		metric "dns.ops.$c.p99_ms" "$p99" ms lower
 		[ "$p99" -lt 50 ] || OPS_SLOW+="$label p99 $p99 ms; "
 	done
 	mcp_close

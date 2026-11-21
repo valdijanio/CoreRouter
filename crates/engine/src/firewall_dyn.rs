@@ -147,7 +147,7 @@ impl DynamicLists {
 impl Session {
     /// Expire dynamic address-list entries (called on every clock tick).
     pub(crate) fn expire_dynamic_addresses(&mut self) {
-        let Some(now) = self.now() else { return };
+        let Some(now) = self.steady_now() else { return };
         let gone: Vec<DynamicAddress> = self
             .dynamic_addresses
             .expire(now)

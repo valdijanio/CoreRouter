@@ -31,6 +31,8 @@ mod lockout;
 pub mod server;
 pub mod tasks;
 pub mod tls;
+#[cfg(target_os = "linux")]
+pub mod unix;
 pub mod wire;
 pub mod ws;
 

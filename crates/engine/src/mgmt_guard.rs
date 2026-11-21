@@ -341,6 +341,13 @@ fn judge(cfg: &Config, open: &HashMap<u64, Open>, fib: &HashMap<(IpAddr, IpAddr)
     out
 }
 
+/// The table a connection whose local address is `local` is in (G3.4zb:
+/// which VRF a service's session came through): the VRF of the port with
+/// that address, or main.
+pub(crate) fn table_of_local(cfg: &Config, local: IpAddr) -> RoutingTable {
+    Tables::of(cfg).table(plain(local))
+}
+
 /// The command that protects `net` of `table`.
 pub fn protect_command(table: &RoutingTable, net: &IpNet) -> String {
     match table {

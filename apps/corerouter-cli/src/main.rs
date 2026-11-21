@@ -166,11 +166,11 @@ fn real_main() -> Result<(), String> {
         }
         "run" => {
             let id = pos.next().ok_or("run needs a command id")?;
-            one_shot_allowed(&id)?;
             let params: Value = match pos.next() {
                 Some(raw) => serde_json::from_str(&raw).map_err(|e| format!("params: {e}"))?,
                 None => Value::Null,
             };
+            one_shot_allowed(&id, &params)?;
             backend.call(
                 "engine.execute",
                 json!({"command": id, "params": params, "via": "cli"}),
@@ -219,8 +219,10 @@ fn real_main() -> Result<(), String> {
 /// to the connection (Safe Mode) would end the moment it started, and the
 /// next `run` would change the config unprotected (G1.6qf, seen on the
 /// image). Refused with the clients that keep the connection open.
-fn one_shot_allowed(id: &str) -> Result<(), String> {
-    if !corerouter_engine::safe_mode::NEEDS_OPEN_CONNECTION.contains(&id) {
+fn one_shot_allowed(id: &str, params: &Value) -> Result<(), String> {
+    if !corerouter_engine::safe_mode::NEEDS_OPEN_CONNECTION.contains(&id)
+        || corerouter_engine::safe_mode::detached(params)
+    {
         return Ok(());
     }
     Err(format!(
@@ -228,7 +230,10 @@ fn one_shot_allowed(id: &str) -> Result<(), String> {
          command returns: the router would undo Safe Mode at once and the next `run` would \
          change the config unprotected.\n\
          Use a client that keeps the connection: `corerouter-cli shell` (Ctrl+X toggles Safe \
-         Mode), the MCP server (`corerouter-cli mcp`) or the GUI."
+         Mode), the MCP server (`corerouter-cli mcp`) or the GUI.\n\
+         Or detach it from the connection, with a deadline (G1.6qg, like `commit confirmed`): \
+         run {id} '{{\"timeout_secs\":300,\"detach\":true}}', make the changes, then \
+         run config.safe-mode.exit to keep them (they are undone at the deadline otherwise)."
     ))
 }
 

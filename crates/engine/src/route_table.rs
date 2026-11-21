@@ -17,6 +17,7 @@ use std::net::IpAddr;
 
 use corerouter_hal::Learned;
 use corerouter_model::route::{self, Reach, Why};
+use corerouter_model::sections::{self, Sections};
 use corerouter_model::types::Discard;
 use corerouter_model::{Config, IfName, InterfaceKind, ItemId, RoutingTable};
 use ipnet::IpNet;
@@ -786,43 +787,153 @@ impl Session {
         self.cached_routes().0
     }
 
-    /// The lines, their counts and the cache generation.
+    /// The lines, their counts and the cache generation, built here if the
+    /// cache is stale (callers that can build off the lock use
+    /// [`Session::routes`]).
     pub(crate) fn cached_routes(&mut self) -> (Arc<Vec<Line>>, Arc<Summary>, u64) {
+        match self.routes() {
+            Routes::Ready(lines, summary, generation) => (lines, summary, generation),
+            Routes::Stale(job) => {
+                let (lines, summary) = job.run();
+                self.route_cache_adopt();
+                let generation = self.ext::<RouteCache>().map_or(0, |c| c.generation);
+                (lines, summary, generation)
+            }
+        }
+    }
+
+    /// The cached lines if they are fresh, or what building them needs
+    /// (G0.31g): taken under the lock in O(what changed), built by
+    /// [`RouteJob::run`] with the lock released, published in the cache.
+    pub(crate) fn routes(&mut self) -> Routes {
+        self.route_cache_adopt();
         let base = self.store().candidate().clone();
-        let live = self.route_live(&base);
+        let mut live = self.route_live(&base);
         let mut checks: Vec<(ItemId, RouteCheck)> =
             live.checks.iter().map(|(k, v)| (*k, v.clone())).collect();
         checks.sort_by_key(|(k, _)| *k);
         let key = CacheKey {
-            generation: self.store().generation(),
             dynamic: self.dynamic_fingerprint(),
             checked: self.static_checks_generation(),
             learned: live.learned.clone(),
             down: live.down.clone(),
             checks,
         };
+        let generation = self.store().generation();
         // A withheld lease route says how long ago its check failed: never
         // kept (only on a router with a failing DHCP gateway).
         let keep = live.withheld.is_empty();
         if keep
-            && let Some(c) = self.ext::<RouteCache>()
-            && c.key.as_ref() == Some(&key)
+            && let Some(c) = self.ext_mut::<RouteCache>()
+            && let Some(st) = c.stamp.as_mut()
+            && st.key == key
         {
-            return (Arc::clone(&c.lines), Arc::clone(&c.summary), c.generation);
+            if st.generation == generation {
+                return Routes::Ready(Arc::clone(&c.lines), Arc::clone(&c.summary), c.generation);
+            }
+            // A commit since: the lines stay if it touched none of what
+            // they read (the identity, a firewall rule…). The next look
+            // compares with this config.
+            if !sections::changed(&st.base, &base).intersects(ROUTE_READS) {
+                st.generation = generation;
+                st.base = base;
+                return Routes::Ready(Arc::clone(&c.lines), Arc::clone(&c.summary), c.generation);
+            }
         }
         let cfg = self.effective(&base).into_owned();
-        let mut live = live;
         self.static_live(&base, &mut live);
-        let lines = Arc::new(build(&cfg, &live));
-        let summary = Arc::new(Summary::of(&lines));
+        let slot = self
+            .ext_mut::<RouteCache>()
+            .map_or_else(Slot::default, |c| Arc::clone(&c.slot));
+        let seen_at = self.now();
+        let watch = self.ext::<RouteWatch>().map(RouteWatch::snapshot);
+        Routes::Stale(Box::new(RouteJob {
+            cfg,
+            live,
+            seen_at,
+            watch,
+            stamp: keep.then_some(Stamp {
+                key,
+                generation,
+                base,
+            }),
+            slot,
+        }))
+    }
+
+    /// Take a build published by a [`RouteJob`] into the cache.
+    fn route_cache_adopt(&mut self) {
         let Some(c) = self.ext_mut::<RouteCache>() else {
-            return (lines, summary, 0);
+            return;
         };
-        c.key = keep.then_some(key);
-        c.lines = Arc::clone(&lines);
-        c.summary = Arc::clone(&summary);
+        let built = c
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(b) = built else {
+            return;
+        };
+        // What it replaces is freed off the lock (60 000 lines and their
+        // states: ~4 ms of `free`, **medido**): it waits in the trash for
+        // `route_garbage`.
+        let old_stamp = std::mem::replace(&mut c.stamp, b.stamp);
+        let old_lines = std::mem::replace(&mut c.lines, Arc::clone(&b.lines));
+        let old_summary = std::mem::replace(&mut c.summary, b.summary);
+        c.trash(Box::new((old_stamp, old_lines, old_summary)));
         c.generation = c.generation.wrapping_add(1);
-        (lines, summary, c.generation)
+        if let Some(w) = self.ext::<RouteWatch>() {
+            let old = (w.snapshot().0, w.looked.clone());
+            if let Some(c) = self.ext_mut::<RouteCache>() {
+                c.trash(Box::new(old));
+            }
+        }
+        // The watch sees them as of when they were asked for (the Changed
+        // column of a route listed then counts from then), from the look
+        // made with them when it still applies.
+        let seen = match (b.look, b.seen_at) {
+            (Some(look), _) => self
+                .ext_mut::<RouteWatch>()
+                .map(|w| w.apply_look(look))
+                .unwrap_or_default(),
+            (None, Some(at)) => self
+                .ext_mut::<RouteWatch>()
+                .map(|w| w.observe_shared(&b.lines, at))
+                .unwrap_or_default(),
+            (None, None) => Vec::new(),
+        };
+        self.log_route_changes(&seen);
+    }
+
+    /// What the route cache let go of since the last call, for the caller
+    /// to drop after releasing the lock (G0.31g).
+    pub fn route_garbage(&mut self) -> RouteGarbage {
+        RouteGarbage(
+            self.ext_mut::<RouteCache>()
+                .map(|c| std::mem::take(&mut c.trash))
+                .unwrap_or_default(),
+        )
+    }
+
+    /// A build of the route lines for the caller to run with the session
+    /// unlocked (the clock, before its tick: G0.31g), when the cached ones
+    /// are stale; `None`: they are fresh, or they are never kept (a lease
+    /// route withheld by its gateway check), or the tick's route watch
+    /// does not look this time. The watch then finds them built.
+    /// `now_unix`: the time the tick will be given.
+    pub fn route_job(&mut self, now_unix: u64) -> Option<RouteJob> {
+        let now = self.hal_now().unwrap_or(now_unix);
+        let routes = self.store().candidate().ip.routes.len();
+        if !self.ext::<RouteWatch>().is_none_or(|w| w.due(routes, now)) {
+            return None;
+        }
+        match self.routes() {
+            Routes::Stale(mut job) if job.stamp.is_some() => {
+                job.seen_at = Some(now);
+                Some(*job)
+            }
+            _ => None,
+        }
     }
 
     /// What the DHCP and DHCPv6 clients and the DHCPv6 server add to the
@@ -923,6 +1034,91 @@ pub struct Transition {
     pub change: Change,
 }
 
+/// The states after a look and the changes it saw (no clock, no rings):
+/// made with or without the watch.
+#[derive(Debug)]
+struct Look {
+    states: Arc<HashMap<String, Seen>>,
+    transitions: Vec<Transition>,
+    /// Routes gone were forgotten.
+    shrank: bool,
+}
+
+impl Look {
+    /// `states` (a copy is made only if it is shared and something
+    /// changed) after seeing `lines` at `now`.
+    fn of(mut states: Arc<HashMap<String, Seen>>, first: bool, lines: &[Line], now: u64) -> Self {
+        let mut out = Vec::new();
+        // Read first, write after: a look that changes nothing leaves the
+        // map shared with the lists built from it (G0.31b).
+        let mut writes: Vec<(&Line, Seen)> = Vec::new();
+        for l in lines.iter().take(MAX_WATCHED) {
+            match states.get(&l.key) {
+                Some(seen) if seen.state != l.state => {
+                    out.push(Transition {
+                        key: l.key.clone(),
+                        dst: l.dst,
+                        table: l.table.clone(),
+                        change: Change {
+                            at: now,
+                            from: seen.state,
+                            to: l.state,
+                            reason: l.why.clone(),
+                        },
+                    });
+                    writes.push((
+                        l,
+                        Seen {
+                            state: l.state,
+                            at: Some(now),
+                        },
+                    ));
+                }
+                Some(_) => {}
+                None => writes.push((
+                    l,
+                    Seen {
+                        state: l.state,
+                        at: (!first).then_some(now),
+                    },
+                )),
+            }
+        }
+        if !writes.is_empty() {
+            let m = Arc::make_mut(&mut states);
+            for (l, seen) in writes {
+                m.insert(l.key.clone(), seen);
+            }
+        }
+        let shrank = states.len() > lines.len().min(MAX_WATCHED);
+        if shrank {
+            let live: std::collections::HashSet<&str> = lines
+                .iter()
+                .take(MAX_WATCHED)
+                .map(|l| l.key.as_str())
+                .collect();
+            Arc::make_mut(&mut states).retain(|k, _| live.contains(k.as_str()));
+        }
+        Self {
+            states,
+            transitions: out,
+            shrank,
+        }
+    }
+}
+
+/// A look at freshly built lines, made off the lock (G0.31g), for
+/// [`RouteWatch::apply_look`].
+#[derive(Debug)]
+struct OffLook {
+    /// The states it started from and whether watching had begun.
+    base: Arc<HashMap<String, Seen>>,
+    first: bool,
+    lines: Arc<Vec<Line>>,
+    now: u64,
+    look: Look,
+}
+
 /// What the watch knows of one route.
 #[derive(Debug, Clone, Copy)]
 struct Seen {
@@ -948,63 +1144,42 @@ impl RouteWatch {
     /// state changes it saw.
     pub fn observe(&mut self, lines: &[Line], now: u64) -> Vec<Transition> {
         let first = self.since.is_none();
+        let states = std::mem::take(&mut self.states);
+        let look = Look::of(states, first, lines, now);
+        self.states = look.states;
+        self.apply(look.transitions, look.shrank, now)
+    }
+
+    /// The watch as a look made without it starts from (G0.31g).
+    fn snapshot(&self) -> (Arc<HashMap<String, Seen>>, bool) {
+        (Arc::clone(&self.states), self.since.is_none())
+    }
+
+    /// A look made off the lock from [`RouteWatch::snapshot`]: taken in
+    /// O(changes) when nothing looked in between, else looked again here.
+    fn apply_look(&mut self, look: OffLook) -> Vec<Transition> {
+        let same = Arc::ptr_eq(&self.states, &look.base) && self.since.is_none() == look.first;
+        if !same {
+            return self.observe_shared(&look.lines, look.now);
+        }
+        self.looked = Some(look.lines);
+        self.states = look.look.states;
+        self.apply(look.look.transitions, look.look.shrank, look.now)
+    }
+
+    /// The part of a look that touches more than the states: the clock,
+    /// the change rings and their age.
+    fn apply(&mut self, out: Vec<Transition>, shrank: bool, now: u64) -> Vec<Transition> {
         self.since.get_or_insert(now);
         self.last_look = Some(now);
-        let mut out = Vec::new();
-        // Read first, write after: a look that changes nothing leaves the
-        // map shared with the lists built from it (G0.31b).
-        let mut writes: Vec<(&Line, Seen)> = Vec::new();
-        for l in lines.iter().take(MAX_WATCHED) {
-            match self.states.get(&l.key) {
-                Some(seen) if seen.state != l.state => {
-                    let change = Change {
-                        at: now,
-                        from: seen.state,
-                        to: l.state,
-                        reason: l.why.clone(),
-                    };
-                    let ring = self.changes.entry(l.key.clone()).or_default();
-                    if ring.len() >= MAX_CHANGES {
-                        ring.pop_front();
-                    }
-                    ring.push_back(change.clone());
-                    out.push(Transition {
-                        key: l.key.clone(),
-                        dst: l.dst,
-                        table: l.table.clone(),
-                        change,
-                    });
-                    writes.push((
-                        l,
-                        Seen {
-                            state: l.state,
-                            at: Some(now),
-                        },
-                    ));
-                }
-                Some(_) => {}
-                None => writes.push((
-                    l,
-                    Seen {
-                        state: l.state,
-                        at: (!first).then_some(now),
-                    },
-                )),
+        for t in &out {
+            let ring = self.changes.entry(t.key.clone()).or_default();
+            if ring.len() >= MAX_CHANGES {
+                ring.pop_front();
             }
+            ring.push_back(t.change.clone());
         }
-        if !writes.is_empty() {
-            let states = Arc::make_mut(&mut self.states);
-            for (l, seen) in writes {
-                states.insert(l.key.clone(), seen);
-            }
-        }
-        if self.states.len() > lines.len().min(MAX_WATCHED) {
-            let live: std::collections::HashSet<&str> = lines
-                .iter()
-                .take(MAX_WATCHED)
-                .map(|l| l.key.as_str())
-                .collect();
-            Arc::make_mut(&mut self.states).retain(|k, _| live.contains(k.as_str()));
+        if shrank {
             let states = &self.states;
             self.changes.retain(|k, _| states.contains_key(k));
         }
@@ -1058,11 +1233,24 @@ impl RouteWatch {
     }
 }
 
-/// What the lines were built from: the candidate's generation, the dynamic
-/// entries (DHCP, DHCPv6) and the live state. Equal key, same lines.
+/// The sections of the config the route lines read (G0.31g): a commit that
+/// changes none of them (the identity, a firewall rule, a DNS record) keeps
+/// the cached lines. Checked by `the_route_lines_read_only_what_they_declare`
+/// (tests/it/incremental_validate.rs) the way the validators' reads are.
+/// The lines themselves read the interfaces (VRFs among them), the
+/// addresses and the routes; the effective config adds the leases of the
+/// DHCP and DHCPv6 clients, whose settings are in `ip` (the rest) and `ipv6`.
+pub const ROUTE_READS: Sections = Sections::INTERFACES
+    .union(Sections::ADDRESSES)
+    .union(Sections::ROUTES)
+    .union(Sections::IP_REST)
+    .union(Sections::IPV6);
+
+/// What the lines were built from besides the config: the dynamic entries
+/// (DHCP, DHCPv6) and the live state. Equal key and the same
+/// [`ROUTE_READS`], same lines.
 #[derive(Debug, Clone, PartialEq)]
 struct CacheKey {
-    generation: u64,
     dynamic: u64,
     /// The static routes' checks (G1.27f, [`crate::gateway_check`]).
     checked: u64,
@@ -1143,11 +1331,121 @@ impl Summary {
 /// that finds them here costs only its own pass.
 #[derive(Debug, Default)]
 pub struct RouteCache {
-    key: Option<CacheKey>,
+    /// What the lines were built from; `None`: not to be reused.
+    stamp: Option<Stamp>,
     pub lines: Arc<Vec<Line>>,
     pub summary: Arc<Summary>,
     /// Bumped by every rebuild: the GUI can tell a new table from a reread.
     pub generation: u64,
+    /// Where a [`RouteJob`] run off the lock leaves its lines.
+    slot: Slot,
+    /// What a build replaced, to free off the lock ([`Session::route_garbage`]).
+    trash: Vec<Garbage>,
+}
+
+type Garbage = Box<dyn std::any::Any + Send>;
+
+/// Replaced tables kept at most for an owner that never takes them (the
+/// GUI in the browser, without a clock thread): past it, freed in place.
+const MAX_TRASH: usize = 8;
+
+impl RouteCache {
+    fn trash(&mut self, g: Garbage) {
+        if self.trash.len() >= MAX_TRASH {
+            self.trash.remove(0);
+        }
+        self.trash.push(g);
+    }
+}
+
+/// Tables the route cache let go of: drop it with the session unlocked.
+#[derive(Default)]
+pub struct RouteGarbage(Vec<Garbage>);
+
+impl std::fmt::Debug for RouteGarbage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RouteGarbage({})", self.0.len())
+    }
+}
+
+/// What a cached build was made from: the key, the config's generation and
+/// the config itself (its sections are shared, a clone is a few reference
+/// counts), to compare a later config with by section.
+#[derive(Debug)]
+struct Stamp {
+    key: CacheKey,
+    generation: u64,
+    base: Config,
+}
+
+/// A build waiting to be taken into the cache.
+#[derive(Debug)]
+struct Built {
+    stamp: Option<Stamp>,
+    seen_at: Option<u64>,
+    look: Option<OffLook>,
+    lines: Arc<Vec<Line>>,
+    summary: Arc<Summary>,
+}
+
+type Slot = Arc<std::sync::Mutex<Option<Built>>>;
+
+/// The route lines, from [`Session::routes`].
+pub(crate) enum Routes {
+    /// Cached: the lines, their counts, the cache generation.
+    Ready(Arc<Vec<Line>>, Arc<Summary>, u64),
+    /// To build.
+    Stale(Box<RouteJob>),
+}
+
+/// What the route lines are built from, taken under the session lock
+/// (G0.31g): [`RouteJob::run`] builds them without the session (60 000
+/// routes: ~26 ms, **medido**) and leaves them for the cache, which takes
+/// them on its next look.
+pub struct RouteJob {
+    cfg: Config,
+    live: Live,
+    /// When they were asked for, for the route watch.
+    seen_at: Option<u64>,
+    /// The watch's states then: the look at the new lines is made off the
+    /// lock too (60 000 lines compared: ~5 ms, **medido**).
+    watch: Option<(Arc<HashMap<String, Seen>>, bool)>,
+    stamp: Option<Stamp>,
+    slot: Slot,
+}
+
+impl std::fmt::Debug for RouteJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RouteJob")
+            .field("routes", &self.cfg.ip.routes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RouteJob {
+    /// Build the lines and leave them for the cache.
+    pub fn run(self) -> (Arc<Vec<Line>>, Arc<Summary>) {
+        let lines = Arc::new(build(&self.cfg, &self.live));
+        let summary = Arc::new(Summary::of(&lines));
+        let look = self.seen_at.zip(self.watch).map(|(now, (base, first))| OffLook {
+            look: Look::of(Arc::clone(&base), first, &lines, now),
+            base,
+            first,
+            lines: Arc::clone(&lines),
+            now,
+        });
+        *self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Built {
+            stamp: self.stamp,
+            seen_at: self.seen_at,
+            look,
+            lines: Arc::clone(&lines),
+            summary: Arc::clone(&summary),
+        });
+        (lines, summary)
+    }
 }
 
 impl Session {
@@ -1204,6 +1502,21 @@ impl Session {
         }
     }
 
+    /// [`Session::routes`], noted by the watch when they are cached; lines
+    /// still to build are noted on the next look (the tick's, or a list's).
+    pub(crate) fn watched_routes(&mut self) -> (Routes, Option<u64>) {
+        let routes = self.routes();
+        let now = self.now();
+        if let (Routes::Ready(lines, ..), Some(now)) = (&routes, now) {
+            let seen = self
+                .ext_mut::<RouteWatch>()
+                .map(|w| w.observe_shared(lines, now))
+                .unwrap_or_default();
+            self.log_route_changes(&seen);
+        }
+        (routes, now)
+    }
+
     /// `route_lines`, noted by the watch too (`ip.route.list` and the
     /// lookup see the change at once, not at the next tick).
     pub(crate) fn watched_route_lines(&mut self) -> (Arc<Vec<Line>>, Option<u64>) {
@@ -1255,6 +1568,61 @@ mod tests {
         lines.sort_by(order);
         select(&mut lines);
         lines
+    }
+
+    /// G0.31g: a look made off the lock from a snapshot of the watch and
+    /// applied after gives what a look made here gives; if something looked
+    /// in between, it is looked at again here.
+    #[test]
+    fn a_look_made_off_the_lock_is_the_same_as_one_made_here() {
+        let up = Arc::new(table(vec![
+            line(1, "10.1.0.0/24", 1, Origin::Static, "10.0.0.1", true),
+            line(2, "10.2.0.0/24", 1, Origin::Static, "10.0.0.1", true),
+        ]));
+        let mut down = table(vec![
+            line(1, "10.1.0.0/24", 1, Origin::Static, "10.0.0.1", false),
+            line(3, "10.3.0.0/24", 1, Origin::Static, "10.0.0.1", true),
+        ]);
+        select(&mut down);
+        let down = Arc::new(down);
+        let (mut here, mut there) = (RouteWatch::default(), RouteWatch::default());
+        here.observe_shared(&up, 100);
+        there.observe_shared(&up, 100);
+        let off = |w: &RouteWatch, lines: &Arc<Vec<Line>>, now: u64| {
+            let (base, first) = w.snapshot();
+            OffLook {
+                look: Look::of(Arc::clone(&base), first, lines, now),
+                base,
+                first,
+                lines: Arc::clone(lines),
+                now,
+            }
+        };
+        let look = off(&there, &down, 130);
+        let a = here.observe_shared(&down, 130);
+        let b = there.apply_look(look);
+        let keys = |t: &[Transition]| t.iter().map(|t| t.key.clone()).collect::<Vec<_>>();
+        assert_eq!(keys(&a), keys(&b));
+        assert_eq!(keys(&a), ["*1"], "the route that went down");
+        for k in ["*1", "*2", "*3"] {
+            assert_eq!(here.changed_at(k), there.changed_at(k), "{k}");
+            assert_eq!(here.changes_of(k, 130).len(), there.changes_of(k, 130).len());
+        }
+        assert_eq!(there.changed_at("*2"), None, "gone, forgotten");
+        // A look in between that changed the states: the off-lock one is
+        // made again here, against them.
+        let stale = off(&there, &up, 160);
+        let more = Arc::new(table(vec![
+            line(1, "10.1.0.0/24", 1, Origin::Static, "10.0.0.1", false),
+            line(3, "10.3.0.0/24", 1, Origin::Static, "10.0.0.1", true),
+            line(4, "10.4.0.0/24", 1, Origin::Static, "10.0.0.1", true),
+        ]));
+        there.observe_shared(&more, 150);
+        assert_eq!(there.changed_at("*4"), Some(150));
+        let again = there.apply_look(stale);
+        assert_eq!(keys(&again), ["*1"], "back up, seen at 160");
+        assert_eq!(there.changed_at("*1"), Some(160));
+        assert_eq!(there.changed_at("*4"), None, "not in the lines looked at");
     }
 
     #[test]

@@ -1164,6 +1164,7 @@ dependencies = [
  "proptest",
  "rcgen",
  "ring",
+ "rustix 1.1.5",
  "rustls",
  "serde",
  "serde_json",
@@ -1652,7 +1653,6 @@ dependencies = [
  "corerouter-model",
  "criterion",
  "log",
- "rustix 1.1.5",
  "serde_json",
 ]
 

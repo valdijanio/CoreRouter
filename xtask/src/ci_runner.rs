@@ -119,6 +119,8 @@ const HELP: &str = "usage: cargo xtask ci-runner <subcommand>   (docs/ci-runner.
                     starts them and takes the snapshot `registered`
   status            VM, runners, busy jobs, job counter, recent verdicts, filter, GitHub view
   check-network     from inside the VM: internet yes; LAN, host and IPv6 no
+  hooks             write this checkout's job hooks into the running VM now (atomic; `reset`
+                    does it too): which events and branches the runner accepts
   up | down         start (and wait for SSH) | shut down
   ssh [cmd...]      shell (or one command) as `ciadmin` (sudo inside the VM)
   run [--rev <git-rev>] [--slot N] -- <cmd...>
@@ -151,6 +153,7 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
         "register" => vm.register(),
         "status" => vm.status(),
         "check-network" => vm.up().and_then(|()| vm.check_network()),
+        "hooks" => vm.up().and_then(|()| vm.apply_hooks()),
         "up" => vm.up(),
         "down" => vm.down(),
         "ssh" => vm.ssh_interactive(rest),
@@ -1011,6 +1014,7 @@ impl Vm {
         )?;
         self.up()?;
         self.apply_modules()?;
+        self.apply_hooks()?;
         eprintln!(
             "ci-runner: back to `{name}` and booted in {:.1} s",
             started.elapsed().as_secs_f64()
@@ -1036,6 +1040,22 @@ impl Vm {
             .collect();
         self.ssh_root_script(&format!(
             "fail=0\ncat > /etc/modules-load.d/corerouter-ci.conf <<'EOF'\n{load}EOF\n{probe}exit $fail\n"
+        ))
+    }
+
+    /// The job hooks of this checkout (G0.30k: a hook changed since
+    /// `create` takes effect at the next `reset`, as the modules do).
+    /// Written beside and renamed: a job starting meanwhile reads the old
+    /// hook or the new one, never half of one.
+    fn apply_hooks(&self) -> Result<(), String> {
+        let started = JOB_STARTED.replace("@REPO@", REPO);
+        self.ssh_root_script(&format!(
+            "set -e\ninstall -d -o root -g root -m 0755 {ETC}\n\
+             cat > {ETC}/.job-started.sh <<'EOF'\n{started}EOF\n\
+             cat > {ETC}/.job-completed.sh <<'EOF'\n{JOB_COMPLETED}EOF\n\
+             chmod 0755 {ETC}/.job-started.sh {ETC}/.job-completed.sh\n\
+             mv -f {ETC}/.job-started.sh {ETC}/job-started.sh\n\
+             mv -f {ETC}/.job-completed.sh {ETC}/job-completed.sh\n"
         ))
     }
 
@@ -1568,13 +1588,16 @@ if [ "$repo" = "$want" ]; then
   case "$event:$ref" in
     push:refs/heads/main) verdict=ok ;;
     workflow_dispatch:refs/heads/queue/*) verdict=ok ;;
+    # G0.30k: the nightly regression run (schedule always runs the default
+    # branch's workflow; a dispatch on main is a writer's re-run of it).
+    schedule:refs/heads/main | workflow_dispatch:refs/heads/main) verdict=ok ;;
   esac
 fi
 printf '%s %s runner=%s event=%s ref=%s repo=%s run=%s actor=%s\n' "$(date -u +%FT%TZ)" \
   "$verdict" "${CR_CI_RUNNER:-?}" "$event" "$ref" "$repo" "${GITHUB_RUN_ID:-}" \
   "${GITHUB_ACTOR:-}" >> "$state/jobs.log" 2>/dev/null
 if [ "$verdict" != ok ]; then
-  echo "::error::corerouter-ci recusa este job: só push na main e workflow_dispatch em queue/* de $want (event=$event ref=$ref repo=$repo)"
+  echo "::error::corerouter-ci recusa este job: só push, schedule e workflow_dispatch na main e workflow_dispatch em queue/* de $want (event=$event ref=$ref repo=$repo)"
   exit 1
 fi
 : > "$run/busy-${CR_CI_RUNNER:-0}" 2>/dev/null
@@ -1726,6 +1749,9 @@ mod tests {
         for (event, ref_) in [
             ("workflow_dispatch", "refs/heads/queue/batch-1793305057482"),
             ("push", "refs/heads/main"),
+            // G0.30k: the nightly regression run and its manual re-run.
+            ("schedule", "refs/heads/main"),
+            ("workflow_dispatch", "refs/heads/main"),
         ] {
             let (ok, _, d) = started(&[
                 ("GITHUB_EVENT_NAME", event),
@@ -1781,6 +1807,11 @@ mod tests {
             ],
             &[
                 ("GITHUB_EVENT_NAME", "schedule"),
+                ("GITHUB_REPOSITORY", REPO),
+            ],
+            &[
+                ("GITHUB_EVENT_NAME", "schedule"),
+                ("GITHUB_REF", "refs/heads/stream/x"),
                 ("GITHUB_REPOSITORY", REPO),
             ],
             // Nothing set: fail closed.

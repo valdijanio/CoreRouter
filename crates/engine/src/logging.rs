@@ -363,9 +363,14 @@ pub fn journal_message(
             .get("revision")
             .map(|r| format!("Configuração revertida para a revisão {r}")),
         // G0.33: the `revision` of these results is the one the checkpoint holds.
-        "config.checkpoint.add" => {
-            text(p, "name").map(|n| format!("Checkpoint «{n}» salvo com a revisão em uso{revision}"))
-        }
+        "config.checkpoint.add" => out
+            .and_then(|v| v.get("name"))
+            .and_then(Value::as_str)
+            .or_else(|| text(p, "name"))
+            .map(|n| {
+                let auto = if n.starts_with("auto-") { " automático" } else { "" };
+                format!("Checkpoint{auto} «{n}» salvo com a revisão em uso{revision}")
+            }),
         "config.checkpoint.restore" => text(p, "name")
             .map(|n| format!("Configuração restaurada do checkpoint «{n}», que guarda{revision}")),
         "config.checkpoint.remove" => text(p, "name").map(|n| format!("Checkpoint «{n}» apagado")),

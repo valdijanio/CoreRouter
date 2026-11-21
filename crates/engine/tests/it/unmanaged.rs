@@ -59,8 +59,8 @@ impl Hal for Host {
         });
         out
     }
-    fn unmanaged(&mut self) -> Vec<(IfName, String)> {
-        vec![(n("docker0"), WHY.into())]
+    fn unmanaged(&mut self) -> corerouter_hal::Unmanaged {
+        std::sync::Arc::new([(n("docker0"), WHY.into())].into())
     }
     fn now_unix(&self) -> Option<u64> {
         None

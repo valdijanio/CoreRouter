@@ -7,7 +7,9 @@
 //! The tick's link poll reads every link of the platform (on a BNG, one per
 //! subscriber: ~200 ms with 10 000, **medido**). It is read here with the
 //! session unlocked and only folded in under the lock (G1.3f), so commands,
-//! the GUI and MCP do not wait for the kernel.
+//! the GUI and MCP do not wait for the kernel. The route lines its route
+//! watch looks at are built the same way when a commit made them stale
+//! (G0.31g: 60 000 routes, ~26 ms, **medido**).
 
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -38,13 +40,27 @@ pub fn spawn_clock(session: Shared) -> std::io::Result<thread::JoinHandle<()>> {
 }
 
 fn tick(session: &Shared) {
-    // The reader is taken under the lock; it reads with the lock released.
-    let reader = lock(session).link_reader();
+    // The reader and the route build are taken under the lock; they run
+    // with it released.
+    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(e) => {
+            log::warn!("clock before 1970, not ticking: {e}");
+            return;
+        }
+    };
+    let (reader, routes) = {
+        let mut s = lock(session);
+        (s.link_reader(), s.route_job(now))
+    };
     let links = reader.map(|mut r| r.read());
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => lock(session).tick_sampled(d.as_secs(), links),
-        Err(e) => log::warn!("clock before 1970, not ticking: {e}"),
+    if let Some(job) = routes {
+        job.run();
     }
+    lock(session).tick_sampled(now, links);
+    // What the route cache let go of is freed with the lock released.
+    let garbage = lock(session).route_garbage();
+    drop(garbage);
 }
 
 fn service(session: &Shared, start: Instant) {

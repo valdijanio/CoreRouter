@@ -10,6 +10,7 @@ use serde_json::json;
 const DEFERRED: &[(&str, &str)] = &[
     ("ip.route.list", "{}"),
     ("ip.route.list", r#"{"family": "ipv4", "state": "active"}"#),
+    ("ip.route.page", "{}"),
     ("ip.firewall.filter.list", "{}"),
     ("ip.firewall.filter.list", r#"{"chain": "input"}"#),
     ("ip.firewall.nat.list", "{}"),
@@ -204,6 +205,9 @@ fn one_large_list_at_a_time() {
         })
         .collect();
     s.batch(&serde_json::Value::Array(steps), true).unwrap();
+    // The lines built (the clock does it after a change, G0.31g): the
+    // check is made under the lock, as the list is asked for.
+    s.execute("ip.route.page", &json!({"limit": 1})).unwrap();
     let list = |s: &mut Session, p: serde_json::Value| {
         s.execute_reply_as(&Caller::local(), "ip.route.list", &p)
     };
@@ -221,6 +225,24 @@ fn one_large_list_at_a_time() {
     assert!(out.len() > 10_000 * 100, "{}", out.len());
     let again = list(&mut s, json!({})).unwrap();
     assert!(list(&mut s, json!({})).is_err());
+    // G0.31g: lines still to build (a route changed) are counted after
+    // the lock, before the first byte: busy is the answer's error then.
+    s.execute(
+        "ip.route.add",
+        &json!({"dst_address": "10.250.0.0/24", "gateway": "192.0.2.254"}),
+    )
+    .unwrap();
+    let stale = list(&mut s, json!({})).unwrap();
+    let mut out = Vec::new();
+    match stale.write(&mut out) {
+        Err(corerouter_engine::off_lock::WriteError::Answer(e)) => {
+            assert!(e.to_string().contains("busy"), "{e}");
+        }
+        other => panic!("not refused as busy: {other:?}"),
+    }
+    assert!(out.is_empty(), "nothing written");
+    let small = list(&mut s, json!({"origin": "connected"})).unwrap();
+    assert_eq!(small.finish().unwrap().as_array().unwrap().len(), 1);
     drop(again);
     assert!(list(&mut s, json!({})).is_ok());
 }
