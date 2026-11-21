@@ -50,6 +50,10 @@ fn a_commit_writes_one_small_revision_file_not_the_whole_history() {
     }
     let one = persist::encoded_len(s.store().running());
     assert!(one > 100_000, "{one}");
+    // G4.1zn: the commits since the slot are journal lines; their revision
+    // files wait for the checkpoint (here the clean shutdown's), all at once.
+    assert_eq!(storage.revision(20), None, "in the journal, no file yet");
+    assert_eq!(s.checkpoint(), Ok(true));
     // The slot holds the running config and its newest revision: twice
     // the config, not 22 copies (it held every revision before G1.23).
     let slot = storage.get(Slot::Current).unwrap().len();
@@ -62,13 +66,15 @@ fn a_commit_writes_one_small_revision_file_not_the_whole_history() {
         "{}",
         storage.revision_bytes()
     );
-    // The newest is only in the slot; its file comes with the next commit,
-    // and a file is written once.
+    // The newest is only in the slot; its file comes with the next
+    // checkpoint, and a file is written once.
     assert_eq!(s.store().current_revision(), 21);
     assert_eq!(storage.revision(21), None);
     let before = storage.revision(20).unwrap();
     assert!(before.contains("\"base\":21"), "{before}");
     rename(&mut s, "again");
+    assert_eq!(storage.revision(21), None, "journaled");
+    assert_eq!(s.checkpoint(), Ok(true));
     assert_eq!(storage.revision(20).unwrap(), before, "rewritten");
     assert!(storage.revision(21).unwrap().contains("\"r19\""));
     assert_eq!(storage.revision(22), None);
@@ -83,6 +89,19 @@ fn the_history_survives_a_reboot_and_old_files_are_deleted() {
     }
     let history = numbers(&s);
     assert_eq!(history.len(), ConfigStore::DEFAULT_MAX_HISTORY);
+    drop(s);
+    // G4.1zn: a crash (no checkpoint): the slot and the journal give every
+    // revision, though most have no file yet.
+    let mut s = boot(&storage);
+    assert!(
+        s.storage_status().boot_errors.is_empty(),
+        "{:?}",
+        s.storage_status().boot_errors
+    );
+    assert_eq!(numbers(&s), history);
+    assert_eq!(s.store().history()[0].config.system.identity, "r6");
+    // The clean shutdown writes them.
+    assert_eq!(s.checkpoint(), Ok(true));
     drop(s);
     // Only the older revisions still in the history have files.
     for n in 0..=70 {
@@ -122,6 +141,8 @@ fn the_history_stays_under_its_share_and_the_last_good_revision_never_goes() {
     // revision now.
     s.execute("config.rollback", &json!({"revision": empty}))
         .unwrap();
+    // G4.1zn: the revision files wait for a checkpoint (journaled commits).
+    assert_eq!(s.checkpoint(), Ok(true));
     let u = s.config_disk_usage().unwrap();
     assert!(
         u.history_bytes > u.history_budget,
@@ -149,6 +170,7 @@ fn the_history_stays_under_its_share_and_the_last_good_revision_never_goes() {
 
     // A small commit: the big file is no longer the last good, and goes.
     rename(&mut s, "small");
+    assert_eq!(s.checkpoint(), Ok(true));
     let active = s.store().current_revision();
     let u = s.config_disk_usage().unwrap();
     assert!(u.history_bytes <= u.history_budget, "{u:?}");
@@ -191,14 +213,19 @@ fn a_history_past_the_share_is_cut_when_the_disk_is_measured() {
     assert!(s.storage_status().revisions_not_saved > 0, "of {all}");
     assert!(s.storage_status().last_error.is_none());
     let active = s.store().current_revision();
+    let last_good = s.store().history()[s.store().history().len() - 2].number;
     drop(s);
-    let s = boot(&storage);
+    let mut s = boot(&storage);
     assert_eq!(s.store().current_revision(), active);
-    assert_eq!(
-        storage.clone().list_revisions().unwrap().len(),
-        1,
-        "the last good"
+    // G4.1zn: the last good is a journal line now, not a file: still there
+    // after the reboot, and a rollback to it works.
+    assert!(
+        storage.clone().list_revisions().unwrap().len() <= 1,
+        "the last good at most"
     );
+    assert!(numbers(&s).contains(&last_good), "{:?}", numbers(&s));
+    s.execute("config.rollback", &json!({"revision": last_good}))
+        .unwrap();
 }
 
 /// Fail-first for audit-history: with full copies a ~750 KB config kept

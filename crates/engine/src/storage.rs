@@ -143,6 +143,18 @@ pub trait ConfigStorage: Send {
         Err(StorageError("revision files are not supported".into()))
     }
 
+    /// G4.1zn: several revision files at once (a checkpoint writes the ones
+    /// the journal held), each result in the order given. They may become
+    /// durable together, before the call returns: a storage with one costly
+    /// flush per file makes it one flush for all. The default writes them
+    /// one by one with [`Self::save_revision`].
+    fn save_revisions(&mut self, files: &[(u32, &str)]) -> Vec<Result<(), StorageError>> {
+        files
+            .iter()
+            .map(|(number, data)| self.save_revision(*number, data))
+            .collect()
+    }
+
     /// Delete revision file `number` (a revision past the history).
     fn remove_revision(&mut self, number: u32) -> Result<(), StorageError> {
         let _ = number;
