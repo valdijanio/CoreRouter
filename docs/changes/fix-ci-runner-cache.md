@@ -12,6 +12,13 @@ Runner próprio do CI: o disco de cache não enche mais. Em 2026-11-21 os três 
   journal do ext4, e o `virsh destroy` logo depois desfazia a remoção (os 186 GB voltaram depois
   do boot, **medido**). A limpeza termina com `sync -f`, e o `reset` roda `sync` na VM antes de
   desligá-la à força, o que também protege o cache que fica.
+- Runner órfão: a unidade tem `KillMode=process` e `PrivateTmp=yes`, então um `systemctl stop`
+  deixa o `Runner.Listener` vivo numa `/tmp` já apagada. Na limpeza à mão do dia, a vaga 2 ficou
+  assim: três lotes falharam com "Cannot create temporary file in /tmp/" (SIGABRT no linker), e
+  a unidade religada não conseguia a sessão ("A session for this runner already exists",
+  **medido**). O caminho do `reset` que para e religa os serviços ("a job started while
+  stopping") agora encerra os órfãos antes; `docs/ci-runner.md` avisa para nunca parar os
+  runners com `systemctl` à mão.
 
 Como testar: `cargo test -p xtask ci_runner`; no runner, `cargo xtask ci-runner reset --if-due`
 com o disco abaixo e acima de 75 %, e `cargo xtask ci-runner ssh df -h /var/cache/corerouter-ci`.

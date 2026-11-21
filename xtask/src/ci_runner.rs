@@ -69,6 +69,9 @@ const DUE_DEFAULT: u64 = 40;
 /// a wipe and a full `cargo xtask ci` per slot they take ~27 GB each
 /// (measured 2026-10-29), ~50 % with the 17 GB swap file.
 const CACHE_FULL_PCT: u64 = 75;
+/// `pkill -f` pattern for the runner processes a `systemctl stop` leaves
+/// behind (the unit's `KillMode=process`): listener and worker of every slot.
+const LEFTOVERS: &str = "'^/opt/actions-runner/[0-9]+/bin/Runner\\.(Listener|Worker)'";
 
 const PACKAGES: &[&str] = &[
     "build-essential",
@@ -830,9 +833,20 @@ impl Vm {
             self.ssh_output("sudo systemctl stop 'corerouter-runner@*.service'")?;
             let busy = self.ssh_output(&format!("ls {RUN} 2>/dev/null | grep '^busy-' || true"))?;
             if !busy.trim().is_empty() {
-                let _ = self.ssh_output("sudo systemctl start --all 'corerouter-runner@*.service'");
+                // The unit has `KillMode=process` and `PrivateTmp=yes`: the
+                // stop ended `run.sh` only, and the `Runner.Listener` (and the
+                // job) live on in a /tmp systemd already removed. Every job it
+                // takes then fails ("Cannot create temporary file in /tmp/",
+                // SIGABRT in the linker), and the restarted unit cannot take
+                // the runner's session while it lives (2026-11-21, measured).
+                // That job is lost either way: end the leftovers, then start.
+                let _ = self.ssh_output(&format!(
+                    "sudo pkill -TERM -f {LEFTOVERS}; sleep 3; sudo pkill -KILL -f {LEFTOVERS}; \
+                     sudo systemctl start --all 'corerouter-runner@*.service'"
+                ));
                 return Err(format!(
-                    "a job started while stopping ({}); runners restarted, try again later",
+                    "a job started while stopping ({}); it was ended and the runners restarted, \
+                     try again later",
                     busy.trim()
                 ));
             }
