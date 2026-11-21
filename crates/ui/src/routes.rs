@@ -1745,17 +1745,29 @@ impl CoreRouterUi {
     }
 
     fn open_route_dialog(&mut self, dialog: RouteDialog) {
+        self.open_route_dialog_warned(dialog, Vec::new());
+    }
+
+    fn open_route_dialog_warned(&mut self, dialog: RouteDialog, warnings: Vec<String>) {
         self.next_dialog = self.next_dialog.wrapping_add(1);
+        let mut status = Status::default();
+        status.warn(warnings);
         self.route_dialogs.push(RouteDialogWin {
             id: self.next_dialog,
             dialog,
-            status: Status::default(),
+            status,
             help: None,
         });
     }
 
     /// "Route <dst>"; an already open one comes to the front.
     pub(crate) fn open_route(&mut self, key: &str) {
+        self.open_route_warned(key, Vec::new());
+    }
+
+    /// [`Self::open_route`] showing what the command that created the route
+    /// warned about (G1.5d: "New Route" whose `ip.route.add` warned).
+    pub(crate) fn open_route_warned(&mut self, key: &str, warnings: Vec<String>) {
         let Some(r) = self.route(key) else { return };
         let open = self.route_dialogs.iter_mut().find(|d| match &d.dialog {
             RouteDialog::Props { id, .. } => r.id.as_deref() == Some(id.as_str()),
@@ -1763,6 +1775,7 @@ impl CoreRouterUi {
             _ => false,
         });
         if let Some(d) = open {
+            d.status.warn(warnings);
             d.status.bring_to_front();
             return;
         }
@@ -1774,7 +1787,7 @@ impl CoreRouterUi {
             },
             _ => RouteDialog::Connected(r.key.clone()),
         };
-        self.open_route_dialog(dialog);
+        self.open_route_dialog_warned(dialog, warnings);
     }
 
     /// Draw every open route dialog as its own floating window.
@@ -1907,13 +1920,24 @@ impl CoreRouterUi {
             return;
         };
         let mut created = None;
+        // G1.5d: what `ip.route.add`/`set` warned about stays on screen.
+        let warnings = dialog::warnings_of(result);
         let close = match self.route_dialogs.get_mut(pos) {
             None => return,
             Some(d) => {
-                let close = d.status.replied(result);
+                let close = match &d.dialog {
+                    // A comment changes nothing the warnings are about.
+                    RouteDialog::Comment { .. } => d.status.replied(result),
+                    // The created route's window shows them (below).
+                    RouteDialog::New(_) => d.status.replied(result),
+                    _ => d.status.replied_warned(result),
+                };
                 match (result, effect, &mut d.dialog) {
                     (Err(_), _, _) => {}
                     (Ok(r), Effect::OpenCreated, _) => {
+                        created = r.get("id").and_then(Value::as_str).map(str::to_owned);
+                    }
+                    (Ok(r), Effect::None, RouteDialog::New(_)) if !warnings.is_empty() => {
                         created = r.get("id").and_then(Value::as_str).map(str::to_owned);
                     }
                     (Ok(_), Effect::Applied(sent), RouteDialog::Props { base, form, .. }) => {
@@ -1943,7 +1967,7 @@ impl CoreRouterUi {
         if let Some(route) = created {
             // Opens when an `ip.route.list` that has it arrives.
             let list = self.reload();
-            self.open_route_after.push((list, route));
+            self.open_route_after.push((list, route, warnings));
         }
     }
 }

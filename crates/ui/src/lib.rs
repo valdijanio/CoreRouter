@@ -260,8 +260,9 @@ pub struct CoreRouterUi {
     pub(crate) lang: i18n::Langs,
     /// "New Route" / "Route <dst>" / route "Comment" windows.
     route_dialogs: Vec<routes::RouteDialogWin>,
-    /// Routes to open once an `ip.route.list` sent after this id arrives.
-    open_route_after: Vec<(RequestId, String)>,
+    /// Routes to open once an `ip.route.list` sent after this id arrives,
+    /// with what the command that created them warned about (G1.5d).
+    open_route_after: Vec<(RequestId, String, Vec<String>)>,
     /// IP › Routes filters, lookup and open ECMP groups (G1.27).
     route_view: routes::View,
     /// "New VRF" / "VRF <name>" / VRF "Comment" windows.
@@ -530,10 +531,10 @@ impl CoreRouterUi {
                 self.route_page_arrived(value);
                 let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.open_route_after)
                     .into_iter()
-                    .partition(|(req, _)| *req <= id);
+                    .partition(|(req, _, _)| *req <= id);
                 self.open_route_after = later;
-                for (_, route) in ready {
-                    self.open_route(&route);
+                for (_, route, warnings) in ready {
+                    self.open_route_warned(&route, warnings);
                 }
             }
             Field::Vrfs => {
