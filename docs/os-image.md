@@ -1850,8 +1850,9 @@ minutos sem resposta, manda olhar o console.
   ajustam nada (o SONiC reinicia a máquina num OOM, `vm.panic_on_oom=2`). O `frr-test` confere
   os valores e provoca um OOM no r2 (`tail /dev/zero`): morre o `tail`, os PIDs do daemon e do
   FRR ficam e a adjacência OSPF volta sozinha. Sem swap, antes do OOM killer agir o kernel tira
-  o cache das páginas (o código dos programas) e a máquina se arrasta: ~50 s numa VM de 1 GiB
-  (**medido**), tempo em que o OSPF (dead 4 s) chega a cair. Matar mais cedo, pela pressão de
+  o cache das páginas (o código dos programas) e a máquina pode se arrastar: numa VM de 1 GiB o
+  `tail` morreu em 1,0 s numa rodada e, noutra, o OSPF (dead 4 s) caiu e o serviço BFD ficou 54 s
+  sem heartbeat (**medido**). Matar mais cedo, pela pressão de
   memória (PSI), é a gap G1.6zza.
 - **Fora da imagem** (`post-build.sh`): `vtysh` (o único que liga readline), bash, readline,
   ncurses, o runtime C++ que a toolchain copia, scripts Python e os daemons que o CoreRouter não
