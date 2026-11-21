@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 
 use super::args::{opt_bool, opt_parse, opt_str, opt_u32};
 use super::{CommandSpec, always};
-use crate::route_table::{Line, Origin, RouteWatch, State, Summary};
+use crate::route_table::{Changed, Line, Origin, RouteCache, RouteWatch, Routes, State, Summary};
 use crate::{EngineError, Result, Session};
 
 /// Rows of one page at most (hostile input; the GUI asks for 500).
@@ -232,8 +232,42 @@ fn page(s: &mut Session, p: &Value) -> Result<Value> {
         origins,
         prefix,
     };
-    let (lines, summary, generation) = s.cached_routes();
+    // Under the lock only pointers (G0.31g): the cached lines, or what
+    // building them needs; the page is cut after it is released.
+    let (routes, generation) = match s.routes() {
+        Routes::Ready(lines, summary, generation) => (Ok((lines, summary)), generation),
+        Routes::Stale(job) => {
+            let next = s.ext_mut::<RouteCache>().map_or(1, |c| c.generation.wrapping_add(1));
+            (Err(job), next)
+        }
+    };
     let now = s.now();
+    let neigh = s.neigh_fresh();
+    let watch = s.ext::<RouteWatch>().map(RouteWatch::changed);
+    let ldp = crate::mpls::ldp_state(s);
+    let garbage = s.route_garbage();
+    s.defer(move || {
+        drop(garbage);
+        let (lines, summary) = routes.unwrap_or_else(|job| job.run());
+        Ok(cut(&lines, &summary, generation, &filter, aggregate, offset, limit, now, &neigh, watch.as_ref(), ldp.as_deref()))
+    })
+}
+
+/// The page of `lines` the parameters ask for (no session: G0.31g).
+#[allow(clippy::too_many_arguments)]
+fn cut(
+    lines: &[Line],
+    summary: &Summary,
+    generation: u64,
+    filter: &Filter,
+    aggregate: bool,
+    offset: usize,
+    limit: usize,
+    now: Option<u64>,
+    neigh: &crate::neigh_table::NeighShared,
+    watch: Option<&Changed>,
+    ldp: Option<&corerouter_model::mpls_state::LdpState>,
+) -> Value {
     // One pass: count what matches, keep only this page's entries.
     let mut total = 0usize;
     let mut kept: Vec<Entry> = Vec::with_capacity(limit.min(lines.len()));
@@ -291,14 +325,12 @@ fn page(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(done) = open.take() {
         push(Entry::Bucket(done), &mut total, &mut kept);
     }
-    let neigh = s.neigh_fresh();
     let neigh = neigh.lock();
-    let watch = s.ext::<RouteWatch>().map(RouteWatch::changed);
     let rows: Vec<Value> = kept
         .iter()
         .filter_map(|e| match e {
             Entry::Line(i) => lines.get(*i).map(|l| {
-                let mut r = super::route::row(l, watch.as_ref(), now);
+                let mut r = super::route::row(l, watch, now);
                 super::route::layer2(&mut r, l, &neigh);
                 r
             }),
@@ -308,12 +340,12 @@ fn page(s: &mut Session, p: &Value) -> Result<Value> {
     drop(neigh);
     let mut rows = rows;
     // G3.5: the LDP labels of the page's routes.
-    crate::mpls::annotate_routes(s, &mut rows);
-    Ok(json!({
+    crate::mpls::annotate_rows(ldp, &mut rows);
+    json!({
         "total": total,
         "offset": offset,
         "rows": rows,
-        "summary": summary_json(&summary),
+        "summary": summary_json(summary),
         "generation": generation,
-    }))
+    })
 }
