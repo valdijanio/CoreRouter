@@ -524,7 +524,7 @@ fn bfd_survives(
     let (_, _, discr) = bfd_of(r1, log)?;
     let pid = sh(r1, log, "pidof corerouter-daemon")?;
     let t0 = Instant::now();
-    sh(r1, log, "kill -9 $(pidof corerouter-daemon)")?;
+    sh(r1, log, "kill -9 $(pidof corerouter-daemon); echo killed")?;
     let mut seen = Vec::new();
     // Past the daemon's restart (the init's backoff) and its reconnection.
     while t0.elapsed().as_secs() < 12 {
