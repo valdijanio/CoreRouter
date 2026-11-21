@@ -3,6 +3,7 @@
 //! (G0.24); above the list, the sessions a learned route covers now and
 //! the management networks not guarded yet, each with its Protect button
 //! (`routing.management-guard.*` decides; this only shows and sends).
+//! G3.4za: each network has its routing table (VRF column and field).
 
 use std::collections::BTreeMap;
 
@@ -52,6 +53,13 @@ const FIELDS: &[Field] = &[
         edit: true,
     },
     Field {
+        param: "vrf",
+        label: "VRF",
+        help: "management_guard.vrf",
+        input: Input::Choice,
+        edit: true,
+    },
+    Field {
         param: "disabled",
         label: "Disabled",
         help: "management_guard.disabled",
@@ -77,8 +85,9 @@ const SPEC: Spec = Spec {
     preview: "routing.management-guard.check",
 };
 
-const COLUMNS: [table::Column; 6] = [
+const COLUMNS: [table::Column; 7] = [
     col("Network").help("management_guard.network"),
+    col("VRF").help("management_guard.vrf"),
     col("Interface").help("management_guard.interface"),
     num("Sessions").help("management_guard.sessions"),
     col("Refused").help("management_guard.refused"),
@@ -132,6 +141,7 @@ fn row(r: &Value) -> Row {
         key: s(r, "id"),
         cells: vec![
             s(r, "network"),
+            vrf_cell(&s(r, "vrf")),
             if iface.is_empty() { String::new() } else { cell("", &[(iface.as_str(), Kind::Hashed(name_hue(&iface)))]) },
             s(r, "sessions"),
             refused,
@@ -144,9 +154,20 @@ fn row(r: &Value) -> Row {
     }
 }
 
+/// A VRF as a chip coloured by its name; `main` as plain text (as the
+/// WireGuard window, G1.31c).
+fn vrf_cell(vrf: &str) -> String {
+    if vrf.is_empty() || vrf == "main" {
+        "main".to_owned()
+    } else {
+        cell("", &[(vrf, Kind::Hashed(name_hue(vrf)))])
+    }
+}
+
 fn values(r: &Value) -> BTreeMap<&'static str, String> {
     let mut v = BTreeMap::new();
     v.insert("network", s(r, "network"));
+    v.insert("vrf", s(r, "vrf"));
     v.insert("disabled", if r.get("disabled").and_then(Value::as_bool) == Some(true) { "yes" } else { "no" }.to_owned());
     v.insert("comment", s(r, "comment"));
     v
@@ -166,12 +187,15 @@ pub(crate) fn sessions_text(who: &Value) -> String {
         .join("; ")
 }
 
-/// Ask the router to guard `network` (the Protect buttons).
-pub(crate) fn protect(app: &mut CoreRouterUi, network: &str) {
-    app.run_steps(
-        vec![json!({"command": CMDS.add, "params": {"network": network}})],
-        Then::Nothing,
-    );
+/// Ask the router to guard `network` of `vrf` (the Protect buttons).
+pub(crate) fn protect(app: &mut CoreRouterUi, network: &str, vrf: &str) {
+    let mut p = json!({"network": network});
+    if !vrf.is_empty()
+        && let Some(o) = p.as_object_mut()
+    {
+        o.insert("vrf".into(), json!(vrf));
+    }
+    app.run_steps(vec![json!({"command": CMDS.add, "params": p})], Then::Nothing);
 }
 
 /// Open the window (the top bar's chip).
@@ -200,17 +224,17 @@ impl GuardPanel {
                 if f.get("guarded").and_then(Value::as_bool) != Some(true)
                     && table::action(ui, &format!("{} {net}", tr_in(SCOPE, l, "Protect")), can.clone())
                 {
-                    protect(app, &net);
+                    protect(app, &net, &s(f, "vrf"));
                 }
             });
         }
         // A network a finding above already offers is not repeated.
-        let offered: Vec<String> = findings.iter().map(|f| s(f, "connected")).collect();
+        let offered: Vec<(String, String)> = findings.iter().map(|f| (s(f, "vrf"), s(f, "connected"))).collect();
         let open: Vec<Value> = self
             .suggest
             .iter()
             .filter(|n| n.get("guarded").and_then(Value::as_bool) != Some(true))
-            .filter(|n| !offered.contains(&s(n, "network")))
+            .filter(|n| !offered.contains(&(s(n, "vrf"), s(n, "network"))))
             .cloned()
             .collect();
         if !open.is_empty() {
@@ -225,6 +249,10 @@ impl GuardPanel {
             ui.horizontal_wrapped(|ui| {
                 let net = s(n, "network");
                 ui.monospace(&net);
+                let vrf = s(n, "vrf");
+                if !vrf.is_empty() && vrf != "main" {
+                    chip::chip(ui, &format!("vrf {vrf}"), chip::palette_tone(&v, name_hue(&vrf)));
+                }
                 let iface = s(n, "interface");
                 chip::chip(ui, &iface, chip::palette_tone(&v, name_hue(&iface)));
                 if n.get("covered").and_then(Value::as_bool) == Some(true) {
@@ -232,7 +260,7 @@ impl GuardPanel {
                 }
                 ui.weak(sessions_text(&n["sessions"])).on_hover_text(s(n, "command"));
                 if table::action(ui, &format!("{} {net}", tr_in(SCOPE, l, "Protect")), can.clone()) {
-                    protect(app, &net);
+                    protect(app, &net, &vrf);
                 }
             });
         }
@@ -250,6 +278,7 @@ impl GuardPanel {
                     v.insert("disabled", "no".to_owned());
                     if let Some(n) = self.suggest.iter().find(|n| n.get("guarded").and_then(Value::as_bool) != Some(true)) {
                         v.insert("network", s(n, "network"));
+                        v.insert("vrf", s(n, "vrf"));
                     }
                     self.modal = Some(Modal::open(app, None, v));
                 }
@@ -289,6 +318,10 @@ impl GuardPanel {
                     .map(|r| {
                         let mut p = json!({"network": s(r, "network")});
                         if let Some(o) = p.as_object_mut() {
+                            let vrf = s(r, "vrf");
+                            if !vrf.is_empty() && vrf != "main" {
+                                o.insert("vrf".into(), json!(vrf));
+                            }
                             if !s(r, "comment").is_empty() {
                                 o.insert("comment".into(), json!(s(r, "comment")));
                             }
@@ -388,8 +421,17 @@ impl PanelState for GuardPanel {
     }
 
     fn dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
+        // G3.4za: main and the VRFs (empty: the table the network is
+        // connected in, chosen by the router).
+        let vrfs: Vec<String> = app.cache.vrfs.iter().map(|r| s(r, "name")).filter(|n| !n.is_empty()).collect();
         if let Some(m) = &mut self.modal
-            && !m.show(app, ctx, area, &SPEC, &|_| Vec::new())
+            && !m.show(app, ctx, area, &SPEC, &|p: &str| {
+                if p == "vrf" {
+                    std::iter::once("main".to_owned()).chain(vrfs.iter().cloned()).collect()
+                } else {
+                    Vec::new()
+                }
+            })
         {
             self.modal = None;
         }

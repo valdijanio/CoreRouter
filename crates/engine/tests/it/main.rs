@@ -56,6 +56,7 @@ mod journal_sections;
 mod link_sample;
 mod log_disk;
 mod metrics;
+mod module_scan;
 mod mpls;
 mod neighbor;
 mod net_audit;

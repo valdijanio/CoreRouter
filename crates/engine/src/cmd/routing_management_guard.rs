@@ -4,9 +4,12 @@
 //! daemon refuses, from every protocol, a prefix inside a network here and
 //! longer than it (FRR zebra `ip protocol any route-map`); the window shows
 //! what it refuses, read from the daemon's RIB.
+//!
+//! G3.4za: each network is in one routing table (`vrf`: main or a VRF);
+//! left out, it is the table the network is connected in.
 
 use corerouter_model::mgmt_guard::{GuardNetwork, MAX_NETWORKS};
-use corerouter_model::{Config, ItemId};
+use corerouter_model::{Config, ItemId, RoutingTable, route};
 use ipnet::IpNet;
 use serde_json::{Value, json};
 
@@ -18,22 +21,22 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("routing.management-guard.add", "Add Management Guard Network", ["Routing", "Management Guard"], None,
-        "{network: cidr (a network the router is managed from; host bits are cleared; not a /32 or /128), disabled?: bool, comment?: string} → {id, network}",
+        "{network: cidr (a network the router is managed from; host bits are cleared; not a /32 or /128), vrf?: string (main or a VRF; default: the table the network is connected in, else main), disabled?: bool, comment?: string} → {id, network, vrf}",
         always, add),
     cmd!("routing.management-guard.set", "Set Management Guard Network", [], None,
-        "{id: *hex, network?: cidr, disabled?: bool, comment?: string, force?: bool (takes away the guard of this session's own network all the same)} → {id, network}",
+        "{id: *hex, network?: cidr, vrf?: string (main or a VRF), disabled?: bool, comment?: string, force?: bool (takes away the guard of this session's own network all the same)} → {id, network, vrf}",
         has_networks, set),
     cmd!("routing.management-guard.remove", "Remove Management Guard Network", [], None,
         "{id: *hex, force?: bool (takes away the guard of this session's own network all the same)} → {id}",
         has_networks, remove),
     cmd!(query "routing.management-guard.list", "Management Guard", ["Routing", "Management Guard"], None,
-        "{} → {watching: bool (the daemon looks up the open sessions' routes), rows: [{id, network, family (ipv4 | ipv6), interface? (the connected network's port), connected: bool, sessions (open management sessions whose peer is inside), covered (of them, whose replies a learned route takes now), refused?: u32 (learned routes inside and longer the daemon holds and keeps out of the kernel), refused_text?, installed?: u32 (of them, in the kernel: the guard is not in force), rib: ready | pending | unavailable, rib_error?, state (active | disabled | not-applied), disabled, comment}], findings: [{peer, route, protocol, interface?, gateway?, connected, connected_interface, sessions: [{via, user, peer}], guarded, text, fix?}]}",
+        "{} → {watching: bool (the daemon looks up the open sessions' routes), rows: [{id, network, vrf (main or a VRF), family (ipv4 | ipv6), interface? (the connected network's port, in that table), connected: bool, sessions (open management sessions whose peer is inside), covered (of them, whose replies a learned route takes now), refused?: u32 (learned routes inside and longer the daemon holds and keeps out of the kernel), refused_text?, installed?: u32 (of them, in the kernel: the guard is not in force), rib: ready | pending | unavailable, rib_error?, state (active | disabled | not-applied), disabled, comment}], findings: [{peer, route, vrf, protocol, interface?, gateway?, connected, connected_interface, sessions: [{via, user, peer}], guarded, text, fix?}]}",
         always, list),
     cmd!(query "routing.management-guard.suggest", "Management Networks", [], None,
-        "{} → [{network, interface, sessions: [{via, user, peer, open (false: closed in the last 10 min)}], covered: bool (a learned route takes the replies now), guarded: bool, command (what protects it)}]",
+        "{} → [{network, vrf, interface, sessions: [{via, user, peer, open (false: closed in the last 10 min)}], covered: bool (a learned route takes the replies now), guarded: bool, command (what protects it)}]",
         always, suggest),
     cmd!(query "routing.management-guard.check", "Check Management Guard Network", [], None,
-        "{id?: string (the network being edited), network?: string, disabled?: string, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param?}], commands: [{command, params}]} (form texts accepted; never an error: bad input is a check)",
+        "{id?: string (the network being edited), network?: string, vrf?: string, disabled?: string, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param?}], commands: [{command, params}]} (form texts accepted; never an error: bad input is a check)",
         always, check),
 ];
 
@@ -69,17 +72,71 @@ fn position(cfg: &Config, id: ItemId) -> Result<usize> {
         .ok_or_else(|| EngineError::bad("id", format!("no management guard network {id} (see routing.management-guard.list)")))
 }
 
-fn duplicate(cfg: &Config, net: &IpNet, except: Option<ItemId>) -> Result<()> {
+fn duplicate(cfg: &Config, table: &RoutingTable, net: &IpNet, except: Option<ItemId>) -> Result<()> {
     if let Some(n) = cfg
         .routing
         .management_guard
         .networks
         .iter()
-        .find(|n| n.network == *net && Some(n.id) != except)
+        .find(|n| n.network == *net && n.vrf == *table && Some(n.id) != except)
     {
-        return Err(EngineError::bad("network", format!("{net} is already guarded ({})", n.id)));
+        return Err(EngineError::bad("network", format!("{net} is already guarded ({}){}", n.id, in_vrf(table))));
     }
     Ok(())
+}
+
+/// " in VRF x", or nothing for main.
+fn in_vrf(table: &RoutingTable) -> String {
+    match table {
+        RoutingTable::Main => String::new(),
+        RoutingTable::Vrf(v) => format!(" in VRF {v}"),
+    }
+}
+
+/// `text` as a guard's table: main or an existing VRF.
+fn parse_vrf(cfg: &Config, text: &str) -> std::result::Result<RoutingTable, String> {
+    let t: RoutingTable = text.parse().map_err(|e: corerouter_model::ParseError| e.to_string())?;
+    if !t.is_main() && !route::is_vrf_table(cfg, &t) {
+        let known: Vec<String> = vrfs(cfg);
+        return Err(format!(
+            "no VRF '{t}' (interface.vrf.add){}",
+            if known.is_empty() { " — this router has none: use main".to_owned() } else { format!("; VRFs: main, {}", known.join(", ")) }
+        ));
+    }
+    Ok(t)
+}
+
+/// The VRF interfaces, by name.
+fn vrfs(cfg: &Config) -> Vec<String> {
+    cfg.interfaces
+        .values()
+        .filter(|i| matches!(i.kind, corerouter_model::InterfaceKind::Vrf { .. }))
+        .map(|i| i.name.to_string())
+        .collect()
+}
+
+/// The tables `net` is connected in (an address of a port whose network is
+/// `net` or inside it), main first.
+fn connected_tables(cfg: &Config, net: &IpNet) -> Vec<(RoutingTable, String)> {
+    let mut out: Vec<(RoutingTable, String)> = Vec::new();
+    for a in cfg.ip.addresses.iter().filter(|a| a.from_pool.is_none() && net.contains(&a.address.trunc())) {
+        let t = match route::table_of(cfg, &a.interface) {
+            t @ RoutingTable::Vrf(_) if route::is_vrf_table(cfg, &t) => t,
+            _ => RoutingTable::Main,
+        };
+        if !out.iter().any(|(o, _)| *o == t) {
+            out.push((t, a.interface.to_string()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The table a network is guarded in when `vrf` is left out: the one it is
+/// connected in (main when it is in main too, or nowhere).
+fn default_vrf(cfg: &Config, net: &IpNet) -> RoutingTable {
+    let tables = connected_tables(cfg, net);
+    tables.first().map(|(t, _)| t.clone()).unwrap_or_default()
 }
 
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
@@ -87,16 +144,22 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let net = parse_network(&text).map_err(|e| EngineError::bad("network", e))?;
     let disabled = opt_bool(p, "disabled")?.unwrap_or(false);
     let comment = opt_text(p, "comment", 256)?.unwrap_or_default();
+    // An empty choice (the form) is "the table it is connected in".
+    let vrf_text = opt_text(p, "vrf", 64)?.filter(|t| !t.trim().is_empty());
     let cfg = s.store_mut().candidate_mut();
-    duplicate(cfg, &net, None)?;
+    let vrf = match vrf_text {
+        Some(t) => parse_vrf(cfg, &t).map_err(|e| EngineError::bad("vrf", e))?,
+        None => default_vrf(cfg, &net),
+    };
+    duplicate(cfg, &vrf, &net, None)?;
     let g = &mut cfg.routing.management_guard;
     if g.networks.len() >= MAX_NETWORKS {
         return Err(EngineError::bad("network", format!("at most {MAX_NETWORKS} guarded networks")));
     }
     g.next_id = g.next_id.saturating_add(1);
     let id = ItemId(g.next_id);
-    g.networks.push(GuardNetwork { id, network: net, disabled, comment });
-    Ok(json!({ "id": id, "network": net }))
+    g.networks.push(GuardNetwork { id, network: net, vrf: vrf.clone(), disabled, comment });
+    Ok(json!({ "id": id, "network": net, "vrf": vrf }))
 }
 
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
@@ -108,10 +171,23 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let disabled = opt_bool(p, "disabled")?;
     let comment = opt_text(p, "comment", 256)?;
+    // An empty choice (the form) is "the table it is connected in".
+    let vrf_text = opt_text(p, "vrf", 64)?.filter(|t| !t.trim().is_empty());
     let cfg = s.store_mut().candidate_mut();
     let at = position(cfg, id)?;
-    if let Some(n) = &net {
-        duplicate(cfg, n, Some(id))?;
+    let vrf = match vrf_text {
+        Some(t) => Some(parse_vrf(cfg, &t).map_err(|e| EngineError::bad("vrf", e))?),
+        None => None,
+    };
+    let (old_net, old_vrf) = cfg
+        .routing
+        .management_guard
+        .networks
+        .get(at)
+        .map(|n| (n.network, n.vrf.clone()))
+        .ok_or_else(|| EngineError::bad("id", format!("no management guard network {id}")))?;
+    if net.is_some() || vrf.is_some() {
+        duplicate(cfg, vrf.as_ref().unwrap_or(&old_vrf), net.as_ref().unwrap_or(&old_net), Some(id))?;
     }
     let Some(entry) = cfg.routing.management_guard.networks.get_mut(at) else {
         return Err(EngineError::bad("id", format!("no management guard network {id}")));
@@ -119,14 +195,17 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(n) = net {
         entry.network = n;
     }
+    if let Some(v) = vrf {
+        entry.vrf = v;
+    }
     if let Some(d) = disabled {
         entry.disabled = d;
     }
     if let Some(c) = comment {
         entry.comment = c;
     }
-    let network = entry.network;
-    Ok(json!({ "id": id, "network": network }))
+    let (network, vrf) = (entry.network, entry.vrf.clone());
+    Ok(json!({ "id": id, "network": network, "vrf": vrf }))
 }
 
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
@@ -140,8 +219,8 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// Whether the routing daemon runs `net`'s guard: the running config has
 /// it active (a candidate not yet committed does not).
-fn applied(s: &Session, net: &IpNet) -> bool {
-    s.store().running().routing.management_guard.active().any(|n| n == net)
+fn applied(s: &Session, table: &RoutingTable, net: &IpNet) -> bool {
+    s.store().running().routing.management_guard.active_in(table).any(|n| n == net)
 }
 
 fn list(s: &mut Session, _: &Value) -> Result<Value> {
@@ -150,21 +229,21 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
     let findings = s.mgmt_guard_findings();
     let mut rows = Vec::with_capacity(networks.len());
     for n in &networks {
-        let inside: Vec<_> = mgmt.iter().filter(|(c, _, _)| n.network.contains(c)).collect();
+        let inside: Vec<_> = mgmt.iter().filter(|m| m.vrf == n.vrf && n.network.contains(&m.network)).collect();
         let iface = mgmt
             .iter()
-            .find(|(c, _, _)| *c == n.network)
-            .map(|(_, i, _)| i.to_string())
-            .or_else(|| connected_port(s.store().running(), &n.network));
-        let sessions: usize = inside.iter().map(|(_, _, w)| w.iter().filter(|w| w.open).count()).sum();
+            .find(|m| m.vrf == n.vrf && m.network == n.network)
+            .map(|m| m.interface.to_string())
+            .or_else(|| connected_port(s.store().running(), &n.vrf, &n.network));
+        let sessions: usize = inside.iter().map(|m| m.sessions.iter().filter(|w| w.open).count()).sum();
         let covered: usize = findings
             .iter()
-            .filter(|f| n.network.contains(&f.peer))
+            .filter(|f| f.vrf == n.vrf && n.network.contains(&f.peer))
             .map(|f| f.sessions.len())
             .sum();
         let state = if n.disabled {
             "disabled"
-        } else if applied(s, &n.network) {
+        } else if applied(s, &n.vrf, &n.network) {
             "active"
         } else {
             "not-applied"
@@ -172,6 +251,7 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
         let mut row = json!({
             "id": n.id,
             "network": n.network,
+            "vrf": n.vrf,
             "family": if n.network.addr().is_ipv4() { "ipv4" } else { "ipv6" },
             "interface": iface,
             "connected": iface.is_some(),
@@ -181,7 +261,7 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
             "disabled": n.disabled,
             "comment": n.comment,
         });
-        let view = if n.disabled { None } else { Some(s.mgmt_guard_rib(n.network)) };
+        let view = if n.disabled { None } else { Some(s.mgmt_guard_rib(&n.vrf, n.network)) };
         if let Some(o) = row.as_object_mut() {
             match view {
                 Some(RibView::Ready(rib)) => {
@@ -210,12 +290,16 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
     }))
 }
 
-/// The port of the connected network `net` exactly (any table).
-fn connected_port(cfg: &Config, net: &IpNet) -> Option<String> {
+/// The port of the connected network `net` exactly, in `table`.
+fn connected_port(cfg: &Config, table: &RoutingTable, net: &IpNet) -> Option<String> {
     cfg.ip
         .addresses
         .iter()
-        .find(|a| a.from_pool.is_none() && a.address.trunc() == *net)
+        .filter(|a| a.from_pool.is_none() && a.address.trunc() == *net)
+        .find(|a| {
+            let t = route::table_of(cfg, &a.interface);
+            if route::is_vrf_table(cfg, &t) { t == *table } else { table.is_main() }
+        })
         .map(|a| a.interface.to_string())
 }
 
@@ -225,14 +309,15 @@ fn suggest(s: &mut Session, _: &Value) -> Result<Value> {
     let rows: Vec<Value> = s
         .mgmt_guard_networks()
         .into_iter()
-        .map(|(net, iface, who)| {
+        .map(|m| {
             json!({
-                "network": net,
-                "interface": iface,
-                "covered": findings.iter().any(|f| f.connected == net),
-                "guarded": guard.active().any(|g| g.contains(&net)),
-                "command": protect_command(&net),
-                "sessions": who,
+                "network": m.network,
+                "vrf": m.vrf,
+                "interface": m.interface,
+                "covered": findings.iter().any(|f| f.vrf == m.vrf && f.connected == m.network),
+                "guarded": guard.active_in(&m.vrf).any(|g| g.contains(&m.network)),
+                "command": protect_command(&m.vrf, &m.network),
+                "sessions": m.sessions,
             })
         })
         .collect();
@@ -241,7 +326,7 @@ fn suggest(s: &mut Session, _: &Value) -> Result<Value> {
 
 fn check(s: &mut Session, raw: &Value) -> Result<Value> {
     let text = |k: &str| raw.get(k).and_then(Value::as_str).map_or("", str::trim).to_owned();
-    let (id, network, comment) = (text("id"), text("network"), text("comment"));
+    let (id, network, comment, vrf_text) = (text("id"), text("network"), text("comment"), text("vrf"));
     let disabled = matches!(text("disabled").as_str(), "yes" | "true");
     let item = |level: &str, check: &str, message: String, param: Option<&str>| {
         let mut v = json!({"level": level, "check": check, "message": message});
@@ -266,26 +351,58 @@ fn check(s: &mut Session, raw: &Value) -> Result<Value> {
         }
     };
     let cfg = s.store().candidate();
-    if let Some(n) = cfg.routing.management_guard.networks.iter().find(|n| n.network == net && Some(n.id) != editing) {
-        checks.push(item("error", "duplicate", format!("{net} is already guarded ({})", n.id), Some("network")));
+    let vrf = if vrf_text.is_empty() {
+        // Editing: the network's own table; new: the one it is connected in.
+        editing
+            .and_then(|id| cfg.routing.management_guard.networks.iter().find(|n| n.id == id))
+            .map_or_else(|| default_vrf(cfg, &net), |n| n.vrf.clone())
+    } else {
+        match parse_vrf(cfg, &vrf_text) {
+            Ok(v) => v,
+            Err(e) => {
+                checks.push(item("error", "param", e, Some("vrf")));
+                return Ok(json!({"computed": computed, "checks": checks, "commands": commands}));
+            }
+        }
+    };
+    if let Some(n) = cfg
+        .routing
+        .management_guard
+        .networks
+        .iter()
+        .find(|n| n.network == net && n.vrf == vrf && Some(n.id) != editing)
+    {
+        checks.push(item("error", "duplicate", format!("{net} is already guarded ({}){}", n.id, in_vrf(&vrf)), Some("network")));
     }
+    let elsewhere: Vec<(RoutingTable, String)> =
+        connected_tables(s.store().running(), &net).into_iter().filter(|(t, _)| *t != vrf).collect();
     let last = match net {
         IpNet::V4(n) => n.broadcast().to_string(),
         IpNet::V6(n) => n.broadcast().to_string(),
     };
     computed.push(json!({"label": "Refuses", "value": format!("learned prefixes inside {net} longer than /{}", net.prefix_len())}));
     computed.push(json!({"label": "Range", "value": format!("{} – {last}", net.network())}));
-    match connected_port(s.store().running(), &net) {
+    computed.push(json!({"label": "Routing table", "value": vrf.to_string()}));
+    match connected_port(s.store().running(), &vrf, &net) {
         Some(port) => computed.push(json!({"label": "Connected on", "value": port})),
+        None if !elsewhere.is_empty() => {
+            let (t, port) = elsewhere.first().map(|(t, p)| (t.to_string(), p.clone())).unwrap_or_default();
+            checks.push(item(
+                "warning",
+                "other-vrf",
+                format!("{net} is connected on {port} in {}, not in {vrf}: a guard in {vrf} does not protect it (choose vrf {t})", if t == RoutingTable::MAIN { "main".to_owned() } else { format!("VRF {t}") }),
+                Some("vrf"),
+            ));
+        }
         None => checks.push(item(
             "warning",
             "not-connected",
-            format!("{net} is not a connected network of the router: the guard still refuses the learned routes inside it, which is what you want only for a management network reached through a static route"),
+            format!("{net} is not a connected network of the router{}: the guard still refuses the learned routes inside it, which is what you want only for a management network reached through a static route", in_vrf(&vrf)),
             Some("network"),
         )),
     }
     let mgmt = s.mgmt_guard_networks();
-    let inside: Vec<_> = mgmt.iter().filter(|(c, _, _)| net.contains(c)).flat_map(|(_, _, w)| w.iter()).collect();
+    let inside: Vec<_> = mgmt.iter().filter(|m| m.vrf == vrf && net.contains(&m.network)).flat_map(|m| m.sessions.iter()).collect();
     let open = inside.iter().filter(|w| w.open).count();
     if open > 0 {
         checks.push(item("ok", "sessions", format!("{open} open management session(s) come from inside {net}"), None));
@@ -293,11 +410,11 @@ fn check(s: &mut Session, raw: &Value) -> Result<Value> {
     if inside.len() > open {
         checks.push(item("ok", "sessions", format!("{} management session(s) from inside {net} closed in the last 10 min", inside.len() - open), None));
     }
-    if s.mgmt_guard_findings().iter().any(|f| net.contains(&f.peer)) {
+    if s.mgmt_guard_findings().iter().any(|f| f.vrf == vrf && net.contains(&f.peer)) {
         checks.push(item("warning", "covered", format!("a learned route takes the replies to a session inside {net} now: this guard takes it out"), None));
     }
     if !disabled {
-        match s.mgmt_guard_rib(net) {
+        match s.mgmt_guard_rib(&vrf, net) {
             RibView::Ready(rib) => {
                 let (hit, installed) = refused(&net, &rib);
                 computed.push(json!({"label": "Learned routes refused now", "value": by_protocol(&hit)}));
@@ -312,6 +429,9 @@ fn check(s: &mut Session, raw: &Value) -> Result<Value> {
     }
     let mut p = json!({"network": net.to_string()});
     if let Some(o) = p.as_object_mut() {
+        if !vrf.is_main() || !vrf_text.is_empty() {
+            o.insert("vrf".into(), json!(vrf));
+        }
         if !comment.is_empty() {
             o.insert("comment".into(), json!(comment));
         }
@@ -340,7 +460,7 @@ mod tests {
     use corerouter_model::routing_state::RoutingStatus;
     use serde_json::json;
 
-    use crate::mgmt_guard::tests::{lab, learned, operator};
+    use crate::mgmt_guard::tests::{lab, learned, operator, vrf_lab, vrf_operator};
     use crate::Session;
 
     fn rows(s: &mut Session) -> Vec<serde_json::Value> {
@@ -423,7 +543,8 @@ mod tests {
         let wanted = s.mgmt_guard_rib_wanted();
         assert_eq!(wanted.len(), 1);
         let r = |p: &str, proto: &str, installed: bool| RibRoute { prefix: p.parse().unwrap(), protocol: proto.into(), installed, inactive: !installed, via: String::new() };
-        s.mgmt_guard_set_rib(wanted[0], Ok(vec![r("192.168.0.0/24", "connected", true), r("192.168.0.2/32", "ospf", true), r("192.168.0.0/25", "bgp", true)]));
+        let (t, n) = wanted[0].clone();
+        s.mgmt_guard_set_rib(t, n, Ok(vec![r("192.168.0.0/24", "connected", true), r("192.168.0.2/32", "ospf", true), r("192.168.0.0/25", "bgp", true)]));
         let c = s.execute("routing.management-guard.check", &json!({"network": "192.168.0.0/24"})).unwrap();
         let text = c.to_string();
         assert!(text.contains("2 (bgp 1, ospf 1)") && text.contains("2 of them in the kernel"), "{c}");
@@ -436,9 +557,9 @@ mod tests {
         let a = s.execute("routing.management-guard.add", &json!({"network": "192.168.0.0/24"})).unwrap();
         let _ = s.set_routing_status(RoutingStatus { backend: "frr 10.7.1".into(), ..Default::default() });
         let _ = s.execute("routing.management-guard.list", &json!({}));
-        let net = s.mgmt_guard_rib_wanted()[0];
+        let (t, net) = s.mgmt_guard_rib_wanted()[0].clone();
         let route = |p: &str| RibRoute { prefix: p.parse().unwrap(), protocol: "ospf".into(), installed: false, inactive: true, via: String::new() };
-        s.mgmt_guard_set_rib(net, Ok(vec![route("192.168.0.2/32")]));
+        s.mgmt_guard_set_rib(t, net, Ok(vec![route("192.168.0.2/32")]));
         let me = operator(3, "192.168.0.2", "GUI");
         let e = s.execute_as(&me, "routing.management-guard.remove", &json!({"id": a["id"]})).unwrap_err().to_string();
         assert!(e.contains("lockout") && e.contains("192.168.0.2/32 (ospf)"), "{e}");
@@ -454,10 +575,83 @@ mod tests {
     }
 
     #[test]
+    fn a_vrf_network_defaults_to_the_table_it_is_connected_in() {
+        let mut s = vrf_lab();
+        let a = s.execute("routing.management-guard.add", &json!({"network": "10.99.0.0/24"})).unwrap();
+        assert_eq!(a["vrf"], "mgmt", "{a}");
+        let b = s.execute("routing.management-guard.add", &json!({"network": "172.16.0.0/16", "vrf": ""})).unwrap();
+        assert_eq!(b["vrf"], "main", "connected nowhere: main");
+        let r = rows(&mut s);
+        assert_eq!((r[0]["vrf"].as_str(), r[0]["interface"].as_str(), r[0]["state"].as_str()), (Some("mgmt"), Some("ether3"), Some("active")), "{r:?}");
+        // The same network in main is another guard, not a duplicate.
+        s.execute("routing.management-guard.add", &json!({"network": "10.99.0.0/24", "vrf": "main"})).unwrap();
+        let e = s.execute("routing.management-guard.add", &json!({"network": "10.99.0.9/24", "vrf": "mgmt"})).unwrap_err().to_string();
+        assert!(e.contains("already guarded") && e.contains("VRF mgmt"), "{e}");
+        // Moving one to main collides with the other.
+        let e = s.execute("routing.management-guard.set", &json!({"id": a["id"], "vrf": "main"})).unwrap_err().to_string();
+        assert!(e.contains("already guarded"), "{e}");
+        s.execute("routing.management-guard.set", &json!({"id": b["id"], "vrf": "mgmt"})).unwrap();
+        assert_eq!(rows(&mut s)[1]["vrf"], "mgmt");
+    }
+
+    #[test]
+    fn a_vrf_that_does_not_exist_is_refused_and_one_in_use_stays() {
+        let mut s = vrf_lab();
+        let e = s.execute("routing.management-guard.add", &json!({"network": "10.99.0.0/24", "vrf": "blue"})).unwrap_err().to_string();
+        assert!(e.contains("no VRF 'blue'") && e.contains("VRFs: main, mgmt"), "{e}");
+        let e = s.execute("routing.management-guard.add", &json!({"network": "10.99.0.0/24", "vrf": "bad name!"})).unwrap_err().to_string();
+        assert!(e.contains("routing table"), "{e}");
+        s.execute("routing.management-guard.add", &json!({"network": "10.99.0.0/24", "vrf": "mgmt"})).unwrap();
+        // The VRF cannot go while the guard names it (the commit is refused
+        // and nothing changes).
+        let e = s.execute("ip.vrf.remove", &json!({"name": "mgmt"})).unwrap_err().to_string();
+        assert!(e.contains("no VRF 'mgmt' for the guard of 10.99.0.0/24"), "{e}");
+        assert_eq!(rows(&mut s)[0]["vrf"], "mgmt");
+    }
+
+    #[test]
+    fn the_check_says_when_the_table_is_the_wrong_one() {
+        let mut s = vrf_lab();
+        let c = s.execute("routing.management-guard.check", &json!({"network": "10.99.0.0/24", "vrf": "main"})).unwrap();
+        let text = c.to_string();
+        assert!(text.contains("other-vrf") && text.contains("connected on ether3 in VRF mgmt"), "{c}");
+        let c = s.execute("routing.management-guard.check", &json!({"network": "10.99.0.0/24"})).unwrap();
+        assert_eq!(c["commands"][0]["params"]["vrf"], "mgmt", "{c}");
+        assert!(c.to_string().contains("\"Connected on\",\"value\":\"ether3\""), "{c}");
+        let c = s.execute("routing.management-guard.check", &json!({"network": "10.99.0.0/24", "vrf": "nope"})).unwrap();
+        assert_eq!(c["checks"][0]["param"], "vrf", "{c}");
+        // The RIB is asked for in the VRF.
+        let _ = s.set_routing_status(RoutingStatus { backend: "frr 10.7.1".into(), ..Default::default() });
+        let _ = s.execute("routing.management-guard.check", &json!({"network": "10.99.0.0/24"})).unwrap();
+        assert_eq!(s.mgmt_guard_rib_wanted()[0].0.to_string(), "mgmt");
+    }
+
+    #[test]
+    fn taking_away_the_vrf_guard_of_ones_own_session_is_a_lockout() {
+        let mut s = vrf_lab();
+        let a = s.execute("routing.management-guard.add", &json!({"network": "10.99.0.0/24"})).unwrap();
+        let _ = s.set_routing_status(RoutingStatus { backend: "frr 10.7.1".into(), ..Default::default() });
+        let _ = s.execute("routing.management-guard.list", &json!({}));
+        let (t, net) = s.mgmt_guard_rib_wanted()[0].clone();
+        let route = |p: &str| RibRoute { prefix: p.parse().unwrap(), protocol: "bgp".into(), installed: false, inactive: true, via: String::new() };
+        s.mgmt_guard_set_rib(t, net, Ok(vec![route("10.99.0.2/32")]));
+        let me = vrf_operator(3, "10.99.0.2");
+        let e = s.execute_as(&me, "routing.management-guard.remove", &json!({"id": a["id"]})).unwrap_err().to_string();
+        assert!(e.contains("lockout") && e.contains("10.99.0.2/32 (bgp)"), "{e}");
+        // Moving the guard to main takes it away from the VRF, too.
+        let e = s.execute_as(&me, "routing.management-guard.set", &json!({"id": a["id"], "vrf": "main"})).unwrap_err().to_string();
+        assert!(e.contains("lockout"), "{e}");
+        // A main session with the same peer address is not this one.
+        let other = operator(4, "10.99.0.2", "GUI");
+        s.execute_as(&other, "routing.management-guard.set", &json!({"id": a["id"], "comment": "x"})).unwrap();
+        assert_eq!(s.store().running().routing.management_guard.networks.len(), 1);
+    }
+
+    #[test]
     fn the_health_check_warns_and_says_how_to_fix() {
         let mut s = lab();
         s.execute_as(&operator(3, "192.168.0.2", "GUI"), "system.identity.get", &json!({})).unwrap();
-        let pairs = s.mgmt_guard_probes();
+        let pairs: Vec<_> = s.mgmt_guard_probes().iter().map(|p| p.pair()).collect();
         s.mgmt_guard_feed(pairs.iter().map(|p| (*p, Ok(learned("198.51.100.0/24", 188)))).collect());
         let h = s.execute("system.health.check", &json!({})).unwrap();
         let c = h["checks"].as_array().unwrap().iter().find(|c| c["key"] == "management.route").unwrap().clone();
