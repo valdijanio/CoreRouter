@@ -152,6 +152,15 @@ impl Remote {
         &self.no_password
     }
 
+    /// The next call opens a new connection first: none is open, or this
+    /// side has seen the router close it. A router that closed a moment
+    /// ago may not be seen yet (its FIN still on the way): a call then
+    /// goes out on the old connection and reports "may or may not have
+    /// run" (G0.30p).
+    pub fn will_redial(&self) -> bool {
+        self.client.as_ref().is_none_or(Client::is_stale)
+    }
+
     fn open(
         target: &Target,
         login: &Login,
