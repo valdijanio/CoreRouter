@@ -276,6 +276,11 @@ mod linux {
         claims: BTreeMap<IfName, InterfaceKind>,
         /// Whether `ra::sync` ran once (the first one flushes stale RA state).
         ra_synced: bool,
+        /// G1.3i: no managed link accepts Router Advertisements (the last
+        /// `ra::sync` set every `accept_ra` to 0 and flushed what they had
+        /// learned): the IPv6 reads skip the walk of the route table for
+        /// `proto ra` routes (37 ms with 100 000 BGP routes, **medido**).
+        ra_off: bool,
         /// G1.27e: the rule list last written (`None`: not compared with the
         /// kernel yet, which a restart may have left with rules of ours).
         rules: Option<BTreeSet<corerouter_hal::policy::KernelRule>>,
@@ -321,6 +326,12 @@ mod linux {
         /// link dump per tick instead of two. Taken by the first reader,
         /// dropped by `apply`.
         managed: Option<BTreeMap<u32, IfName>>,
+        /// G1.3i: the IPv6 state of the managed links the clock read with
+        /// the session unlocked, and when it was folded in. `ipv6_learned`
+        /// and `address_states` (every route list, every tick's route
+        /// look) answer from it while it is fresh instead of dumping the
+        /// kernel under the lock. Dropped by `apply`.
+        v6: Option<(std::time::Instant, V6Cache)>,
         /// G3.4m: the last `Hal::unmanaged` answer, its `epoch` and when
         /// it was read. Commands ask before touching a name (30 of them);
         /// a batch of 4 000 `interface.remove` read the whole link list
@@ -398,14 +409,54 @@ mod linux {
         }
     }
 
-    /// Reads the links with the session unlocked (G1.3f).
+    /// How long the clock's IPv6 read answers `ipv6_learned` and
+    /// `address_states`: the clock reads every second, so a missed tick or
+    /// two still answers from it; older, the kernel is asked.
+    const V6_FRESH: std::time::Duration = std::time::Duration::from_secs(3);
+    /// A reader reads the IPv6 state again only once the last read is this
+    /// old: the link events (G1.3d) take a reader per burst, up to ~20 a
+    /// second, and need only the links.
+    const V6_EVERY: std::time::Duration = std::time::Duration::from_millis(900);
+
+    /// The IPv6 state of the managed links (G1.3i).
+    #[derive(Debug, Default)]
+    struct V6Cache {
+        learned: Vec<corerouter_hal::Learned>,
+        states: Vec<corerouter_hal::address_state::AddressState>,
+    }
+
+    /// Reads the links with the session unlocked (G1.3f), and the IPv6
+    /// state on them (G1.3i): the route and address dumps the tick and
+    /// the route lists did under the lock.
     struct Reader {
         epoch: u64,
+        /// Read the IPv6 state too.
+        v6: bool,
+        /// Some managed link accepts RA: read the `proto ra` routes.
+        ra: bool,
+    }
+
+    /// What a [`Reader`] read.
+    struct Sample {
+        links: Result<Vec<KernelLink>, HalError>,
+        v6: Option<crate::netlink::V6Read>,
     }
 
     impl corerouter_hal::link_reader::LinkReader for Reader {
         fn read(&mut self) -> corerouter_hal::link_reader::LinkSample {
-            corerouter_hal::link_reader::LinkSample::new(self.epoch, crate::netlink::links())
+            let links = crate::netlink::links();
+            // Every link's: which are managed is the hal's to say, when it
+            // folds the sample in.
+            let v6 = links.as_ref().ok().filter(|_| self.v6).and_then(|l| {
+                let names: BTreeMap<u32, IfName> = l
+                    .iter()
+                    .filter_map(|l| Some((l.index, l.name.parse().ok()?)))
+                    .collect();
+                crate::netlink::v6_read(&names, self.ra)
+                    .map_err(|e| log::debug!("IPv6 state not read with the links: {e}"))
+                    .ok()
+            });
+            corerouter_hal::link_reader::LinkSample::new(self.epoch, Sample { links, v6 })
         }
     }
 
@@ -502,13 +553,79 @@ mod linux {
                     return;
                 }
             };
-            for p in crate::ra::sync(to, &managed, !self.ra_synced) {
+            let problems = crate::ra::sync(to, &managed, !self.ra_synced);
+            for p in &problems {
                 log::warn!("ipv6 RA settings: {p}");
             }
             self.ra_synced |= settled;
+            // Only once the kernel was told (and flushed) without a hitch.
+            self.ra_off = self.ra_synced
+                && problems.is_empty()
+                // A managed link outside the config is not synced: it may
+                // still hold what it learned.
+                && managed.keys().all(|n| {
+                    to.interfaces.contains_key(n)
+                        && corerouter_model::ipv6::ra_mode(to, n).0
+                            == corerouter_model::ipv6::RaMode::Off
+                });
         }
 
         /// Kernel index → name of the managed links.
+        /// The clock's IPv6 read (G1.3i), while fresh.
+        /// The lifetimes count down from when it was read: they come back
+        /// as the kernel would say them now.
+        fn fresh_v6(&self) -> Option<V6Cache> {
+            let (at, c) = self.v6.as_ref()?;
+            let age = at.elapsed();
+            if age >= V6_FRESH {
+                return None;
+            }
+            let age = u32::try_from(age.as_secs()).unwrap_or(u32::MAX);
+            let left = |s: &Option<u32>| s.map(|s| s.saturating_sub(age));
+            let learned = c
+                .learned
+                .iter()
+                .map(|l| match l {
+                    corerouter_hal::Learned::Address {
+                        interface,
+                        address,
+                        valid_secs,
+                        preferred_secs,
+                    } => corerouter_hal::Learned::Address {
+                        interface: interface.clone(),
+                        address: *address,
+                        valid_secs: left(valid_secs),
+                        preferred_secs: left(preferred_secs),
+                    },
+                    corerouter_hal::Learned::Route {
+                        interface,
+                        dst,
+                        gateway,
+                        metric,
+                        table,
+                        expires_secs,
+                    } => corerouter_hal::Learned::Route {
+                        interface: interface.clone(),
+                        dst: *dst,
+                        gateway: *gateway,
+                        metric: *metric,
+                        table: *table,
+                        expires_secs: left(expires_secs),
+                    },
+                })
+                .collect();
+            let states = c
+                .states
+                .iter()
+                .map(|s| corerouter_hal::address_state::AddressState {
+                    valid_secs: left(&s.valid_secs),
+                    preferred_secs: left(&s.preferred_secs),
+                    ..s.clone()
+                })
+                .collect();
+            Some(V6Cache { learned, states })
+        }
+
         fn managed_indexes(&mut self) -> Result<BTreeMap<u32, IfName>, HalError> {
             // G1.3f: what this tick's poll just read (at most a second old;
             // an apply drops it).
@@ -1032,6 +1149,7 @@ mod linux {
             // G1.3f: link samples read before this are stale.
             self.epoch = self.epoch.wrapping_add(1);
             self.managed = None;
+            self.v6 = None;
             let mut retried = false;
             let mut look =
                 !self.absent.is_empty() || corerouter_model::sections::interfaces_changed(from, to);
@@ -1423,7 +1541,15 @@ mod linux {
         }
 
         fn link_reader(&self) -> Option<Box<dyn corerouter_hal::link_reader::LinkReader>> {
-            Some(Box::new(Reader { epoch: self.epoch }))
+            let v6 = self
+                .v6
+                .as_ref()
+                .is_none_or(|(at, _)| at.elapsed() >= V6_EVERY);
+            Some(Box::new(Reader {
+                epoch: self.epoch,
+                v6,
+                ra: !self.ra_off,
+            }))
         }
 
         fn poll_sample(
@@ -1436,10 +1562,35 @@ mod linux {
                 self.cpu.feed();
                 return None;
             }
-            let links = sample
-                .take::<Result<Vec<KernelLink>, HalError>>()
-                .unwrap_or_else(|| Err(HalError::Io("link sample of another backend".into())));
-            Some(self.merge(links))
+            let Some(Sample { links, v6 }) = sample.take::<Sample>() else {
+                return Some(
+                    self.merge(Err(HalError::Io("link sample of another backend".into()))),
+                );
+            };
+            let live = self.merge(links);
+            // The managed links of this very sample (merge just set them).
+            // No read (not due, or it failed): the last one ages out.
+            if let Some(fresh) = v6.zip(self.managed.as_ref()).map(|(r, managed)| {
+                let mine = |i: &u32| managed.contains_key(i);
+                let cache = V6Cache {
+                    learned: r
+                        .learned
+                        .into_iter()
+                        .filter(|(i, _)| mine(i))
+                        .map(|(_, l)| l)
+                        .collect(),
+                    states: r
+                        .states
+                        .into_iter()
+                        .filter(|(i, _)| mine(i))
+                        .map(|(_, s)| s)
+                        .collect(),
+                };
+                (std::time::Instant::now(), cache)
+            }) {
+                self.v6 = Some(fresh);
+            }
+            Some(live)
         }
 
         /// Managed links of `cfg` as the kernel has them, and the
@@ -1755,6 +1906,9 @@ mod linux {
         }
 
         fn ipv6_learned(&mut self) -> Result<Vec<corerouter_hal::Learned>, HalError> {
+            if let Some(c) = self.fresh_v6() {
+                return Ok(c.learned);
+            }
             let names = self.managed_indexes()?;
             crate::netlink::learned(&names)
         }
@@ -1762,6 +1916,9 @@ mod linux {
         fn address_states(
             &mut self,
         ) -> Result<Vec<corerouter_hal::address_state::AddressState>, HalError> {
+            if let Some(c) = self.fresh_v6() {
+                return Ok(c.states);
+            }
             let names = self.managed_indexes()?;
             crate::netlink::address_states(&names)
         }
