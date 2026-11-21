@@ -28,6 +28,8 @@ set -euo pipefail
 
 if [ "${1:-}" = "--host" ]; then
 	IMAGES=${2:?usage: $0 --host <images dir>}
+	# put/ssh and the run must reach the same VM (G0.26c): the free one now.
+	export COREROUTER_VM_LAB=${COREROUTER_VM_LAB:-$(cargo xtask vm-lab pick)}
 	# A round first: an unhealthy VM goes back to its snapshot there, which
 	# would drop what `put` copied.
 	cargo xtask vm-lab run -- true

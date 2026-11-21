@@ -3,34 +3,132 @@
 Os testes que precisam de root de verdade (carregar XDP, `BPF_PROG_LOAD`, o laboratório do BNG
 com BNG Blaster e `pppd`) não rodam no host: os agentes nunca usam `sudo` lá. Em vez de esperar o
 usuário rodar no terminal dele ou o runner do CI (~15 min, 4 vCPUs), eles rodam numa VM libvirt
-local, `corerouter-lab`, onde o agente é root. O root fica dentro da VM.
+local, onde o agente é root. O root fica dentro da VM.
+
+São duas VMs desde a G0.26c (veja "Duas VMs"): a `corerouter-lab` (VM 1, 8 vCPUs, 16 GiB) para
+as **medições de desempenho** e a `corerouter-lab2` (VM 2, 4 vCPUs, 6 GiB) para os **testes de
+funcionamento**. O `vm-lab run` sem `--vm` usa a livre (a 2 primeiro); `--perf` pede a 1.
 
 ## Receita
 
 ```sh
 cargo xtask vm-lab create          # uma vez: imagem, VM, pacotes, rustup, snapshot `clean`
+cargo xtask vm-lab --vm 2 create --from 1   # a VM 2: cópia do snapshot `tools` da 1 (~75 s)
+cargo xtask vm-lab run -- cargo test -p corerouter-hal-linux --test netns_l2   # a VM livre
+cargo xtask vm-lab run --perf -- scripts/dns-stress-lab.sh …                   # medição: VM 1
+cargo xtask vm-lab pin             # mapa de CPUs ao vivo nas duas VMs e no runner do CI
 cargo xtask vm-lab run -- env COREROUTER_REQUIRE_XDP=1 cargo xtask xdp-root
 cargo xtask vm-lab run -- cargo test -p corerouter-hal-linux --test xdp_root --no-run
 cargo xtask vm-lab ssh             # shell como `lab` (sudo sem senha lá dentro)
-cargo xtask vm-lab status          # estado, dono da trava e idade, endereço, snapshots, disco, NICs
+cargo xtask vm-lab status          # as duas VMs: estado, CPUs, dono da trava e idade, endereço, snapshots, disco, NICs
 cargo xtask vm-lab unlock          # quem segura a trava; --force encerra o que sobrou de rodada morta
 cargo xtask vm-lab tools --check   # as ferramentas de terceiros estão lá? (o agente roda)
 cargo xtask vm-lab tools           # instala as que faltam e tira o snapshot `tools` (o usuário roda)
 cargo xtask vm-lab reset           # volta o disco ao snapshot `tools` (ou `clean`) e liga
 ```
 
+Todo subcomando aceita `--vm 1|2` logo depois de `vm-lab` (ou `$COREROUTER_VM_LAB`; também
+`lab`, `lab2` ou o nome inteiro). Sem ele: `run` escolhe, `status` e `unlock` mostram as duas, os
+outros usam a VM 1, como antes.
+
 | Subcomando | O que faz |
 |---|---|
-| `create [--cpus N] [--memory MiB] [--disk GiB] [--wires N]` | Baixa a imagem Ubuntu 24.04 cloud uma vez e confere com o `SHA256SUMS` publicado (recusa e apaga se não bate), cria um overlay qcow2 fino, o seed do cloud-init, define e liga a VM, espera o cloud-init, instala o Rust e tira o snapshot `clean`. Padrão: 8 vCPUs, 16384 MiB, 40 GiB (20 GiB até 2026-11-13; veja "Disco"), 1 fio. |
+| `create [--cpus N] [--memory MiB] [--disk GiB] [--wires N] [--from 1]` | `--from 1` (G0.26c): copia o disco do snapshot `tools` (ou `clean`) da VM 1 com `qemu-img convert -U -l snapshot.name=tools`, como overlay sobre a mesma imagem base, sem parar nem tocar a VM 1 (os clusters de um snapshot não mudam enquanto ele existe), e liga com um seed novo (`instance-id`, hostname, MACs, chave de host próprios): o cloud-init a trata como máquina nova. Depois deixa só a chave dela no `authorized_keys`, gera outro `machine-id` e tira o snapshot `tools`. Sem `--from`: baixa a imagem Ubuntu 24.04 cloud uma vez e confere com o `SHA256SUMS` publicado (recusa e apaga se não bate), cria um overlay qcow2 fino, o seed do cloud-init, define e liga a VM, espera o cloud-init, instala o Rust e tira o snapshot `clean`. Padrão: VM 1 com 8 vCPUs, 16384 MiB, 40 GiB (20 GiB até 2026-11-13; veja "Disco"); VM 2 com 4 vCPUs, 6144 MiB, 30 GiB; 1 fio. |
 | `up` / `down` | Liga e espera o SSH / desliga (ACPI; força depois de 90 s). |
 | `ssh [cmd…]` | Shell ou um comando como `lab`. |
 | `sync` | `rsync` da worktree para `/srv/lab/<worktree>/src` (sem `target*`, `.git`, `.claude/`, `vm/`, `plan/`; o app copia o `.claude/` para cada worktree, com o que estiver estacionado lá). |
 | `put <arquivo…>` | Copia arquivos do host para `/srv/lab/inbox/` na VM (uma captura, um arquivo de config). |
 | `tools [--check]` | Instala as ferramentas de terceiros declaradas em `xtask/src/vm_tools.rs` que faltam, imprime o que está instalado e tira o snapshot `tools`; `--check` só confere e diz o que falta. Idempotente. Veja "Ferramentas de terceiros". |
-| `run [--no-sync] [--shared] [--lock-timeout 30m] -- <cmd…>` | Confere a saúde da VM (root, processos novos, disco > 2 GiB e memória > 1 GiB livres; o que faz quando falha está em "Saúde da VM: reiniciar ou esperar": disco curto apaga os `target` que nenhuma rodada usa, e o `reset` sozinho só acontece sem outra rodada na VM), `sync`, pega a trava `/run/corerouter-lab.lock` (uma rodada por vez; `--shared` pula, só para compilar) e roda o comando **como root** em `/srv/lab/<worktree>/src`, com `CARGO_TARGET_DIR=/srv/lab/<worktree>/target`; saída ao vivo, código de saída repassado, tempo da rodada no fim. Um argumento só é uma linha de shell (`run -- 'a && b'`); vários são citados um a um. Espera a trava até `--lock-timeout` (ou `$COREROUTER_VM_LOCK_TIMEOUT`; padrão 30 min; `900`, `90s`, `30m`, `1h`) e então falha com código 75 dizendo quem a segura; o prazo vale só para a espera, nunca para a rodada. No fim avisa dos processos que o comando deixou vivos na VM. Uma rodada por worktree: se já há uma rodada da mesma worktree esperando ou rodando na VM, o `run` recusa antes do `sync` (ele sobrescreveria o código dela em `src`); `--no-sync` roda sobre o código que está lá. |
-| `unlock [--force]` | Mostra a trava: dono (worktree, PID do `run` no host, round), há quanto tempo, e os processos que a seguram, esperam por ela ou sobraram de rodadas. Com `--force`, encerra (TERM, KILL depois de 5 s) os processos de rodadas cujo `vm-lab run` já não existe no host, o que solta a trava. Nunca mexe numa rodada viva nem em quem só espera. |
+| `run [--perf] [--vm N] [--no-sync] [--shared] [--lock-timeout 30m] -- <cmd…>` | Escolhe a VM (veja "Duas VMs": `--perf` é a 1; sem `--vm`, a livre, a 2 primeiro) e diz qual na primeira linha. Confere a saúde da VM (root, processos novos, disco > 2 GiB e memória > 1 GiB livres; o que faz quando falha está em "Saúde da VM: reiniciar ou esperar": disco curto apaga os `target` que nenhuma rodada usa, e o `reset` sozinho só acontece sem outra rodada na VM), `sync`, pega a trava `/run/corerouter-lab.lock` (uma rodada por vez; `--shared` pula, só para compilar) e roda o comando **como root** em `/srv/lab/<worktree>/src`, com `CARGO_TARGET_DIR=/srv/lab/<worktree>/target`; saída ao vivo, código de saída repassado, tempo da rodada no fim. Um argumento só é uma linha de shell (`run -- 'a && b'`); vários são citados um a um. Espera a trava até `--lock-timeout` (ou `$COREROUTER_VM_LOCK_TIMEOUT`; padrão 30 min; `900`, `90s`, `30m`, `1h`) e então falha com código 75 dizendo quem a segura; o prazo vale só para a espera, nunca para a rodada. No fim avisa dos processos que o comando deixou vivos na VM. Uma rodada por worktree: se já há uma rodada da mesma worktree esperando ou rodando na VM, o `run` recusa antes do `sync` (ele sobrescreveria o código dela em `src`); `--no-sync` roda sobre o código que está lá. |
+| `pick [--perf]` | Imprime o número da VM que um `run` pegaria agora. Para roteiro que faz `put` ou `ssh` antes do `run`: `export COREROUTER_VM_LAB=${COREROUTER_VM_LAB:-$(cargo xtask vm-lab pick)}`, e os três passos vão para a mesma VM. |
+| `pin [--vm 1\|2\|ci] [--force]` | Aplica o mapa de CPUs ("CPUs por VM") com `virsh vcpupin/emulatorpin --live --config`: vale na hora e fica na definição, sem reiniciar. Sem `--vm`: as duas VMs do laboratório e o runner do CI. VM do laboratório com rodada é pulada (diz quando tentar de novo), salvo `--force`. |
+| `unlock [--force]` | Sem `--vm`, nas duas VMs. Mostra a trava: dono (worktree, PID do `run` no host, round), há quanto tempo, e os processos que a seguram, esperam por ela ou sobraram de rodadas. Com `--force`, encerra (TERM, KILL depois de 5 s) os processos de rodadas cujo `vm-lab run` já não existe no host, o que solta a trava. Nunca mexe numa rodada viva nem em quem só espera. |
 | `snapshot [nome] [--force]` / `reset [nome] [--force]` | Snapshot interno do disco (com a VM desligada; sem imagem de RAM) / volta o disco a ele e liga, mantendo a definição atual da VM (CPU, memória). Padrão `tools` (ou `clean`, se não houver `tools`). Recusa enquanto alguém está numa rodada: um `vm-lab run` vivo deste host com rodada na VM (segurando a trava, esperando por ela ou `--shared`), a trava do `run` na VM ou `vm/root.lock` no host (rodada à mão do usuário); `--force` passa por cima. Veja "Travas: regras e como destravar". |
 | `destroy` | Apaga a VM, o overlay e o seed; a imagem baixada e a chave ficam. |
+
+## Duas VMs (G0.26c, 2026-11-20)
+
+Na rodada da fase C (2026-11-20) a fila levou 8–10 min do PR à `main` e o atraso das sessões veio
+da VM única: a G3.4z esperou a rodada do DNS, que segurava a VM havia 919 s (**medido**).
+
+| | `corerouter-lab` (VM 1) | `corerouter-lab2` (VM 2) |
+|---|---|---|
+| Para quê | medições de desempenho (`run --perf`) | testes de funcionamento (`run` a pega primeiro) |
+| vCPUs, memória, disco | 8, 16 GiB, 20 GiB (40 se criada de novo) | 4, 6 GiB, 30 GiB |
+| Arquivos no host | `vm/` (os mesmos de antes) | `vm/corerouter-lab2/` |
+| MAC de gerência, fios | `…:72:01`, `…:73:nn` | `…:72:02`, `…:74:nn` |
+| Portas UDP dos fios | 47210–47217 | 47230–47237 |
+| CPUs do host (vCPU, QEMU) | 8–15 (um núcleo por vCPU), 24–31 | 4–7, 20–23 |
+
+- **Cada VM tem disco, seed, chave SSH (`id_ed25519`, `known_hosts`, alias de host próprio),
+  snapshots, `health.lock` e `root.lock` próprios**, e a trava de rodada
+  (`/run/corerouter-lab.lock`) fica dentro de cada uma. Os caches compartilhados são só a imagem
+  base (`vm/base/`) e os `.deb` (`vm/tools/`). A VM 1 ficou com os arquivos e nomes de antes:
+  uma worktree com um `vm_lab.rs` antigo continua usando a VM 1 e é vista pelas novas como
+  rodada nela.
+- **Qual VM o `run` usa** (função pura `pick`, testes `pick_prefers_a_free_vm_2…`): `--perf` →
+  VM 1; senão a VM livre, a 2 primeiro; as duas ocupadas → a com menos rodadas (empate: a 2);
+  sem VM 2 criada → a 1, como antes. Ocupada = rodada viva nela vista do host (o ssh da rodada
+  traz `HostKeyAlias=<nome>`) ou um `run` entre a conferência de saúde e a rodada (segura o
+  `health.lock` dela). `--vm N` (ou `$COREROUTER_VM_LAB`) escolhe à mão; `--perf` com `--vm 2`
+  é erro.
+- **Cache de build por VM:** cada VM tem o seu `/srv/lab/<worktree>/target`. Uma rodada que cai
+  na outra VM compila do zero ali (hal-linux: 40 s na VM 2, **medido**). Para compilar com
+  `--shared` e depois rodar a medição, use `--perf` nos dois.
+- **`put` e `ssh` vão para a VM 1 sem `--vm`.** Roteiro que copia antes do `run` fixa a VM:
+  `wifi-bond-lab.sh`, `hostap-hwsim.sh` e `frr-topotests.sh` usam `vm-lab pick`;
+  `dns-stress-lab.sh` e `ospf-stress-lab.sh` (medições) usam a 1.
+- **Ferramentas:** a VM 2 criada com `--from 1` herda as do snapshot `tools` da 1. O que faltar
+  aparece em `cargo xtask vm-lab --vm 2 tools --check`, e quem instala é o usuário
+  (`cargo xtask vm-lab --vm 2 tools`). Em 2026-11-20 faltavam nas duas `qemu-system-x86`,
+  `unzip` e `traceroute` (só o interop com o CHR usa).
+
+### CPUs por VM
+
+O host é um Ryzen AI MAX+ 395: 16 núcleos com SMT em dois CCDs, cada um com o próprio L3. O CCD0
+tem os núcleos 0–7 (CPUs 0–7 e as irmãs 16–23); o CCD1, os núcleos 8–15 (CPUs 8–15 e 24–31).
+
+| VM | vCPU → CPU do host | QEMU (emulador, E/S) |
+|---|---|---|
+| `corerouter-lab` | vCPU i → 8+i (CCD1, um núcleo físico por vCPU) | 24–31 (irmãs SMT dos mesmos núcleos) |
+| `corerouter-lab2` | 0–3 → 4–7 (CCD0) | 20–23 |
+| `corerouter-ci` (runner, `ci_runner.rs`) | 16 vCPUs → 0–7 e 16–23 (CCD0 inteiro) | 0–7, 16–23 |
+| `corerouter-teste` (do usuário) | sem mapa | — |
+
+Nenhuma outra VM usa o CCD1: a medição na VM 1 não divide núcleo nem L3 com outro convidado. A VM 2
+e o runner dividem o CCD0; os dois testam funcionamento, e a divisão só custa velocidade. O mapa
+está em `VMS` e `CI_VCPU_CPUS` (`xtask/src/vm_lab.rs`; teste `the_measurement_vm_shares_no_cpu`),
+entra no XML do `create` (das duas VMs e do `ci-runner create`) e o `vm-lab pin` o aplica ao vivo
+numa VM que já existe. O `status` mostra o mapa de cada VM e se ele confere.
+
+**O que o mapa não isola:** os processos do próprio host (os `cargo` das sessões, o app) podem
+rodar nas CPUs 8–15 e 24–31. Isolar de verdade pede `AllowedCPUs` no `user.slice` do systemd, uma
+configuração do sistema que fica para o usuário decidir (gap no `docs/changes/G0.26c.md`).
+
+### Medição (2026-11-20, **medido**)
+
+Carga fixa na VM 1: 8 processos em paralelo, cada um com `sha256sum` de um arquivo de 512 MiB em
+`/dev/shm`, três vezes; 15 repetições por bloco, tempo de parede de cada uma. Carga na VM 2: builds
+release do `corerouter-hal-linux` em laço (uma rodada de funcionamento típica). Blocos
+intercalados (com e sem mapa, com e sem carga na VM 2), host com carga média de 5 a 15 (outras
+sessões compilando).
+
+| VM 1 | VM 2 | blocos de 15 | mediana de cada bloco | CV dentro do bloco | pior repetição |
+|---|---|---|---|---|---|
+| com mapa | compilando | 4 | 940, 951, 951, 952 ms | 0,5–1,1 % | 984 ms |
+| sem mapa | compilando | 3 | 936, 917, 965 ms | 0,7–2,4 % | 1014 ms |
+| com mapa | parada | 3 | 943, 954, 983 ms | 0,7–1,2 % | 1007 ms |
+| com mapa | parada, host com carga 13 | 1 | 1004 ms | 24 % | 1865 ms |
+| sem mapa | parada | 2 | 936, 965 ms | 1,9 %, 21 % | 1544 ms |
+
+- **A VM 2 compilando não muda a medição da VM 1 de forma visível:** 940–952 ms com ela
+  compilando, 943–983 ms com ela parada; a diferença fica abaixo do que o host varia sozinho.
+- **O mapa reduz a variação** dentro do bloco sob carga (CV 0,5–1,1 % contra 0,7–2,4 %; pior
+  caso 984 contra 1014 ms). A mediana não muda de forma consistente (sem o mapa: de 917 a
+  965 ms).
+- **O ruído grande vem do host:** quando a carga do host subiu de 10 para 15, a VM 1 teve CV de
+  20–24 % com e sem mapa (pior caso 1865 ms). Medição de PR: repita os blocos e compare a
+  mediana; o `AllowedCPUs` acima é o que tiraria esse ruído.
 
 ## Travas: regras e como destravar (G0.26b)
 
@@ -176,10 +274,13 @@ instala os três pacotes do Ubuntu se faltarem). Veja `docs/producao-core.md`, "
 
 ## Como é montada
 
-- **libvirt `qemu:///system`**, sem `sudo`: o usuário está no grupo `libvirt`. A VM se chama
-  sempre `corerouter-lab`; as VMs `nl-node-*` são do usuário e nunca são tocadas.
+- **libvirt `qemu:///system`**, sem `sudo`: o usuário está no grupo `libvirt`. As VMs se chamam
+  `corerouter-lab` e `corerouter-lab2`; a `corerouter-teste` e as `nl-node-*` são do usuário e
+  nunca são tocadas, e a `corerouter-ci` é do `cargo xtask ci-runner` (o `vm-lab pin` só fixa as
+  CPUs dela).
 - **Arquivos em `vm/` do checkout principal** (no `.gitignore`), compartilhado por todas as
-  worktrees (`$COREROUTER_VM_DIR` muda): `base/` (imagem e `SHA256SUMS`), `corerouter-lab.qcow2`
+  worktrees (`$COREROUTER_VM_DIR` muda; os da VM 2 ficam em `vm/corerouter-lab2/`, com os
+  mesmos nomes): `base/` (imagem e `SHA256SUMS`), `corerouter-lab.qcow2`
   (overlay sobre a imagem), `seed.iso`, `id_ed25519` (chave do laboratório, só para ele),
   `ssh_host_ed25519_key` e `known_hosts` (a chave de host da VM é gerada aqui e entra pelo
   cloud-init; o SSH confere com `HostKeyAlias=corerouter-lab`, então trocar de IP no DHCP não
@@ -224,9 +325,10 @@ instala os três pacotes do Ubuntu se faltarem). Veja `docs/producao-core.md`, "
 
 ## Limites
 
-- Uma VM para todas as sessões: os testes usam nomes fixos de namespace (`crxdp`, `crxsub`) e um
-  apaga o do outro; os números de pps também dividem CPU. Por isso o `run` é exclusivo (trava
-  `flock` dentro da VM; quem chega espera até o prazo e vê quem segura). Uma worktree com um `vm_lab.rs` antigo,
+- Duas VMs para todas as sessões: dentro de cada uma os testes usam nomes fixos de namespace
+  (`crxdp`, `crxsub`) e um apaga o do outro; os números de pps também dividem CPU. Por isso o
+  `run` é exclusivo por VM (trava `flock` dentro dela; quem chega espera até o prazo e vê quem
+  segura), e duas rodadas só andam juntas em VMs diferentes. Uma worktree com um `vm_lab.rs` antigo,
   sem a trava, ainda colide: faça `git merge origin/main`.
 - `reset` volta o disco inteiro, inclusive o cache de build (o snapshot `tools` não tem cache): tire um `snapshot` depois de uma
   compilação longa se quiser voltar a ele quente.

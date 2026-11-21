@@ -21,15 +21,166 @@ use sha2::{Digest, Sha256};
 use crate::Outcome;
 use crate::vm_tools::{self, Source, TOOLS};
 
-const NAME: &str = "corerouter-lab";
 const URI: &str = "qemu:///system";
 const IMAGE: &str = "noble-server-cloudimg-amd64.img";
 const IMAGE_URL: &str = "https://cloud-images.ubuntu.com/noble/current/";
-/// The management NIC's MAC: how `domifaddr` finds the VM's address.
-const MGMT_MAC: &str = "52:54:00:c0:72:01";
-/// UDP ports on 127.0.0.1 behind the wires (two per NIC pair).
-const WIRE_PORT_BASE: u16 = 47_210;
 const MAX_WIRES: u32 = 4;
+/// Picks the VM for every subcommand (`1`, `2`, `lab`, `lab2` or the full
+/// name), like `--vm`; `--vm` wins.
+const VM_VAR: &str = "COREROUTER_VM_LAB";
+
+/// One lab VM (G0.26c): what differs between them. Each has its own disk,
+/// seed, SSH keys, snapshots, host locks and, inside it, its own round lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Vm {
+    /// What `--vm` takes.
+    num: u8,
+    name: &'static str,
+    /// Its files under `vm/`: `None` for VM 1, whose files stay where they
+    /// were before G0.26c (`vm/corerouter-lab.qcow2`, `vm/id_ed25519`…), so
+    /// an older `vm_lab.rs` in another worktree still finds them.
+    subdir: Option<&'static str>,
+    /// The management NIC's MAC: how `domifaddr` finds the VM's address.
+    mgmt_mac: &'static str,
+    /// The wires' MACs are `<prefix>:<nn>`.
+    wire_mac_prefix: &'static str,
+    /// UDP ports on 127.0.0.1 behind the wires (two per NIC pair).
+    wire_port_base: u16,
+    /// `create` defaults.
+    cpus: u32,
+    memory_mib: u32,
+    disk_gib: u32,
+    /// Host CPUs (`cputune`): vCPU i runs on `vcpu_cpus[i % len]`, QEMU's
+    /// own threads (I/O, emulator) on `emulator_cpus`. See `docs/vm-lab.md`,
+    /// "CPUs por VM".
+    vcpu_cpus: &'static [u32],
+    emulator_cpus: &'static str,
+    /// For `status` and messages.
+    role: &'static str,
+}
+
+/// VM 1 owns the second CCD (cores 8–15, one vCPU per physical core, its
+/// QEMU threads on their SMT siblings 24–31): no other VM runs there, so a
+/// measurement is not shared with anyone else's guest. VM 2 and the CI
+/// runner share the first CCD (cores 0–7): functional tests only.
+const VMS: [Vm; 2] = [
+    Vm {
+        num: 1,
+        name: "corerouter-lab",
+        subdir: None,
+        mgmt_mac: "52:54:00:c0:72:01",
+        wire_mac_prefix: "52:54:00:c0:73",
+        wire_port_base: 47_210,
+        cpus: 8,
+        memory_mib: 16_384,
+        disk_gib: 40,
+        vcpu_cpus: &[8, 9, 10, 11, 12, 13, 14, 15],
+        emulator_cpus: "24-31",
+        role: "performance measurements (`run --perf`)",
+    },
+    Vm {
+        num: 2,
+        name: "corerouter-lab2",
+        subdir: Some("corerouter-lab2"),
+        mgmt_mac: "52:54:00:c0:72:02",
+        wire_mac_prefix: "52:54:00:c0:74",
+        wire_port_base: 47_230,
+        cpus: 4,
+        // 6 GiB, not 8: the host had 22.7 GB available and 19.5 GB of swap
+        // in use when it was made (**measured**, 2026-11-20).
+        memory_mib: 6_144,
+        disk_gib: 30,
+        vcpu_cpus: &[4, 5, 6, 7],
+        emulator_cpus: "20-23",
+        role: "functional tests (`run` picks it first)",
+    },
+];
+
+/// The CI runner (`corerouter-ci`, `xtask/src/ci_runner.rs`): 16 vCPUs on
+/// the first CCD, both threads of each core, never on VM 1's CCD.
+pub(crate) const CI_VCPU_CPUS: &[u32] = &[0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23];
+pub(crate) const CI_EMULATOR_CPUS: &str = "0-7,16-23";
+const CI_NAME: &str = "corerouter-ci";
+
+impl Vm {
+    /// `1`, `2`, `lab`, `lab2`, `corerouter-lab2`.
+    fn parse(text: &str) -> Result<Vm, String> {
+        let t = text.trim();
+        VMS.iter()
+            .find(|v| {
+                t == v.num.to_string()
+                    || t == v.name
+                    || Some(t) == v.name.strip_prefix("corerouter-")
+            })
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "unknown lab VM {:?}: {}",
+                    t.chars().take(40).collect::<String>(),
+                    VMS.iter()
+                        .map(|v| format!("{} ({})", v.num, v.name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
+
+    /// `<cputune>` for `cpus` vCPUs.
+    fn cputune(&self, cpus: u32) -> String {
+        cputune_xml(cpus, self.vcpu_cpus, self.emulator_cpus)
+    }
+}
+
+/// `<cputune>`: vCPU i on `vcpu_cpus[i % len]`, QEMU's threads on `emulator`.
+pub(crate) fn cputune_xml(cpus: u32, vcpu_cpus: &[u32], emulator: &str) -> String {
+    let mut s = String::from("  <cputune>\n");
+    for (vcpu, cpu) in pin_plan(cpus, vcpu_cpus) {
+        s.push_str(&format!("    <vcpupin vcpu='{vcpu}' cpuset='{cpu}'/>\n"));
+    }
+    s.push_str(&format!(
+        "    <emulatorpin cpuset='{emulator}'/>\n  </cputune>\n"
+    ));
+    s
+}
+
+/// `(vcpu, host cpu)` for each of `cpus` vCPUs.
+fn pin_plan(cpus: u32, vcpu_cpus: &[u32]) -> Vec<(u32, u32)> {
+    if vcpu_cpus.is_empty() {
+        return Vec::new();
+    }
+    (0..cpus)
+        .filter_map(|v| {
+            let i = usize::try_from(v).ok()? % vcpu_cpus.len();
+            vcpu_cpus.get(i).map(|c| (v, *c))
+        })
+        .collect()
+}
+
+/// What `run` knows about one VM when it picks (`pick`).
+#[derive(Clone, Copy, Debug)]
+struct Candidate {
+    vm: Vm,
+    /// Defined in libvirt (running or not: `run` boots it).
+    exists: bool,
+    /// Rounds in it now, plus one if a `run` is between its health check and
+    /// its round (holds that VM's `health.lock`).
+    busy: usize,
+}
+
+/// The VM a `run` with no `--vm` uses: `--perf` → VM 1; else a free one,
+/// VM 2 first (VM 1 stays free for measurements); none free → the one with
+/// the fewest rounds, VM 2 on a tie. Only VMs that exist count; with none,
+/// VM 1 (whose error says how to create it).
+fn pick(cands: &[Candidate], perf: bool) -> Vm {
+    let first = VMS[0];
+    if perf {
+        return first;
+    }
+    let mut order: Vec<&Candidate> = cands.iter().filter(|c| c.exists).collect();
+    // VM 2 before VM 1, then by number.
+    order.sort_by_key(|c| (c.vm.num == 1, c.vm.num));
+    order.iter().min_by_key(|c| c.busy).map_or(first, |c| c.vm)
+}
 const USER: &str = "lab";
 /// Toolchains, sources and build caches inside the VM.
 const RUST_ENV: &str = "/etc/profile.d/corerouter-rust.sh";
@@ -88,26 +239,38 @@ const PACKAGES: &[&str] = &[
     "linux-generic-hwe-24.04",
 ];
 
-const HELP: &str = "usage: cargo xtask vm-lab <subcommand>
-  create [--cpus N] [--memory MiB] [--disk GiB] [--wires N]
+const HELP: &str = "usage: cargo xtask vm-lab [--vm 1|2] <subcommand>
+  Two VMs (G0.26c): 1 = corerouter-lab (measurements), 2 = corerouter-lab2
+  (functional tests). --vm (or $COREROUTER_VM_LAB) picks one; without it `run`
+  takes the free one (VM 2 first), `status`/`unlock` show both, the rest use VM 1.
+  create [--cpus N] [--memory MiB] [--disk GiB] [--wires N] [--from 1]
                     download + verify the Ubuntu 24.04 image, make the VM, provision
-                    it (packages, rustup) and take the `clean` snapshot
-                    (defaults: 8 vCPUs, 16384 MiB, 40 GiB thin, 1 wire = 2 test NICs)
+                    it (packages, rustup) and take the `clean` snapshot; --from 1
+                    clones VM 1's `tools` snapshot instead (no install, ~2 min)
+                    (defaults: VM 1 8 vCPUs, 16384 MiB, 40 GiB; VM 2 4 vCPUs, 6144 MiB,
+                    30 GiB; thin; 1 wire = 2 test NICs)
   up | down         start (and wait for SSH) | shut down
   ssh [cmd...]      shell (or one command) as user `lab`; `sudo` works inside
   sync              rsync this worktree to /srv/lab/<worktree>/src (no target*, .git)
   put <file...>     copy host files into /srv/lab/inbox/ (a .deb, a capture)
-  status            state, address, who holds the VM lock and for how long
-  run [--no-sync] [--shared] [--lock-timeout 30m] -- <cmd...>
+  status            state, CPU map, address, who holds the VM lock and for how long
+  run [--perf] [--vm N] [--no-sync] [--shared] [--lock-timeout 30m] -- <cmd...>
+                    --perf: a measurement, on VM 1; else the free VM (VM 2 first).
                     health check (short disk: drop the build caches no round uses; broken:
                     reset to `tools`/`clean`, but only with no other round in the VM, else
                     wait and check again within --lock-timeout), sync, then run
                     <cmd> as root in /srv/lab/<worktree>/src with
                     CARGO_TARGET_DIR=/srv/lab/<worktree>/target (kept: incremental);
-                    one run at a time unless --shared (builds only, no namespaces).
+                    one run at a time per VM unless --shared (builds only, no namespaces).
                     Waits for the lock up to --lock-timeout (or $COREROUTER_VM_LOCK_TIMEOUT;
                     default 30m; s/m/h), then fails showing who holds it. Warns about
                     processes the command left running
+  pick [--perf]     print the number of the VM a `run` would take now (for scripts that
+                    `put` or `ssh` before their `run`: COREROUTER_VM_LAB=$(… pick))
+  pin [--vm 1|2|ci] [--force]
+                    apply the CPU map of docs/vm-lab.md live (virsh vcpupin/emulatorpin,
+                    no restart): both lab VMs and the CI runner; a lab VM in a round is
+                    skipped unless --force
   unlock [--force]  show who holds the VM lock (owner, age, processes); with --force,
                     end what is left of rounds whose `vm-lab run` is gone, freeing the lock
   tools [--check]   install the third-party tools declared in xtask/src/vm_tools.rs
@@ -123,62 +286,422 @@ const HELP: &str = "usage: cargo xtask vm-lab <subcommand>
 
 /// Entry point: `args` are what follows `vm-lab`.
 pub fn main(root: &Path, args: &[String]) -> Outcome {
-    let lab = match Lab::new(root) {
-        Ok(l) => l,
-        Err(e) => return Outcome::Fail(e),
-    };
-    let (sub, rest) = match args.split_first() {
-        Some((s, r)) => (s.as_str(), r),
-        None => ("", &[][..]),
-    };
-    let result = match sub {
-        "create" => lab.create(rest),
-        "up" => lab.up(),
-        "down" => lab.down(),
-        "status" => lab.status(),
-        "ssh" => lab.ssh_interactive(rest),
-        "sync" => lab.up().and_then(|()| lab.sync()),
-        "put" => lab.put(rest),
-        "run" => lab.run(rest),
-        "unlock" => lab.unlock(rest),
-        "tools" => lab.tools(rest),
-        "snapshot" | "reset" => {
-            let force = rest.iter().any(|a| a == "--force");
-            let named = rest.iter().find(|a| !a.starts_with("--")).cloned();
-            let name = match named {
-                Some(n) => Ok(n),
-                None if sub == "reset" => lab.base_snapshot().map(str::to_owned),
-                None => Ok(TOOLS_SNAPSHOT.to_owned()),
-            };
-            name.and_then(|n| {
-                if !force {
-                    lab.idle()?;
-                }
-                if sub == "reset" {
-                    lab.reset(&n)
-                } else {
-                    lab.snapshot(&n)
-                }
-            })
-        }
-        "destroy" => lab.destroy(),
-        "" | "-h" | "--help" | "help" => {
-            eprintln!("{HELP}");
-            return Outcome::Ok;
-        }
-        other => Err(format!("unknown subcommand '{other}'\n{HELP}")),
-    };
-    match result {
+    match dispatch(root, args) {
         Ok(()) => Outcome::Ok,
         Err(e) => Outcome::Fail(e),
     }
 }
 
+/// `--vm <x>` / `--vm=<x>` at the front of `args` (before the subcommand),
+/// else `$COREROUTER_VM_LAB`; `None`: not chosen (`run` picks, `status` and
+/// `unlock` show every VM, the rest use VM 1).
+fn front_vm(args: &[String], env: Option<&str>) -> Result<(Option<Vm>, Vec<String>), String> {
+    let mut chosen = None;
+    let mut rest = args;
+    loop {
+        match rest {
+            [flag, value, tail @ ..] if flag == "--vm" => {
+                chosen = Some(Vm::parse(value)?);
+                rest = tail;
+            }
+            [flag, tail @ ..] if flag.starts_with("--vm=") => {
+                chosen = Some(Vm::parse(flag.trim_start_matches("--vm="))?);
+                rest = tail;
+            }
+            [flag] if flag == "--vm" => return Err("--vm needs a value (1, 2)".into()),
+            _ => break,
+        }
+    }
+    if chosen.is_none()
+        && let Some(e) = env.filter(|e| !e.trim().is_empty())
+    {
+        chosen = Some(Vm::parse(e).map_err(|err| format!("${VM_VAR}: {err}"))?);
+    }
+    Ok((chosen, rest.to_vec()))
+}
+
+fn dispatch(root: &Path, args: &[String]) -> Result<(), String> {
+    let env = std::env::var(VM_VAR).ok();
+    let (chosen, args) = front_vm(args, env.as_deref())?;
+    let (sub, rest) = match args.split_first() {
+        Some((s, r)) => (s.as_str(), r),
+        None => ("", &[][..]),
+    };
+    let dir = vm_dir(root)?;
+    let lab = |vm: Vm| Lab {
+        root: root.to_path_buf(),
+        dir: dir.clone(),
+        vm,
+    };
+    let one = lab(chosen.unwrap_or(VMS[0]));
+    match sub {
+        "create" => one.create(rest),
+        "up" => one.up(),
+        "down" => one.down(),
+        // No `--vm`: every VM.
+        "status" => match chosen {
+            Some(_) => one.status(),
+            None => each_vm(&lab, "status", |l| l.status()),
+        },
+        "unlock" => match chosen {
+            Some(_) => one.unlock(rest),
+            None => each_vm(&lab, "unlock", |l| l.unlock(rest)),
+        },
+        "pin" => pin(&lab, chosen, rest),
+        "pick" => {
+            let perf = match rest {
+                [] => false,
+                [a] if a == "--perf" => true,
+                _ => return Err(format!("usage: cargo xtask vm-lab pick [--perf]\n{HELP}")),
+            };
+            let vm = match chosen {
+                Some(v) => v,
+                None => lab(VMS[0]).pick(perf)?,
+            };
+            println!("{}", vm.num);
+            Ok(())
+        }
+        "ssh" => one.ssh_interactive(rest),
+        "sync" => one.up().and_then(|()| one.sync()),
+        "put" => one.put(rest),
+        "run" => {
+            let (opts, cmd) = parse_run(rest, std::env::var(LOCK_TIMEOUT_VAR).ok().as_deref())?;
+            let vm = match run_vm(chosen, &opts)? {
+                Some(v) => v,
+                None => lab(VMS[0]).pick(opts.perf)?,
+            };
+            lab(vm).run(&opts, &cmd)
+        }
+        "tools" => one.tools(rest),
+        "snapshot" | "reset" => {
+            let force = rest.iter().any(|a| a == "--force");
+            let named = rest.iter().find(|a| !a.starts_with("--")).cloned();
+            let name = match named {
+                Some(n) => n,
+                None if sub == "reset" => one.base_snapshot()?.to_owned(),
+                None => TOOLS_SNAPSHOT.to_owned(),
+            };
+            if !force {
+                one.idle()?;
+            }
+            if sub == "reset" {
+                one.reset(&name)
+            } else {
+                one.snapshot(&name)
+            }
+        }
+        "destroy" => one.destroy(),
+        "" | "-h" | "--help" | "help" => {
+            eprintln!("{HELP}");
+            Ok(())
+        }
+        other => Err(format!("unknown subcommand '{other}'\n{HELP}")),
+    }
+}
+
+/// `f` on every VM that exists (VM 1 always, for its "not created" line),
+/// each under a `== name (role)` header; the first error is returned after
+/// all ran.
+fn each_vm(
+    lab: &dyn Fn(Vm) -> Lab,
+    what: &str,
+    f: impl Fn(&Lab) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut first_err = None;
+    for vm in VMS {
+        let l = lab(vm);
+        if vm.num != 1 && l.state()?.is_none() {
+            println!(
+                "== {} ({}): not created (`cargo xtask vm-lab --vm {} create --from 1`)",
+                vm.name, vm.role, vm.num
+            );
+            continue;
+        }
+        println!("== {} ({})", vm.name, vm.role);
+        if let Err(e) = f(&l) {
+            eprintln!("vm-lab: {what} {}: {e}", vm.name);
+            first_err.get_or_insert(e);
+        }
+    }
+    first_err.map_or(Ok(()), Err)
+}
+
+/// `vm/` of the main checkout, or `$COREROUTER_VM_DIR`.
+fn vm_dir(root: &Path) -> Result<PathBuf, String> {
+    if let Some(d) = std::env::var_os("COREROUTER_VM_DIR") {
+        return Ok(PathBuf::from(d));
+    }
+    // Every worktree shares the main checkout's `vm/`.
+    let common = output(Command::new("git").current_dir(root).args([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    ]))?;
+    let common = PathBuf::from(common.trim());
+    Ok(common
+        .parent()
+        .ok_or_else(|| format!("git common dir {} has no parent", common.display()))?
+        .join("vm"))
+}
+
+/// `vm-lab pin [--force]`: the CPU map of `docs/vm-lab.md` applied live and
+/// in the definition (`virsh vcpupin/emulatorpin --live --config`), with no
+/// restart. No `--vm`: both lab VMs and the CI runner (`--vm ci`: only it).
+/// A lab VM with a round in it is skipped unless `--force` (moving a VM's
+/// threads is harmless, but its round would measure across the change).
+fn pin(lab: &dyn Fn(Vm) -> Lab, chosen: Option<Vm>, rest: &[String]) -> Result<(), String> {
+    let (force, target) = parse_pin(rest)?;
+    let (chosen, ci_only) = match target {
+        Some(PinTarget::Ci) => (None, true),
+        Some(PinTarget::Lab(v)) => (Some(v), false),
+        None => (chosen, false),
+    };
+    let mut plan: Vec<(&str, u32, &[u32], &str, Option<Lab>)> = Vec::new();
+    if !ci_only {
+        for vm in VMS {
+            if chosen.is_some_and(|c| c != vm) {
+                continue;
+            }
+            let l = lab(vm);
+            let Some(state) = l.state()? else {
+                continue;
+            };
+            let cpus = if state == "running" {
+                vcpu_count(&virsh(&["vcpucount", vm.name, "--live"])?)
+            } else {
+                vcpu_count(&virsh(&["vcpucount", vm.name, "--config"])?)
+            }
+            .unwrap_or(vm.cpus);
+            plan.push((vm.name, cpus, vm.vcpu_cpus, vm.emulator_cpus, Some(l)));
+        }
+    }
+    if chosen.is_none() || ci_only {
+        if let Ok(out) = virsh(&["vcpucount", CI_NAME, "--config"]) {
+            let cpus = vcpu_count(&out).unwrap_or(16);
+            plan.push((CI_NAME, cpus, CI_VCPU_CPUS, CI_EMULATOR_CPUS, None));
+        }
+    }
+    for (name, cpus, vcpu_cpus, emulator, l) in plan {
+        if let Some(l) = &l
+            && !force
+            && let Err(why) = l.idle()
+        {
+            println!("{name}: not pinned now ({why}); run `pin` again when it is free");
+            continue;
+        }
+        let running = Command::new("virsh")
+            .args(["-c", URI, "domstate", name])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "running");
+        let scope: &[&str] = if running {
+            &["--live", "--config"]
+        } else {
+            &["--config"]
+        };
+        for (vcpu, cpu) in pin_plan(cpus, vcpu_cpus) {
+            let (v, c) = (vcpu.to_string(), cpu.to_string());
+            let mut a = vec!["vcpupin", name, v.as_str(), c.as_str()];
+            a.extend_from_slice(scope);
+            virsh(&a)?;
+        }
+        let mut a = vec!["emulatorpin", name, emulator];
+        a.extend_from_slice(scope);
+        virsh(&a)?;
+        println!(
+            "{name}: {cpus} vCPUs on host CPUs {}, emulator on {emulator}{}",
+            cpu_list(vcpu_cpus, cpus),
+            if running {
+                " (live and in the definition)"
+            } else {
+                " (in the definition)"
+            }
+        );
+    }
+    Ok(())
+}
+
+/// `virsh vcpupin` and `emulatorpin` tables in one line, and whether they
+/// match the map in `VMS`.
+fn pin_summary(vcpupin: &str, emulatorpin: &str, want: &[u32], want_emu: &str) -> String {
+    let rows: Vec<(u32, String)> = vcpupin
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let v = f.next()?.parse().ok()?;
+            Some((v, f.next()?.to_owned()))
+        })
+        .collect();
+    let emu = emulatorpin
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("*:"))
+        .map(str::trim)
+        .unwrap_or("?");
+    let pairs = rows
+        .iter()
+        .map(|(v, c)| format!("{v}→{c}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cpus = u32::try_from(rows.len()).unwrap_or(0);
+    let expected: Vec<(u32, String)> = pin_plan(cpus, want)
+        .into_iter()
+        .map(|(v, c)| (v, c.to_string()))
+        .collect();
+    let verdict = if rows == expected && emu == want_emu {
+        "as in docs/vm-lab.md"
+    } else {
+        "not the map of docs/vm-lab.md: `cargo xtask vm-lab pin`"
+    };
+    format!("vCPU→CPU {pairs}; emulator {emu} ({verdict})")
+}
+
+/// What `pin --vm <x>` names: a lab VM or the CI runner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PinTarget {
+    Lab(Vm),
+    Ci,
+}
+
+/// `pin [--vm 1|2|ci] [--force]`: `(force, target)`.
+fn parse_pin(rest: &[String]) -> Result<(bool, Option<PinTarget>), String> {
+    let mut force = false;
+    let mut target = None;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        let named = match a.as_str() {
+            "--force" => {
+                force = true;
+                continue;
+            }
+            "--vm" => it.next().ok_or_else(|| "--vm needs a value (1, 2, ci)".to_owned())?,
+            f if f.starts_with("--vm=") => f.trim_start_matches("--vm="),
+            other => return Err(format!("pin: unknown option {other}\n{HELP}")),
+        };
+        target = Some(if named == "ci" || named == CI_NAME {
+            PinTarget::Ci
+        } else {
+            PinTarget::Lab(Vm::parse(named)?)
+        });
+    }
+    Ok((force, target))
+}
+
+/// The number in `virsh vcpucount <dom> --live|--config` (one line).
+fn vcpu_count(out: &str) -> Option<u32> {
+    out.split_whitespace().last()?.parse().ok()
+}
+
+/// `8-15` style list of the CPUs the first `cpus` vCPUs use.
+fn cpu_list(vcpu_cpus: &[u32], cpus: u32) -> String {
+    let mut used: Vec<u32> = pin_plan(cpus, vcpu_cpus)
+        .into_iter()
+        .map(|(_, c)| c)
+        .collect();
+    used.sort_unstable();
+    used.dedup();
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while let Some(&lo) = used.get(i) {
+        let mut hi = lo;
+        while used.get(i + 1) == Some(&(hi + 1)) {
+            hi += 1;
+            i += 1;
+        }
+        parts.push(if hi == lo {
+            lo.to_string()
+        } else {
+            format!("{lo}-{hi}")
+        });
+        i += 1;
+    }
+    parts.join(",")
+}
+
+/// The VM a `run` names (front `--vm`/`$COREROUTER_VM_LAB` first, then its
+/// own `--vm`); `None`: pick the free one. `--perf` is VM 1 only.
+fn run_vm(front: Option<Vm>, opts: &RunOpts) -> Result<Option<Vm>, String> {
+    match (front.or(opts.vm), opts.perf) {
+        (Some(v), true) if v.num != 1 => Err(format!(
+            "--perf runs on VM 1 ({}), not {}: drop --vm, or --perf",
+            VMS[0].name, v.name
+        )),
+        (Some(v), _) => Ok(Some(v)),
+        (None, true) => Ok(Some(VMS[0])),
+        (None, false) => Ok(None),
+    }
+}
+
+/// The options of `vm-lab run` (before `--`).
+#[derive(Debug, PartialEq, Eq)]
+struct RunOpts {
+    sync: bool,
+    exclusive: bool,
+    timeout_s: u64,
+    /// `--vm` among the run options (the front `--vm` wins).
+    vm: Option<Vm>,
+    /// `--perf`: a measurement, VM 1.
+    perf: bool,
+}
+
+/// `run`'s options, then the command. `env_timeout`: `$COREROUTER_VM_LOCK_TIMEOUT`.
+fn parse_run(args: &[String], env_timeout: Option<&str>) -> Result<(RunOpts, Vec<String>), String> {
+    let mut o = RunOpts {
+        sync: true,
+        exclusive: true,
+        timeout_s: match env_timeout {
+            Some(v) => parse_duration(v).map_err(|e| format!("${LOCK_TIMEOUT_VAR}: {e}"))?,
+            None => LOCK_TIMEOUT_DEFAULT,
+        },
+        vm: None,
+        perf: false,
+    };
+    let mut rest = args;
+    while let Some((first, tail)) = rest.split_first() {
+        let value = |name: &str| -> Result<(&String, &[String]), String> {
+            tail.split_first()
+                .ok_or_else(|| format!("{name} needs a value"))
+        };
+        match first.as_str() {
+            "--no-sync" => o.sync = false,
+            "--shared" => o.exclusive = false,
+            "--perf" => o.perf = true,
+            "--lock-timeout" => {
+                let (v, t) = value("--lock-timeout (30m, 900, 1h)")?;
+                o.timeout_s = parse_duration(v).map_err(|e| format!("--lock-timeout: {e}"))?;
+                rest = t;
+                continue;
+            }
+            "--vm" => {
+                let (v, t) = value("--vm (1, 2)")?;
+                o.vm = Some(Vm::parse(v)?);
+                rest = t;
+                continue;
+            }
+            f if f.starts_with("--lock-timeout=") => {
+                let v = f.trim_start_matches("--lock-timeout=");
+                o.timeout_s = parse_duration(v).map_err(|e| format!("--lock-timeout: {e}"))?;
+            }
+            f if f.starts_with("--vm=") => o.vm = Some(Vm::parse(f.trim_start_matches("--vm="))?),
+            "--" => {
+                rest = tail;
+                break;
+            }
+            _ => break,
+        }
+        rest = tail;
+    }
+    if rest.is_empty() {
+        return Err(format!("nothing to run\n{HELP}"));
+    }
+    Ok((o, rest.to_vec()))
+}
+
 struct Lab {
     /// The worktree being worked on (what `sync` copies).
     root: PathBuf,
-    /// `vm/` of the main checkout, or `$COREROUTER_VM_DIR`.
+    /// `vm/` of the main checkout, or `$COREROUTER_VM_DIR`: shared by every VM
+    /// (the cloud image in `base/`, the `.deb`s in `tools/`).
     dir: PathBuf,
+    vm: Vm,
 }
 
 struct Spec {
@@ -189,31 +712,74 @@ struct Spec {
 }
 
 impl Lab {
-    fn new(root: &Path) -> Result<Self, String> {
-        let dir = match std::env::var_os("COREROUTER_VM_DIR") {
-            Some(d) => PathBuf::from(d),
-            None => {
-                // Every worktree shares the main checkout's `vm/`.
-                let common = output(Command::new("git").current_dir(root).args([
-                    "rev-parse",
-                    "--path-format=absolute",
-                    "--git-common-dir",
-                ]))?;
-                let common = PathBuf::from(common.trim());
-                common
-                    .parent()
-                    .ok_or_else(|| format!("git common dir {} has no parent", common.display()))?
-                    .join("vm")
-            }
-        };
-        Ok(Self {
-            root: root.to_path_buf(),
-            dir,
-        })
+    /// This VM's own file (`vm/<file>` for VM 1, `vm/<subdir>/<file>` else).
+    fn path(&self, name: &str) -> PathBuf {
+        self.vm_dir().join(name)
     }
 
-    fn path(&self, name: &str) -> PathBuf {
+    fn vm_dir(&self) -> PathBuf {
+        match self.vm.subdir {
+            Some(sub) => self.dir.join(sub),
+            None => self.dir.clone(),
+        }
+    }
+
+    /// A file every VM shares (`vm/base`, `vm/tools`).
+    fn shared(&self, name: &str) -> PathBuf {
         self.dir.join(name)
+    }
+
+    /// The VM for a `run` that did not name one (`pick`). Busy: the rounds in
+    /// each VM, seen from this host, plus a `run` between its health check
+    /// and its round (holding that VM's `health.lock`).
+    fn pick(&self, perf: bool) -> Result<Vm, String> {
+        let own = own_round();
+        let mut cands = Vec::new();
+        for vm in VMS {
+            let l = Lab {
+                root: self.root.clone(),
+                dir: self.dir.clone(),
+                vm,
+            };
+            let exists = l.state()?.is_some();
+            let mut busy = live_rounds(&own, &l.path(HOST_LOCK), vm.name).len();
+            if l.health_lock_busy() {
+                busy += 1;
+            }
+            cands.push(Candidate { vm, exists, busy });
+        }
+        let vm = pick(&cands, perf);
+        let line = cands
+            .iter()
+            .filter(|c| c.exists)
+            .map(|c| format!("{} {} round(s)", c.vm.name, c.busy))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "vm-lab: {} ({}){}; `--vm N` chooses",
+            vm.name,
+            if perf { "--perf" } else { "the free one" },
+            if line.is_empty() {
+                String::new()
+            } else {
+                format!(" [{line}]")
+            }
+        );
+        Ok(vm)
+    }
+
+    /// Another `run` holds this VM's `health.lock` right now.
+    fn health_lock_busy(&self) -> bool {
+        let Ok(file) = std::fs::File::open(self.path(HEALTH_LOCK)) else {
+            return false;
+        };
+        match file.try_lock_shared() {
+            Ok(()) => {
+                let _ = file.unlock();
+                false
+            }
+            Err(_) => true,
+        }
     }
 
     /// `/srv/lab/<worktree name>` inside the VM: one per worktree, so
@@ -239,38 +805,47 @@ impl Lab {
     // ---- create -------------------------------------------------------
 
     fn create(&self, args: &[String]) -> Result<(), String> {
-        let spec = parse_spec(args)?;
+        let vm = self.vm.name;
+        let (spec, from) = parse_spec(args, &self.vm)?;
         if self.state()?.is_some() {
             return Err(format!(
-                "{NAME} already exists: `cargo xtask vm-lab destroy` first (or `reset`)"
+                "{vm} already exists: `cargo xtask vm-lab destroy` first (or `reset`)"
             ));
         }
         let started = Instant::now();
-        std::fs::create_dir_all(self.path("base"))
+        std::fs::create_dir_all(self.vm_dir())
+            .map_err(|e| format!("{}: {e}", self.vm_dir().display()))?;
+        std::fs::create_dir_all(self.shared("base"))
             .map_err(|e| format!("{}: {e}", self.dir.display()))?;
-        let base = cloud_image(&self.path("base"))?;
+        let base = cloud_image(&self.shared("base"))?;
         self.keys()?;
         self.seed(&spec)?;
-        let overlay = self.path(&format!("{NAME}.qcow2"));
+        let overlay = self.path(&format!("{vm}.qcow2"));
         let _ = std::fs::remove_file(&overlay);
-        run_ok(Command::new("qemu-img").args([
-            "create",
-            "-q",
-            "-f",
-            "qcow2",
-            "-F",
-            "qcow2",
-            "-b",
-            &base.to_string_lossy(),
-            &overlay.to_string_lossy(),
-            &format!("{}G", spec.disk_gib),
-        ]))?;
-        let xml = self.path(&format!("{NAME}.xml"));
+        let cloned = match from {
+            Some(src) => Some(self.clone_disk(src, &base, &overlay, spec.disk_gib)?),
+            None => {
+                run_ok(Command::new("qemu-img").args([
+                    "create",
+                    "-q",
+                    "-f",
+                    "qcow2",
+                    "-F",
+                    "qcow2",
+                    "-b",
+                    &base.to_string_lossy(),
+                    &overlay.to_string_lossy(),
+                    &format!("{}G", spec.disk_gib),
+                ]))?;
+                None
+            }
+        };
+        let xml = self.path(&format!("{vm}.xml"));
         std::fs::write(&xml, self.domain_xml(&spec, &overlay))
             .map_err(|e| format!("{}: {e}", xml.display()))?;
         virsh(&["define", &xml.to_string_lossy()])?;
-        virsh(&["start", NAME])?;
-        eprintln!("vm-lab: {NAME} defined and started; waiting for cloud-init (packages)…");
+        virsh(&["start", vm])?;
+        eprintln!("vm-lab: {vm} defined and started; waiting for cloud-init (packages)…");
         self.wait_ssh(Duration::from_secs(600))?;
         // `status --wait` exits 2 for "done with recoverable errors" (a
         // deprecation warning is enough): the long form says what it was.
@@ -279,6 +854,9 @@ impl Lab {
         eprintln!("{}", status.trim());
         if !status.contains("status: done") {
             return Err(format!("cloud-init did not finish:\n{status}"));
+        }
+        if cloned.is_some() {
+            self.own_clone()?;
         }
         // Boot into the kernel cloud-init installed, with the lab's
         // command line.
@@ -296,10 +874,11 @@ impl Lab {
         self.provision()?;
         // The seed has done its job; an empty CD-ROM keeps snapshots internal
         // (qcow2 only) and stops cloud-init from looking at it again.
-        virsh(&["change-media", NAME, "sda", "--eject", "--config"])?;
-        self.snapshot("clean")?;
+        virsh(&["change-media", vm, "sda", "--eject", "--config"])?;
+        // A clone keeps the name of the snapshot it came from (`tools`).
+        self.snapshot(cloned.unwrap_or("clean"))?;
         eprintln!(
-            "vm-lab: {NAME} ready in {:.0} s ({} vCPUs, {} MiB, {} wire(s)); `cargo xtask vm-lab status`",
+            "vm-lab: {vm} ready in {:.0} s ({} vCPUs, {} MiB, {} wire(s)); `cargo xtask vm-lab status`",
             started.elapsed().as_secs_f64(),
             spec.cpus,
             spec.memory_mib,
@@ -308,10 +887,97 @@ impl Lab {
         Ok(())
     }
 
+    /// VM 2 from VM 1 (G0.26c): the disk of `src`'s base snapshot (`tools`,
+    /// with the third-party tools the user installed there, or `clean`), as
+    /// an overlay on the same cloud image. Read with `-U` while `src` runs: a
+    /// snapshot's clusters never change while it exists (a write to them is
+    /// copied first), so nothing of `src` is stopped or touched. The new seed
+    /// (own `instance-id`, hostname, MACs, host key) makes cloud-init treat
+    /// the copy as a new machine. Returns the snapshot's name.
+    fn clone_disk(
+        &self,
+        src: Vm,
+        base: &Path,
+        overlay: &Path,
+        disk_gib: u32,
+    ) -> Result<&'static str, String> {
+        let from = Lab {
+            root: self.root.clone(),
+            dir: self.dir.clone(),
+            vm: src,
+        };
+        from.require()?;
+        let snap = from.base_snapshot()?;
+        let src_disk = from.path(&format!("{}.qcow2", src.name));
+        let started = Instant::now();
+        eprintln!(
+            "vm-lab: cloning snapshot `{snap}` of {} into {}…",
+            src.name,
+            overlay.display()
+        );
+        run_ok(
+            Command::new("qemu-img")
+                .args(["convert", "-U", "-O", "qcow2", "-B"])
+                .arg(base)
+                .args(["-F", "qcow2", "-l"])
+                .arg(format!("snapshot.name={snap}"))
+                .arg(&src_disk)
+                .arg(overlay),
+        )?;
+        let info = output(Command::new("qemu-img").args([
+            "info",
+            "--output=json",
+            &overlay.to_string_lossy(),
+        ]))?;
+        let have = json_u64(&info, "virtual-size").unwrap_or(0);
+        let want = u64::from(disk_gib) << 30;
+        if want > have {
+            run_ok(Command::new("qemu-img").args([
+                "resize",
+                "-q",
+                &overlay.to_string_lossy(),
+                &format!("{disk_gib}G"),
+            ]))?;
+        } else if want < have {
+            eprintln!(
+                "vm-lab: --disk {disk_gib} is under the source's {} GiB; kept {} GiB",
+                have >> 30,
+                have >> 30
+            );
+        }
+        let size = std::fs::metadata(overlay)
+            .map(|m| m.len() >> 20)
+            .unwrap_or(0);
+        eprintln!(
+            "vm-lab: cloned in {:.0} s ({size} MiB on the host)",
+            started.elapsed().as_secs_f64()
+        );
+        Ok(snap)
+    }
+
+    /// After the first boot of a clone: only this VM's key logs in (the
+    /// users module of cloud-init adds keys, it never removes the source's),
+    /// and its own machine id (journal, DHCP's DUID).
+    fn own_clone(&self) -> Result<(), String> {
+        let key = read(&self.path("id_ed25519.pub"))?;
+        let script = format!(
+            "set -e\n\
+             printf '%s\\n' {key} > /home/{USER}/.ssh/authorized_keys\n\
+             chown {USER}:{USER} /home/{USER}/.ssh/authorized_keys\n\
+             chmod 600 /home/{USER}/.ssh/authorized_keys\n\
+             rm -f /etc/machine-id\n\
+             systemd-machine-id-setup >/dev/null\n\
+             hostname\n",
+            key = shell_quote(key.trim()),
+        );
+        self.ssh_root_script(&script)
+    }
+
     /// The lab's own client key and the VM's host key (pinned in
     /// `known_hosts` under the alias `corerouter-lab`, so a new address
     /// from DHCP never asks to trust anything).
     fn keys(&self) -> Result<(), String> {
+        let vm = self.vm.name;
         for key in ["id_ed25519", "ssh_host_ed25519_key"] {
             let p = self.path(key);
             if !p.exists() {
@@ -322,7 +988,7 @@ impl Lab {
                     "-N",
                     "",
                     "-C",
-                    &format!("{NAME}-{key}"),
+                    &format!("{vm}-{key}"),
                     "-f",
                     &p.to_string_lossy(),
                 ]))?;
@@ -333,10 +999,11 @@ impl Lab {
         let (Some(kind), Some(key)) = (fields.next(), fields.next()) else {
             return Err("ssh_host_ed25519_key.pub is malformed".into());
         };
-        write(&self.path("known_hosts"), &format!("{NAME} {kind} {key}\n"))
+        write(&self.path("known_hosts"), &format!("{vm} {kind} {key}\n"))
     }
 
     fn seed(&self, spec: &Spec) -> Result<(), String> {
+        let vm = self.vm.name;
         let seed = self.path("seed");
         std::fs::create_dir_all(&seed).map_err(|e| format!("{}: {e}", seed.display()))?;
         let client = read(&self.path("id_ed25519.pub"))?;
@@ -346,7 +1013,7 @@ impl Lab {
         let packages: String = PACKAGES.iter().map(|p| format!("  - {p}\n")).collect();
         let user_data = format!(
             "#cloud-config\n\
-             hostname: {NAME}\n\
+             hostname: {vm}\n\
              users:\n\
              \x20 - name: {USER}\n\
              \x20   shell: /bin/bash\n\
@@ -369,13 +1036,14 @@ impl Lab {
             client = client.trim(),
             host_pub = host_pub.trim(),
         );
-        let instance = format!("{NAME}-{}", unix_now());
-        let meta = format!("instance-id: {instance}\nlocal-hostname: {NAME}\n");
+        let instance = format!("{vm}-{}", unix_now());
+        let meta = format!("instance-id: {instance}\nlocal-hostname: {vm}\n");
         let mut net = format!(
-            "version: 2\nethernets:\n  mgmt0:\n    match:\n      macaddress: \"{MGMT_MAC}\"\n    \
-             set-name: mgmt0\n    dhcp4: true\n    dhcp6: false\n    dhcp-identifier: mac\n"
+            "version: 2\nethernets:\n  mgmt0:\n    match:\n      macaddress: \"{mgmt_mac}\"\n    \
+             set-name: mgmt0\n    dhcp4: true\n    dhcp6: false\n    dhcp-identifier: mac\n",
+            mgmt_mac = self.vm.mgmt_mac
         );
-        for (name, mac) in wire_nics(spec.wires) {
+        for (name, mac) in wire_nics(spec.wires, self.vm.wire_mac_prefix) {
             net.push_str(&format!(
                 "  {name}:\n    match:\n      macaddress: \"{mac}\"\n    set-name: {name}\n    \
                  dhcp4: false\n    dhcp6: false\n    accept-ra: false\n    link-local: []\n    \
@@ -398,17 +1066,23 @@ impl Lab {
     }
 
     fn domain_xml(&self, spec: &Spec, overlay: &Path) -> String {
+        let vm = self.vm.name;
         let mut nics = format!(
             "    <interface type='network'>\n      <source network='default'/>\n      \
-             <mac address='{MGMT_MAC}'/>\n      <model type='virtio'/>\n    </interface>\n"
+             <mac address='{mgmt_mac}'/>\n      <model type='virtio'/>\n    </interface>\n",
+            mgmt_mac = self.vm.mgmt_mac
         );
-        for (i, (_, mac)) in wire_nics(spec.wires).into_iter().enumerate() {
+        let base = self.vm.wire_port_base;
+        for (i, (_, mac)) in wire_nics(spec.wires, self.vm.wire_mac_prefix)
+            .into_iter()
+            .enumerate()
+        {
             // NIC 2k sends to the port NIC 2k+1 listens on, and back.
             let pair = u16::try_from(i / 2).unwrap_or(0);
             let (local, remote) = if i % 2 == 0 {
-                (WIRE_PORT_BASE + 2 * pair, WIRE_PORT_BASE + 2 * pair + 1)
+                (base + 2 * pair, base + 2 * pair + 1)
             } else {
-                (WIRE_PORT_BASE + 2 * pair + 1, WIRE_PORT_BASE + 2 * pair)
+                (base + 2 * pair + 1, base + 2 * pair)
             };
             nics.push_str(&format!(
                 "    <interface type='udp'>\n      <mac address='{mac}'/>\n      \
@@ -417,15 +1091,18 @@ impl Lab {
                  <model type='virtio'/>\n    </interface>\n"
             ));
         }
+        // `cputune`: the CPU map of `VMS` (G0.26c). `freePageReporting`: the
+        // guest hands the pages it frees back to the host (the host swapped
+        // 19.5 GB when VM 2 was made, **measured**).
         // `host-model`, not `host-passthrough`: passthrough hands the guest
         // the host's CET shadow stack (KVM on kernel 7.0 offers it), which
         // QEMU 8.2 does not manage; after a while every process in the VM
         // segfaulted at the same shadow-stack address (**measured**,
         // 2026-10-25).
         format!(
-            "<domain type='kvm'>\n  <name>{NAME}</name>\n  \
+            "<domain type='kvm'>\n  <name>{vm}</name>\n  \
              <description>CoreRouter VM lab (cargo xtask vm-lab, docs/vm-lab.md)</description>\n  \
-             <memory unit='MiB'>{mem}</memory>\n  <vcpu>{cpus}</vcpu>\n  \
+             <memory unit='MiB'>{mem}</memory>\n  <vcpu>{cpus}</vcpu>\n{cputune}  \
              <os><type arch='x86_64' machine='q35'>hvm</type><boot dev='hd'/></os>\n  \
              <features><acpi/><apic/></features>\n  \
              <cpu mode='host-model' check='partial'/>\n  \
@@ -438,10 +1115,12 @@ impl Lab {
              <source file='{seed}'/>\n      <target dev='sda' bus='sata'/>\n      <readonly/>\n    \
              </disk>\n{nics}    <serial type='pty'/>\n    <console type='pty'/>\n    \
              <channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel>\n    \
-             <rng model='virtio'><backend model='random'>/dev/urandom</backend></rng>\n  \
+             <rng model='virtio'><backend model='random'>/dev/urandom</backend></rng>\n    \
+             <memballoon model='virtio' freePageReporting='on'/>\n  \
              </devices>\n</domain>\n",
             mem = spec.memory_mib,
             cpus = spec.cpus,
+            cputune = self.vm.cputune(spec.cpus),
             overlay = overlay.display(),
             seed = self.path("seed.iso").display(),
         )
@@ -469,8 +1148,9 @@ impl Lab {
 
     /// `Some("running")`, `Some("shut off")`… or `None` when not defined.
     fn state(&self) -> Result<Option<String>, String> {
+        let vm = self.vm.name;
         let out = Command::new("virsh")
-            .args(["-c", URI, "domstate", NAME])
+            .args(["-c", URI, "domstate", vm])
             .output()
             .map_err(|e| format!("virsh: {e}"))?;
         if out.status.success() {
@@ -484,20 +1164,22 @@ impl Lab {
     }
 
     fn require(&self) -> Result<String, String> {
+        let vm = self.vm.name;
         self.state()?
-            .ok_or_else(|| format!("{NAME} does not exist: `cargo xtask vm-lab create`"))
+            .ok_or_else(|| format!("{vm} does not exist: `cargo xtask vm-lab create`"))
     }
 
     fn up(&self) -> Result<(), String> {
+        let vm = self.vm.name;
         if self.require()? != "running" {
-            virsh(&["start", NAME])?;
+            virsh(&["start", vm])?;
         }
         self.wait_ssh(Duration::from_secs(180))?;
         // A `reset` to an older snapshot may predate a guest setting.
         if self.guest_settings()? {
             eprintln!("vm-lab: guest boot settings applied; rebooting");
             self.down()?;
-            virsh(&["start", NAME])?;
+            virsh(&["start", vm])?;
             self.wait_ssh(Duration::from_secs(180))?;
         }
         Ok(())
@@ -529,11 +1211,12 @@ impl Lab {
     }
 
     fn down(&self) -> Result<(), String> {
+        let vm = self.vm.name;
         if self.require()? != "running" {
             return Ok(());
         }
         self.close_master();
-        virsh(&["shutdown", NAME])?;
+        virsh(&["shutdown", vm])?;
         let deadline = Instant::now() + Duration::from_secs(90);
         while Instant::now() < deadline {
             // "in shutdown" is not done yet: a snapshot taken then races
@@ -544,56 +1227,59 @@ impl Lab {
             std::thread::sleep(Duration::from_millis(500));
         }
         eprintln!("vm-lab: no clean shutdown in 90 s; powering off");
-        virsh(&["destroy", NAME]).map(|_| ())
+        virsh(&["destroy", vm]).map(|_| ())
     }
 
     fn destroy(&self) -> Result<(), String> {
+        let vm = self.vm.name;
         if let Some(state) = self.state()? {
             self.close_master();
             if state == "running" {
-                let _ = virsh(&["destroy", NAME]);
+                let _ = virsh(&["destroy", vm]);
             }
-            virsh(&["undefine", NAME, "--snapshots-metadata"])?;
+            virsh(&["undefine", vm, "--snapshots-metadata"])?;
         }
         for f in [
-            format!("{NAME}.qcow2"),
+            format!("{vm}.qcow2"),
             "seed.iso".into(),
-            format!("{NAME}.xml"),
+            format!("{vm}.xml"),
         ] {
             let _ = std::fs::remove_file(self.path(&f));
         }
-        eprintln!("vm-lab: {NAME} destroyed (vm/base/ cache and the lab key stay)");
+        eprintln!("vm-lab: {vm} destroyed (vm/base/ cache and the lab key stay)");
         Ok(())
     }
 
     fn snapshot(&self, name: &str) -> Result<(), String> {
+        let vm = self.vm.name;
         check_snapshot_name(name)?;
         let was_running = self.require()? == "running";
         // Offline: an internal disk snapshot, no RAM image (8 GB) to store.
         self.down()?;
-        if virsh(&["snapshot-list", NAME, "--name"])?
+        if virsh(&["snapshot-list", vm, "--name"])?
             .lines()
             .any(|l| l.trim() == name)
         {
-            virsh(&["snapshot-delete", NAME, name])?;
+            virsh(&["snapshot-delete", vm, name])?;
         }
-        virsh(&["snapshot-create-as", NAME, name, "--atomic"])?;
+        virsh(&["snapshot-create-as", vm, name, "--atomic"])?;
         eprintln!("vm-lab: snapshot `{name}` taken");
         if was_running { self.up() } else { Ok(()) }
     }
 
     fn reset(&self, name: &str) -> Result<(), String> {
+        let vm = self.vm.name;
         check_snapshot_name(name)?;
         let started = Instant::now();
         if self.require()? == "running" {
             self.close_master();
-            virsh(&["destroy", NAME])?;
+            virsh(&["destroy", vm])?;
         }
         // A revert also brings back the definition saved with the snapshot
         // (CPU, memory): keep the current one.
-        let current = virsh(&["dumpxml", "--inactive", "--security-info", NAME])?;
-        virsh(&["snapshot-revert", NAME, name])?;
-        let xml = self.path(&format!("{NAME}.xml"));
+        let current = virsh(&["dumpxml", "--inactive", "--security-info", vm])?;
+        virsh(&["snapshot-revert", vm, name])?;
+        let xml = self.path(&format!("{vm}.xml"));
         write(&xml, &current)?;
         virsh(&["define", &xml.to_string_lossy()])?;
         self.up()?;
@@ -606,7 +1292,8 @@ impl Lab {
 
     /// `tools` when it exists, else `clean`.
     fn base_snapshot(&self) -> Result<&'static str, String> {
-        let list = virsh(&["snapshot-list", NAME, "--name"])?;
+        let vm = self.vm.name;
+        let list = virsh(&["snapshot-list", vm, "--name"])?;
         Ok(if list.lines().any(|l| l.trim() == TOOLS_SNAPSHOT) {
             TOOLS_SNAPSHOT
         } else {
@@ -617,6 +1304,7 @@ impl Lab {
     /// Nobody in a round: neither the user's host lock nor `run`'s lock in
     /// the VM is held. A snapshot or reset would cut that round off.
     fn idle(&self) -> Result<(), String> {
+        let vm = self.vm.name;
         let host = self.path(HOST_LOCK);
         if host_lock_held(&host) {
             return Err(format!(
@@ -624,7 +1312,7 @@ impl Lab {
                 host.display()
             ));
         }
-        let live = live_rounds(&own_round(), &host);
+        let live = live_rounds(&own_round(), &host, vm);
         if !live.is_empty() {
             return Err(format!(
                 "a `vm-lab run` is in the VM; try again when it ends, or --force\n{}",
@@ -738,6 +1426,7 @@ impl Lab {
     /// alive. `Ok` holds `vm/health.lock` (drop it once the round's ssh has
     /// started) and says how long it waited.
     fn ready(&self, timeout: Duration) -> Result<(std::fs::File, Duration), String> {
+        let vm = self.vm.name;
         let started = Instant::now();
         let own = own_round();
         let own_dir = self.remote_dir()?;
@@ -747,7 +1436,7 @@ impl Lab {
         let mut last_live: Vec<String> = Vec::new();
         loop {
             let guard = self.health_lock()?;
-            let live = live_rounds(&own, &self.path(HOST_LOCK));
+            let live = live_rounds(&own, &self.path(HOST_LOCK), vm);
             let who: Vec<String> = live.iter().map(|r| r.who.clone()).collect();
             if who != last_live {
                 // A round ended (or came): its cache may be removable now.
@@ -769,7 +1458,7 @@ impl Lab {
                     let mut keep: Vec<String> = live.iter().filter_map(|r| r.name()).collect();
                     keep.extend(dir_name(&own_dir));
                     eprintln!(
-                        "vm-lab: {NAME}: {health}; removing the build caches of worktrees no round uses"
+                        "vm-lab: {vm}: {health}; removing the build caches of worktrees no round uses"
                     );
                     match self.clean_disk(&keep) {
                         Ok(report) => eprint!("{report}"),
@@ -780,7 +1469,7 @@ impl Lab {
                     reset_done = true;
                     let base = self.base_snapshot()?;
                     eprintln!(
-                        "vm-lab: {NAME} is unhealthy ({health}) and no round is alive; `reset` to `{base}`"
+                        "vm-lab: {vm} is unhealthy ({health}) and no round is alive; `reset` to `{base}`"
                     );
                     self.reset(base)?;
                 }
@@ -788,7 +1477,7 @@ impl Lab {
                     if !said_wait {
                         said_wait = true;
                         eprintln!(
-                            "vm-lab: {NAME} looks unhealthy ({health}), but a round is alive in it:\n{}\n\
+                            "vm-lab: {vm} looks unhealthy ({health}), but a round is alive in it:\n{}\n\
                              vm-lab: no reset (it would cut that round off); checking again every {} s \
                              for up to {} (--lock-timeout)",
                             live_list(&live),
@@ -801,11 +1490,11 @@ impl Lab {
                     std::thread::sleep(RECHECK_EVERY.min(left).max(Duration::from_secs(1)));
                 }
                 Verdict::GiveUp if reset_done && live.is_empty() => {
-                    return Err(format!("{NAME} still unhealthy after reset: {health}"));
+                    return Err(format!("{vm} still unhealthy after reset: {health}"));
                 }
                 Verdict::GiveUp => {
                     return Err(format!(
-                        "{NAME} is unhealthy ({health}) and still in use after {}:\n{}\n\
+                        "{vm} is unhealthy ({health}) and still in use after {}:\n{}\n\
                          Not reset: that would cut those rounds off. Run again when they end (the \
                          reset is automatic then), raise --lock-timeout, or, only if those rounds \
                          are stuck, `cargo xtask vm-lab reset --force`",
@@ -818,14 +1507,29 @@ impl Lab {
     }
 
     fn status(&self) -> Result<(), String> {
+        let vm = self.vm.name;
         let Some(state) = self.state()? else {
             println!(
-                "{NAME}: not created (`cargo xtask vm-lab create`); cache in {}",
+                "{vm}: not created (`cargo xtask vm-lab create`); cache in {}",
                 self.dir.display()
             );
             return Ok(());
         };
-        println!("{NAME}: {state}");
+        println!("{vm}: {state}");
+        let live = if state == "running" {
+            "--live"
+        } else {
+            "--config"
+        };
+        if let (Ok(v), Ok(e)) = (
+            virsh(&["vcpupin", vm, live]),
+            virsh(&["emulatorpin", vm, live]),
+        ) {
+            println!(
+                "cpus: {}",
+                pin_summary(&v, &e, self.vm.vcpu_cpus, self.vm.emulator_cpus)
+            );
+        }
         match self.idle() {
             Ok(()) => println!("rounds: none (snapshot/reset allowed)"),
             Err(why) => println!("rounds: busy: {why}"),
@@ -851,7 +1555,7 @@ impl Lab {
                 Err(e) => println!("address: {e}"),
             }
         }
-        let snaps = virsh(&["snapshot-list", NAME, "--name"])?;
+        let snaps = virsh(&["snapshot-list", vm, "--name"])?;
         let snaps: Vec<&str> = snaps
             .lines()
             .map(str::trim)
@@ -865,7 +1569,7 @@ impl Lab {
                 snaps.join(", ")
             }
         );
-        let overlay = self.path(&format!("{NAME}.qcow2"));
+        let overlay = self.path(&format!("{vm}.qcow2"));
         if let Ok(info) =
             output(Command::new("qemu-img").args(["info", "-U", &overlay.to_string_lossy()]))
         {
@@ -890,16 +1594,17 @@ impl Lab {
 
     /// The VM's IPv4 on the `default` network, from libvirt's DHCP leases.
     fn address(&self) -> Result<Option<String>, String> {
+        let vm = self.vm.name;
         // The guest agent knows the address in use; the lease table may
         // also hold an older lease of the same NIC (a continuation row).
-        if let Ok(out) = virsh(&["domifaddr", NAME, "--source", "agent"])
-            && let Some(ip) = mgmt_ipv4(&out, MGMT_MAC)
+        if let Ok(out) = virsh(&["domifaddr", vm, "--source", "agent"])
+            && let Some(ip) = mgmt_ipv4(&out, self.vm.mgmt_mac)
         {
             return Ok(Some(ip));
         }
         Ok(mgmt_ipv4(
-            &virsh(&["domifaddr", NAME, "--source", "lease"])?,
-            MGMT_MAC,
+            &virsh(&["domifaddr", vm, "--source", "lease"])?,
+            self.vm.mgmt_mac,
         ))
     }
 
@@ -910,6 +1615,7 @@ impl Lab {
     /// `connect_s`: ssh's `ConnectTimeout` (the first value given wins in
     /// ssh, so it cannot be appended later).
     fn ssh_base_with(&self, ip: &str, connect_s: u32) -> Command {
+        let vm = self.vm.name;
         let mut c = Command::new("ssh");
         c.args(["-F", "/dev/null", "-i"])
             .arg(self.path("id_ed25519"))
@@ -920,7 +1626,7 @@ impl Lab {
             ))
             .args([
                 "-o",
-                &format!("HostKeyAlias={NAME}"),
+                &format!("HostKeyAlias={vm}"),
                 "-o",
                 "StrictHostKeyChecking=yes",
                 "-o",
@@ -939,15 +1645,16 @@ impl Lab {
             .arg("-o")
             .arg(format!("ConnectTimeout={connect_s}"))
             .arg("-o")
-            .arg(format!("ControlPath={}/cm-%C", self.dir.display()))
+            .arg(format!("ControlPath={}/cm-%C", self.vm_dir().display()))
             .arg(format!("{USER}@{ip}"));
         c
     }
 
     fn ssh(&self) -> Result<Command, String> {
+        let vm = self.vm.name;
         let ip = self
             .address()?
-            .ok_or_else(|| format!("{NAME} has no address yet: `cargo xtask vm-lab up`"))?;
+            .ok_or_else(|| format!("{vm} has no address yet: `cargo xtask vm-lab up`"))?;
         Ok(self.ssh_base(&ip))
     }
 
@@ -963,6 +1670,7 @@ impl Lab {
     }
 
     fn wait_ssh(&self, limit: Duration) -> Result<(), String> {
+        let vm = self.vm.name;
         let deadline = Instant::now() + limit;
         loop {
             if let Some(ip) = self.address()? {
@@ -980,7 +1688,7 @@ impl Lab {
             }
             if Instant::now() > deadline {
                 return Err(format!(
-                    "{NAME} not reachable by SSH after {} s (`virsh -c {URI} console {NAME}`)",
+                    "{vm} not reachable by SSH after {} s (`virsh -c {URI} console {vm}`)",
                     limit.as_secs()
                 ));
             }
@@ -994,6 +1702,7 @@ impl Lab {
 
     /// A bash script as root, output streamed.
     fn ssh_root_script(&self, script: &str) -> Result<(), String> {
+        let vm = self.vm.name;
         let mut child = self
             .ssh()?
             .args(["sudo", "bash", "-s"])
@@ -1010,7 +1719,7 @@ impl Lab {
         if status.success() {
             Ok(())
         } else {
-            Err(format!("command in {NAME} failed: {status}"))
+            Err(format!("command in {vm} failed: {status}"))
         }
     }
 
@@ -1023,7 +1732,7 @@ impl Lab {
             c.arg(remote_command(args));
         }
         let status = c.status().map_err(|e| format!("ssh: {e}"))?;
-        exit_like(status)
+        exit_like(status, self.vm.name)
     }
 
     // ---- sync / run ---------------------------------------------------
@@ -1048,6 +1757,7 @@ impl Lab {
     }
 
     fn sync(&self) -> Result<(), String> {
+        let vm = self.vm.name;
         let started = Instant::now();
         let dest = format!("{}/src/", self.remote_dir()?);
         let (mut rsync, to) = self.rsync(&dest)?;
@@ -1059,7 +1769,7 @@ impl Lab {
                 .arg(to),
         )?;
         eprintln!(
-            "vm-lab: synced {} → {NAME}:{dest} in {:.1} s",
+            "vm-lab: synced {} → {vm}:{dest} in {:.1} s",
             self.root.display(),
             started.elapsed().as_secs_f64()
         );
@@ -1069,6 +1779,7 @@ impl Lab {
     /// The third-party tools of `vm_tools::TOOLS`: `--check` reports, the
     /// default installs what is missing and snapshots `tools`.
     fn tools(&self, args: &[String]) -> Result<(), String> {
+        let vm = self.vm.name;
         let check = match args {
             [] => false,
             [a] if a == "--check" => true,
@@ -1091,9 +1802,14 @@ impl Lab {
                 eprintln!("vm-lab: all {} tools present", TOOLS.len());
                 return Ok(());
             }
+            let flag = if self.vm.num == 1 {
+                String::new()
+            } else {
+                format!("--vm {} ", self.vm.num)
+            };
             return Err(format!(
-                "missing in {NAME}: {}. Installing third-party code is the user's call, once: \
-                 ask them to run `cargo xtask vm-lab tools`",
+                "missing in {vm}: {}. Installing third-party code is the user's call, once: \
+                 ask them to run `cargo xtask vm-lab {flag}tools`",
                 describe(&missing)
             ));
         }
@@ -1129,7 +1845,7 @@ impl Lab {
     /// SHA-256 here and again in the VM), then one `apt-get install` for
     /// everything, so apt resolves the `.deb`s' dependencies.
     fn install(&self, list: &[(&vm_tools::Tool, Option<String>)]) -> Result<(), String> {
-        let cache = self.path("tools");
+        let cache = self.shared("tools");
         std::fs::create_dir_all(&cache).map_err(|e| format!("{}: {e}", cache.display()))?;
         let remote = format!("{LAB_ROOT}/tools/");
         let mut debs = Vec::new();
@@ -1170,6 +1886,7 @@ impl Lab {
 
     /// Files from the host (a `.deb`, a capture) into `/srv/lab/inbox/`.
     fn put(&self, files: &[String]) -> Result<(), String> {
+        let vm = self.vm.name;
         if files.is_empty() {
             return Err(format!("nothing to copy\n{HELP}"));
         }
@@ -1177,45 +1894,13 @@ impl Lab {
         let dest = format!("{LAB_ROOT}/inbox/");
         let (mut rsync, to) = self.rsync(&dest)?;
         run_ok(rsync.arg("-t").args(files).arg(to))?;
-        eprintln!("vm-lab: copied {} file(s) to {NAME}:{dest}", files.len());
+        eprintln!("vm-lab: copied {} file(s) to {vm}:{dest}", files.len());
         Ok(())
     }
 
-    fn run(&self, args: &[String]) -> Result<(), String> {
-        let mut sync = true;
-        let mut exclusive = true;
-        let mut timeout = match std::env::var(LOCK_TIMEOUT_VAR) {
-            Ok(v) => parse_duration(&v).map_err(|e| format!("${LOCK_TIMEOUT_VAR}: {e}"))?,
-            Err(_) => LOCK_TIMEOUT_DEFAULT,
-        };
-        let mut rest = args;
-        while let Some((first, tail)) = rest.split_first() {
-            match first.as_str() {
-                "--no-sync" => sync = false,
-                "--shared" => exclusive = false,
-                "--lock-timeout" => {
-                    let (v, t) = tail
-                        .split_first()
-                        .ok_or_else(|| "--lock-timeout needs a value (30m, 900, 1h)".to_owned())?;
-                    timeout = parse_duration(v).map_err(|e| format!("--lock-timeout: {e}"))?;
-                    rest = t;
-                    continue;
-                }
-                f if f.starts_with("--lock-timeout=") => {
-                    let v = f.strip_prefix("--lock-timeout=").unwrap_or_default();
-                    timeout = parse_duration(v).map_err(|e| format!("--lock-timeout: {e}"))?;
-                }
-                "--" => {
-                    rest = tail;
-                    break;
-                }
-                _ => break,
-            }
-            rest = tail;
-        }
-        if rest.is_empty() {
-            return Err(format!("nothing to run\n{HELP}"));
-        }
+    fn run(&self, opts: &RunOpts, rest: &[String]) -> Result<(), String> {
+        let vm = self.vm.name;
+        let (sync, exclusive, timeout) = (opts.sync, opts.exclusive, opts.timeout_s);
         let started = Instant::now();
         // Unreachable counts as unhealthy too (sshd was among the victims),
         // but nothing is reset under a live round (2026-11-13): see `verdict`.
@@ -1268,10 +1953,10 @@ impl Lab {
         drop(health_lock);
         let status = child.wait().map_err(|e| format!("ssh: {e}"))?;
         eprintln!(
-            "vm-lab: round (sync + command) {:.1} s, {status}",
+            "vm-lab: round (sync + command) in {vm} {:.1} s, {status}",
             started.elapsed().as_secs_f64()
         );
-        exit_like(status)
+        exit_like(status, vm)
     }
 
     // ---- lock: status / unlock ----------------------------------------
@@ -1294,6 +1979,7 @@ impl Lab {
     }
 
     fn unlock(&self, args: &[String]) -> Result<(), String> {
+        let vm = self.vm.name;
         let mut force = false;
         for a in args {
             match a.as_str() {
@@ -1302,7 +1988,7 @@ impl Lab {
             }
         }
         if self.require()? != "running" {
-            println!("{NAME} is not running: no round, no lock (it lives in /run)");
+            println!("{vm} is not running: no round, no lock (it lives in /run)");
             return Ok(());
         }
         let report = self.lock_report()?;
@@ -1526,7 +2212,7 @@ fn dir_name(dir: &str) -> Option<String> {
 /// `run` starts for its round: `(round, /srv/lab/<worktree>)`. The mux
 /// master renames itself (`ssh: <path> [mux]`) and rsync's ssh carries no
 /// round, so neither counts.
-fn round_of_ssh(args: &[String]) -> Option<(String, String)> {
+fn round_of_ssh(args: &[String]) -> Option<(String, String, String)> {
     let prog = args.first()?;
     if prog.rsplit('/').next() != Some("ssh") {
         return None;
@@ -1542,14 +2228,20 @@ fn round_of_ssh(args: &[String]) -> Option<(String, String)> {
             path.strip_suffix("/target").map(str::to_owned)
         })
         .unwrap_or_default();
-    Some((round.to_owned(), dir))
+    // Which VM: the ssh's `HostKeyAlias=<name>` (every `vm_lab.rs` since
+    // G0.26 sets it).
+    let alias = args
+        .iter()
+        .find_map(|a| a.strip_prefix("HostKeyAlias="))
+        .unwrap_or_default();
+    Some((round.to_owned(), dir, alias.to_owned()))
 }
 
 /// Rounds in the VM started by a live `vm-lab run` of this host (their ssh
 /// carries the round mark; `round_alive` rules out a reused pid), other
 /// than `own`; plus the user's hand-held `vm/root.lock`. Works with the VM
 /// unreachable: it only reads this host's `/proc`.
-fn live_rounds(own: &str, host_lock: &Path) -> Vec<LiveRound> {
+fn live_rounds(own: &str, host_lock: &Path, vm: &str) -> Vec<LiveRound> {
     let mut live = Vec::new();
     if host_lock_held(host_lock) {
         live.push(LiveRound {
@@ -1569,10 +2261,10 @@ fn live_rounds(own: &str, host_lock: &Path) -> Vec<LiveRound> {
             .split(|b| *b == 0)
             .map(|a| String::from_utf8_lossy(a).into_owned())
             .collect();
-        let Some((round, dir)) = round_of_ssh(&args) else {
+        let Some((round, dir, alias)) = round_of_ssh(&args) else {
             continue;
         };
-        if round == own || seen.contains(&round) || !round_alive(&round) {
+        if alias != vm || round == own || seen.contains(&round) || !round_alive(&round) {
             continue;
         }
         let pid = round.split('.').next().unwrap_or("?");
@@ -2039,20 +2731,31 @@ fn human_secs(s: u64) -> String {
     }
 }
 
-fn parse_spec(args: &[String]) -> Result<Spec, String> {
+/// `create`'s options: the VM's defaults, overridden; `--from <vm>` clones
+/// that VM's base snapshot instead of provisioning from the cloud image.
+fn parse_spec(args: &[String], vm: &Vm) -> Result<(Spec, Option<Vm>), String> {
     let mut spec = Spec {
-        cpus: 8,
-        memory_mib: 16_384,
-        disk_gib: 40,
+        cpus: vm.cpus,
+        memory_mib: vm.memory_mib,
+        disk_gib: vm.disk_gib,
         wires: 1,
     };
+    let mut from = None;
     let mut it = args.iter();
     while let Some(flag) = it.next() {
-        let value = it
-            .next()
-            .ok_or_else(|| format!("{flag} needs a value"))?
-            .parse::<u32>()
-            .map_err(|e| format!("{flag}: {e}"))?;
+        let raw = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
+        if flag == "--from" {
+            let src = Vm::parse(raw)?;
+            if src == *vm {
+                return Err(format!(
+                    "--from {raw}: {} cannot be cloned from itself",
+                    vm.name
+                ));
+            }
+            from = Some(src);
+            continue;
+        }
+        let value = raw.parse::<u32>().map_err(|e| format!("{flag}: {e}"))?;
         let (slot, lo, hi) = match flag.as_str() {
             "--cpus" => (&mut spec.cpus, 1, 64),
             "--memory" => (&mut spec.memory_mib, 1024, 65_536),
@@ -2065,17 +2768,17 @@ fn parse_spec(args: &[String]) -> Result<Spec, String> {
         }
         *slot = value;
     }
-    Ok(spec)
+    Ok((spec, from))
 }
 
 /// `(wire0a, mac), (wire0b, mac), …` for `wires` pairs.
-fn wire_nics(wires: u32) -> Vec<(String, String)> {
+fn wire_nics(wires: u32, mac_prefix: &str) -> Vec<(String, String)> {
     (0..wires)
         .flat_map(|w| {
             [("a", 0), ("b", 1)].map(|(side, n)| {
                 (
                     format!("wire{w}{side}"),
-                    format!("52:54:00:c0:73:{:02x}", w * 2 + n),
+                    format!("{mac_prefix}:{:02x}", w * 2 + n),
                 )
             })
         })
@@ -2223,11 +2926,11 @@ pub(crate) fn shell_quote(s: &str) -> String {
     }
 }
 
-fn exit_like(status: std::process::ExitStatus) -> Result<(), String> {
+fn exit_like(status: std::process::ExitStatus, vm: &str) -> Result<(), String> {
     if status.success() {
         Ok(())
     } else {
-        Err(format!("command in {NAME} exited with {status}"))
+        Err(format!("command in {vm} exited with {status}"))
     }
 }
 
@@ -2300,6 +3003,16 @@ pub(crate) fn read(path: &Path) -> Result<String, String> {
 
 pub(crate) fn write(path: &Path, text: &str) -> Result<(), String> {
     std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// `"key": <number>` in a flat JSON text (`qemu-img info --output=json`).
+fn json_u64(text: &str, key: &str) -> Option<u64> {
+    let (_, rest) = text.split_once(&format!("\"{key}\""))?;
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest.get(..end)?.parse().ok()
 }
 
 pub(crate) fn unix_now() -> u64 {
@@ -2384,15 +3097,55 @@ mod tests {
 
     #[test]
     fn wires_pair_up_and_never_reuse_a_mac() {
-        let nics = wire_nics(2);
-        let names: Vec<&str> = nics.iter().map(|(n, _)| n.as_str()).collect();
+        let first = wire_nics(2, VMS[0].wire_mac_prefix);
+        let names: Vec<&str> = first.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["wire0a", "wire0b", "wire1a", "wire1b"]);
-        let mut macs: Vec<&str> = nics.iter().map(|(_, m)| m.as_str()).collect();
-        macs.push(MGMT_MAC);
+        // VM 1 keeps the MACs it had before G0.26c (its netplan matches them).
+        assert_eq!(first[0].1, "52:54:00:c0:73:00");
+        // Every NIC of every VM, at the most wires, plus the CI runner's.
+        let mut macs: Vec<String> = vec![crate::ci_runner::MGMT_MAC.to_owned()];
+        for vm in VMS {
+            macs.push(vm.mgmt_mac.to_owned());
+            macs.extend(
+                wire_nics(MAX_WIRES, vm.wire_mac_prefix)
+                    .into_iter()
+                    .map(|(_, m)| m),
+            );
+        }
         let before = macs.len();
         macs.sort_unstable();
         macs.dedup();
         assert_eq!(macs.len(), before);
+    }
+
+    /// Two VMs at the most wires never bind the same UDP port.
+    #[test]
+    fn wire_ports_of_the_vms_never_overlap() {
+        let ports = |vm: &Vm| {
+            let lab = Lab {
+                root: "/w/x".into(),
+                dir: "/c/vm".into(),
+                vm: *vm,
+            };
+            let (spec, _) = parse_spec(&[], vm).unwrap();
+            let xml = lab.domain_xml(
+                &Spec {
+                    wires: MAX_WIRES,
+                    ..spec
+                },
+                Path::new("/o.qcow2"),
+            );
+            xml.match_indices("port='")
+                .map(|(i, _)| {
+                    let rest = &xml[i + 6..];
+                    rest[..rest.find('\'').unwrap()].parse::<u16>().unwrap()
+                })
+                .collect::<std::collections::BTreeSet<u16>>()
+        };
+        let (a, b) = (ports(&VMS[0]), ports(&VMS[1]));
+        assert_eq!(a.len(), 2 * MAX_WIRES as usize);
+        assert_eq!(a.first(), Some(&47_210));
+        assert!(a.is_disjoint(&b), "{a:?} {b:?}");
     }
 
     #[test]
@@ -2400,12 +3153,292 @@ mod tests {
         let lab = Lab {
             root: "/w/x".into(),
             dir: "/c/vm".into(),
+            vm: VMS[0],
         };
-        let spec = parse_spec(&[]).unwrap();
+        let (spec, _) = parse_spec(&[], &VMS[0]).unwrap();
         let xml = lab.domain_xml(&Spec { wires: 1, ..spec }, Path::new("/c/vm/o.qcow2"));
         assert!(xml.contains("port='47211'>\n        <local address='127.0.0.1' port='47210'/>"));
         assert!(xml.contains("port='47210'>\n        <local address='127.0.0.1' port='47211'/>"));
-        assert!(xml.contains(&format!("<name>{NAME}</name>")));
+        assert!(xml.contains("<name>corerouter-lab</name>"));
+        // The CPU map: vCPU i on host CPU 8+i, QEMU's threads on 24-31.
+        assert!(xml.contains("<vcpupin vcpu='0' cpuset='8'/>"));
+        assert!(xml.contains("<vcpupin vcpu='7' cpuset='15'/>"));
+        assert!(xml.contains("<emulatorpin cpuset='24-31'/>"));
+        assert!(xml.contains("freePageReporting='on'"));
+    }
+
+    fn strings(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn vms_are_named_by_number_short_or_full_name() {
+        for (t, n) in [
+            ("1", 1),
+            ("lab", 1),
+            ("corerouter-lab", 1),
+            ("2", 2),
+            ("lab2", 2),
+            ("corerouter-lab2", 2),
+        ] {
+            assert_eq!(Vm::parse(t).unwrap().num, n, "{t}");
+        }
+        for bad in ["3", "", "ci", "corerouter-ci", "lab3"] {
+            assert!(Vm::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_front_vm_comes_from_the_flag_then_the_variable() {
+        let (vm, rest) = front_vm(&strings(&["status"]), None).unwrap();
+        assert_eq!((vm, rest), (None, strings(&["status"])));
+        let (vm, rest) = front_vm(&strings(&["--vm", "2", "ssh", "ls"]), None).unwrap();
+        assert_eq!((vm, rest), (Some(VMS[1]), strings(&["ssh", "ls"])));
+        let (vm, _) = front_vm(&strings(&["--vm=lab2", "status"]), Some("1")).unwrap();
+        assert_eq!(vm, Some(VMS[1]), "the flag wins over the variable");
+        let (vm, _) = front_vm(&strings(&["status"]), Some("2")).unwrap();
+        assert_eq!(vm, Some(VMS[1]));
+        let (vm, _) = front_vm(&strings(&["status"]), Some(" ")).unwrap();
+        assert_eq!(vm, None, "an empty variable is unset");
+        assert!(front_vm(&strings(&["--vm"]), None).is_err());
+        assert!(front_vm(&strings(&["status"]), Some("9")).is_err());
+        // `--vm` after the subcommand belongs to it (ssh's remote command).
+        let (vm, rest) = front_vm(&strings(&["ssh", "--vm", "2"]), None).unwrap();
+        assert_eq!((vm, rest.len()), (None, 3));
+    }
+
+    #[test]
+    fn run_options_parse_as_before_plus_perf_and_vm() {
+        // What every caller passed before G0.26c still parses the same way.
+        let (o, cmd) = parse_run(&strings(&["--", "cargo", "xtask", "xdp-root"]), None).unwrap();
+        assert_eq!(
+            o,
+            RunOpts {
+                sync: true,
+                exclusive: true,
+                timeout_s: LOCK_TIMEOUT_DEFAULT,
+                vm: None,
+                perf: false
+            }
+        );
+        assert_eq!(cmd, strings(&["cargo", "xtask", "xdp-root"]));
+        let (o, cmd) = parse_run(
+            &strings(&[
+                "--no-sync",
+                "--shared",
+                "--lock-timeout",
+                "1h",
+                "--",
+                "true",
+            ]),
+            Some("90s"),
+        )
+        .unwrap();
+        assert_eq!(
+            (o.sync, o.exclusive, o.timeout_s, cmd.len()),
+            (false, false, 3600, 1)
+        );
+        let (o, _) = parse_run(&strings(&["--lock-timeout=2m", "true"]), Some("90s")).unwrap();
+        assert_eq!(o.timeout_s, 120);
+        let (o, _) = parse_run(&strings(&["true"]), Some("90s")).unwrap();
+        assert_eq!(o.timeout_s, 90);
+        let (o, _) = parse_run(&strings(&["--perf", "--vm", "1", "--", "x"]), None).unwrap();
+        assert_eq!((o.perf, o.vm), (true, Some(VMS[0])));
+        let (o, _) = parse_run(&strings(&["--vm=2", "--", "x"]), None).unwrap();
+        assert_eq!(o.vm, Some(VMS[1]));
+        assert!(parse_run(&strings(&["--vm"]), None).is_err());
+        assert!(
+            parse_run(&strings(&["--perf", "--"]), None).is_err(),
+            "nothing to run"
+        );
+        assert!(parse_run(&strings(&["x"]), Some("forever")).is_err());
+    }
+
+    #[test]
+    fn perf_is_vm_1_and_a_named_vm_wins() {
+        let opts = |vm: Option<Vm>, perf: bool| RunOpts {
+            sync: true,
+            exclusive: true,
+            timeout_s: 1,
+            vm,
+            perf,
+        };
+        assert_eq!(run_vm(None, &opts(None, false)).unwrap(), None);
+        assert_eq!(run_vm(None, &opts(None, true)).unwrap(), Some(VMS[0]));
+        assert_eq!(
+            run_vm(Some(VMS[1]), &opts(None, false)).unwrap(),
+            Some(VMS[1])
+        );
+        assert_eq!(
+            run_vm(None, &opts(Some(VMS[1]), false)).unwrap(),
+            Some(VMS[1])
+        );
+        assert_eq!(
+            run_vm(Some(VMS[0]), &opts(Some(VMS[1]), false)).unwrap(),
+            Some(VMS[0])
+        );
+        assert!(run_vm(Some(VMS[1]), &opts(None, true)).is_err());
+        assert!(run_vm(None, &opts(Some(VMS[1]), true)).is_err());
+        assert_eq!(
+            run_vm(Some(VMS[0]), &opts(None, true)).unwrap(),
+            Some(VMS[0])
+        );
+    }
+
+    #[test]
+    fn pick_prefers_a_free_vm_2_and_keeps_vm_1_for_measurements() {
+        let c = |num: usize, exists: bool, busy: usize| Candidate {
+            vm: VMS[num - 1],
+            exists,
+            busy,
+        };
+        let n = |cands: &[Candidate], perf: bool| pick(cands, perf).num;
+        // Both free: VM 2.
+        assert_eq!(n(&[c(1, true, 0), c(2, true, 0)], false), 2);
+        // VM 2 busy, VM 1 free: VM 1.
+        assert_eq!(n(&[c(1, true, 0), c(2, true, 1)], false), 1);
+        // Both busy: the fewest rounds, VM 2 on a tie.
+        assert_eq!(n(&[c(1, true, 1), c(2, true, 1)], false), 2);
+        assert_eq!(n(&[c(1, true, 1), c(2, true, 3)], false), 1);
+        // No VM 2 (before it is created): VM 1, as before G0.26c.
+        assert_eq!(n(&[c(1, true, 2), c(2, false, 0)], false), 1);
+        assert_eq!(n(&[c(1, false, 0), c(2, false, 0)], false), 1);
+        // --perf: VM 1, however busy.
+        assert_eq!(n(&[c(1, true, 5), c(2, true, 0)], true), 1);
+    }
+
+    /// The CPU map of `docs/vm-lab.md`: nothing else on VM 1's CPUs (its
+    /// vCPUs and its QEMU threads); VM 2 inside the CI runner's CCD.
+    #[test]
+    fn the_measurement_vm_shares_no_cpu() {
+        use std::collections::BTreeSet;
+        let cpus = |list: &str| -> BTreeSet<u32> {
+            list.split(',')
+                .flat_map(|r| match r.split_once('-') {
+                    Some((a, b)) => (a.parse::<u32>().unwrap()..=b.parse().unwrap()).collect(),
+                    None => vec![r.parse().unwrap()],
+                })
+                .collect()
+        };
+        let set = |v: &[u32], emu: &str| -> BTreeSet<u32> {
+            v.iter().copied().chain(cpus(emu)).collect()
+        };
+        let vm1 = set(VMS[0].vcpu_cpus, VMS[0].emulator_cpus);
+        let vm2 = set(VMS[1].vcpu_cpus, VMS[1].emulator_cpus);
+        let ci = set(CI_VCPU_CPUS, CI_EMULATOR_CPUS);
+        assert!(vm1.is_disjoint(&vm2), "{vm1:?} {vm2:?}");
+        assert!(vm1.is_disjoint(&ci), "{vm1:?} {ci:?}");
+        assert!(
+            vm1.iter()
+                .all(|c| (8..16).contains(c) || (24..32).contains(c)),
+            "CCD1"
+        );
+        assert!(ci.iter().all(|c| *c < 32));
+        // One host CPU per vCPU at the default size (no two vCPUs share one).
+        for (vcpus, n) in [
+            (VMS[0].vcpu_cpus, VMS[0].cpus),
+            (VMS[1].vcpu_cpus, VMS[1].cpus),
+            (CI_VCPU_CPUS, 16),
+        ] {
+            let used: BTreeSet<u32> = pin_plan(n, vcpus).into_iter().map(|(_, c)| c).collect();
+            assert_eq!(used.len(), n as usize);
+        }
+        // More vCPUs than the map wraps around instead of failing.
+        assert_eq!(pin_plan(6, VMS[1].vcpu_cpus).last(), Some(&(5, 5)));
+        assert!(pin_plan(3, &[]).is_empty());
+        assert_eq!(cpu_list(VMS[0].vcpu_cpus, 8), "8-15");
+        assert_eq!(cpu_list(CI_VCPU_CPUS, 16), "0-7,16-23");
+        assert_eq!(cpu_list(&[1, 3, 4], 3), "1,3-4");
+        let xml = cputune_xml(16, CI_VCPU_CPUS, CI_EMULATOR_CPUS);
+        assert!(xml.contains("<vcpupin vcpu='8' cpuset='16'/>"), "{xml}");
+        assert!(xml.contains("<emulatorpin cpuset='0-7,16-23'/>"));
+    }
+
+    #[test]
+    fn pin_takes_a_lab_vm_or_the_ci_runner() {
+        assert_eq!(parse_pin(&[]).unwrap(), (false, None));
+        assert_eq!(
+            parse_pin(&strings(&["--vm", "1"])).unwrap(),
+            (false, Some(PinTarget::Lab(VMS[0])))
+        );
+        assert_eq!(
+            parse_pin(&strings(&["--force", "--vm=ci"])).unwrap(),
+            (true, Some(PinTarget::Ci))
+        );
+        assert_eq!(
+            parse_pin(&strings(&["--vm", "corerouter-ci"])).unwrap().1,
+            Some(PinTarget::Ci)
+        );
+        assert!(parse_pin(&strings(&["--vm"])).is_err());
+        assert!(parse_pin(&strings(&["--vm", "3"])).is_err());
+        assert!(parse_pin(&strings(&["--bogus"])).is_err());
+    }
+
+    #[test]
+    fn status_says_whether_the_cpu_map_is_applied() {
+        let free = " VCPU   CPU Affinity\n----------------------\n 0      0-31\n 1      0-31\n";
+        let emu_free =
+            "emulator: CPU Affinity\n----------------------------------\n       *: 0-31\n";
+        let line = pin_summary(free, emu_free, &[4, 5], "20-23");
+        assert!(line.contains("0→0-31 1→0-31"), "{line}");
+        assert!(line.contains("vm-lab pin"), "{line}");
+        let pinned = " VCPU   CPU Affinity\n----------------------\n 0      4\n 1      5\n";
+        let emu = "emulator: CPU Affinity\n----------------------------------\n       *: 20-23\n";
+        let line = pin_summary(pinned, emu, &[4, 5], "20-23");
+        assert!(line.contains("as in docs/vm-lab.md"), "{line}");
+        assert_eq!(vcpu_count("4\n"), Some(4));
+        assert_eq!(vcpu_count("current         live      8\n"), Some(8));
+    }
+
+    /// VM 1's files are where they were before G0.26c; VM 2 has its own.
+    #[test]
+    fn each_vm_has_its_own_files_and_shares_the_image_cache() {
+        let lab = |vm| Lab {
+            root: "/w/x".into(),
+            dir: "/c/vm".into(),
+            vm,
+        };
+        let (one, two) = (lab(VMS[0]), lab(VMS[1]));
+        for f in [
+            "id_ed25519",
+            "known_hosts",
+            HOST_LOCK,
+            HEALTH_LOCK,
+            "seed.iso",
+        ] {
+            assert_eq!(one.path(f), Path::new("/c/vm").join(f));
+            assert_eq!(two.path(f), Path::new("/c/vm/corerouter-lab2").join(f));
+        }
+        assert_eq!(
+            one.path("corerouter-lab.qcow2"),
+            Path::new("/c/vm/corerouter-lab.qcow2")
+        );
+        assert_eq!(two.shared("base"), Path::new("/c/vm/base"));
+        assert_eq!(two.shared("tools"), one.shared("tools"));
+        // The ssh of each VM pins its own host key alias and master socket.
+        let args = |l: &Lab| -> Vec<String> {
+            l.ssh_base("192.0.2.1")
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert!(args(&two).contains(&"HostKeyAlias=corerouter-lab2".to_owned()));
+        assert!(args(&two).contains(&"ControlPath=/c/vm/corerouter-lab2/cm-%C".to_owned()));
+        assert!(args(&one).contains(&"ControlPath=/c/vm/cm-%C".to_owned()));
+        assert!(
+            args(&two)
+                .iter()
+                .any(|a| a.ends_with("/c/vm/corerouter-lab2/known_hosts"))
+        );
+    }
+
+    #[test]
+    fn qemu_img_json_numbers_are_read() {
+        let info = r#"{ "virtual-size": 21474836480, "filename": "x", "actual-size": 7 }"#;
+        assert_eq!(json_u64(info, "virtual-size"), Some(21_474_836_480));
+        assert_eq!(json_u64(info, "actual-size"), Some(7));
+        assert_eq!(json_u64(info, "missing"), None);
+        assert_eq!(json_u64(r#"{"virtual-size": "x"}"#, "virtual-size"), None);
     }
 
     #[test]
@@ -2418,19 +3451,31 @@ mod tests {
  wire0a     52:54:00:c0:73:00    ipv4         10.0.0.1/24
 ";
         assert_eq!(
-            mgmt_ipv4(table, MGMT_MAC).as_deref(),
+            mgmt_ipv4(table, VMS[0].mgmt_mac).as_deref(),
             Some("192.168.122.47")
         );
-        assert_eq!(mgmt_ipv4(" Name MAC Protocol Address\n", MGMT_MAC), None);
+        assert_eq!(
+            mgmt_ipv4(" Name MAC Protocol Address\n", VMS[0].mgmt_mac),
+            None
+        );
+        // VM 2's NIC is another row.
+        assert_eq!(mgmt_ipv4(table, VMS[1].mgmt_mac), None);
     }
 
     #[test]
     fn spec_flags_are_checked() {
-        let s = parse_spec(&["--cpus".into(), "16".into(), "--wires".into(), "2".into()]).unwrap();
-        assert_eq!((s.cpus, s.wires, s.memory_mib), (16, 2, 16_384));
-        assert!(parse_spec(&["--wires".into(), "9".into()]).is_err());
-        assert!(parse_spec(&["--cpus".into()]).is_err());
-        assert!(parse_spec(&["--bogus".into(), "1".into()]).is_err());
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (s, from) = parse_spec(&args(&["--cpus", "16", "--wires", "2"]), &VMS[0]).unwrap();
+        assert_eq!((s.cpus, s.wires, s.memory_mib, from), (16, 2, 16_384, None));
+        assert!(parse_spec(&args(&["--wires", "9"]), &VMS[0]).is_err());
+        assert!(parse_spec(&args(&["--cpus"]), &VMS[0]).is_err());
+        assert!(parse_spec(&args(&["--bogus", "1"]), &VMS[0]).is_err());
+        // VM 2's own defaults, and the clone source.
+        let (s, from) = parse_spec(&args(&["--from", "1"]), &VMS[1]).unwrap();
+        assert_eq!((s.cpus, s.memory_mib, s.disk_gib), (4, 6_144, 30));
+        assert_eq!(from, Some(VMS[0]));
+        assert!(parse_spec(&args(&["--from", "2"]), &VMS[1]).is_err());
+        assert!(parse_spec(&args(&["--from", "9"]), &VMS[1]).is_err());
     }
 
     #[test]
@@ -2740,6 +3785,8 @@ mod tests {
             "ssh",
             "-F",
             "/dev/null",
+            "-o",
+            "HostKeyAlias=corerouter-lab2",
             "lab@192.168.122.46",
             "sudo",
             "env",
@@ -2750,7 +3797,11 @@ mod tests {
         ]);
         assert_eq!(
             round_of_ssh(&round),
-            Some(("1194199.9140753".into(), "/srv/lab/img-443646f1".into()))
+            Some((
+                "1194199.9140753".into(),
+                "/srv/lab/img-443646f1".into(),
+                "corerouter-lab2".into()
+            ))
         );
         // The ControlPersist master, rsync's ssh, and the shell that started
         // `vm-lab run` (its text mentions the variable) are not rounds.
@@ -2899,20 +3950,23 @@ mod tests {
                 .args(["-c", "sleep 30; true", "x"])
                 .arg(format!("{ROUND_VAR}={me}"))
                 .arg("export CARGO_TARGET_DIR=/srv/lab/fake-wt/target CARGO_TERM_COLOR=always")
+                .arg("HostKeyAlias=corerouter-lab2")
                 .spawn()
                 .unwrap();
             let host_lock = d.join("root.lock");
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut found = Vec::new();
             while Instant::now() < deadline {
-                found = live_rounds("someone-else", &host_lock);
+                found = live_rounds("someone-else", &host_lock, "corerouter-lab2");
                 if found.iter().any(|r| r.name().as_deref() == Some("fake-wt")) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            // Its own round is never "another" round.
-            let own = live_rounds(&me, &host_lock);
+            // Its own round is never "another" round, and a round in VM 2
+            // is not one in VM 1.
+            let own = live_rounds(&me, &host_lock, "corerouter-lab2");
+            let in_vm1 = live_rounds("someone-else", &host_lock, "corerouter-lab");
             let _ = fake.kill();
             let _ = fake.wait();
             let _ = std::fs::remove_dir_all(&d);
@@ -2922,6 +3976,11 @@ mod tests {
             let ours = ours.unwrap_or_else(|| panic!("not found: {found:?}"));
             assert!(ours.who.contains(&format!("round {me}")), "{ours:?}");
             assert!(!own.iter().any(|r| r.name().as_deref() == Some("fake-wt")));
+            assert!(
+                !in_vm1
+                    .iter()
+                    .any(|r| r.name().as_deref() == Some("fake-wt"))
+            );
         }
 
         #[test]
