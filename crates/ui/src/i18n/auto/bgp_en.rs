@@ -86,7 +86,7 @@ Seconds between KEEPALIVEs. Empty: a third of the hold time (RFC 4271 §10). Mus
 RouterOS `local.role`: `ibgp` (same AS), `ibgp-rr` (iBGP where this router reflects routes to the neighbor, its client, RFC 4456) or `ebgp`; the `ebgp-provider`, `-customer`, `-peer`, `-rs`, `-rs-client` roles are announced in the OPEN (RFC 9234) and let both sides catch a route leak.
 
 ## Default
-Empty: from the remote AS (ours → ibgp, other → ebgp)."##),
+Empty: from the remote AS (ours: ibgp, other: ebgp)."##),
     (r##"bgp.param.max_prefix"##, r##"## What it is
 The most prefixes accepted from the neighbor, per family (RouterOS `input.limit-process-routes`). Protects the router from a full table sent by mistake. Empty or 0: no limit."##),
     (r##"bgp.param.max_prefix_action"##, r##"## What it is

@@ -740,13 +740,13 @@ impl ArpPanel {
             if matched > u64::from(PAGE) {
                 ui.separator();
                 let last = (offset + u64::from(PAGE)).min(matched);
-                if ui.add_enabled(offset > 0, egui::Button::new("◀")).clicked() {
+                if ui.add_enabled(offset > 0, egui::Button::new("‹")).clicked() {
                     let lst = self.listing();
                     lst.offset = lst.offset.saturating_sub(PAGE);
                     app.cache.refreshed_at = None;
                 }
                 ui.label(format!("{}–{last} / {matched}", offset + 1));
-                if ui.add_enabled(last < matched, egui::Button::new("▶")).clicked() {
+                if ui.add_enabled(last < matched, egui::Button::new("›")).clicked() {
                     let lst = self.listing();
                     lst.offset = lst.offset.saturating_add(PAGE);
                     app.cache.refreshed_at = None;
@@ -817,7 +817,7 @@ impl ArpPanel {
             if hist.is_empty() {
                 ui.weak(tr_in(SCOPE, l, "same MAC since the router started watching"));
             } else {
-                ui.label(hist.join("  →  "));
+                ui.label(hist.join("  ›  "));
             }
             ui.end_row();
             ui.label(tr_in(SCOPE, l, "Routes through it"));

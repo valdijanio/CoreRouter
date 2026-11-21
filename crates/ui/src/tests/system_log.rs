@@ -87,7 +87,7 @@ fn technical_view_adds_command_params_and_revision() {
         .unwrap()
         .technical();
     assert!(
-        line.starts_with(r#"#1 system.identity.set {"name":"edge1"} → "#),
+        line.starts_with(r#"#1 system.identity.set {"name":"edge1"} -> "#),
         "{line}"
     );
     assert!(line.contains("(revisão "), "{line}");

@@ -508,13 +508,15 @@ pub(crate) fn sfp(ui: &mut Ui, view: &NicView) {
     }
     let alerts: Vec<String> = strings(module, "alerts");
     for a in &alerts {
-        let alarm = a.contains("alarm");
-        let color = if alarm {
-            ui.visuals().error_fg_color
+        let (chip_text, tone) = if a.contains("alarm") {
+            ("alarm", crate::chip::RED)
         } else {
-            amber(ui)
+            ("warning", crate::chip::AMBER)
         };
-        ui.colored_label(color, format!("⚠ {a}"));
+        ui.horizontal_wrapped(|ui| {
+            crate::chip::chip(ui, chip_text, tone.tone(ui.visuals()));
+            ui.label(a.as_str());
+        });
     }
     let dom: Vec<&Value> = module
         .get("dom")

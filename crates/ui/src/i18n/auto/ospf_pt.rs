@@ -207,7 +207,7 @@ O próximo salto de reserva que o zebra deixou instalado (TI-LFA). No laboratór
     (r##"ospf.frr.coverage"##, r##"## O que é
 A porcentagem das rotas OSPF que têm reserva instalada, como o `show ... fast-reroute prefix-summary` da Cisco. Verde ≥ 95%, âmbar ≥ 70%, vermelho abaixo. A aba **Sem proteção** diz o motivo de cada uma."##),
     (r##"ospf.frr.labels"##, r##"## O que é
-A pilha de rótulos do reserva, de cima para baixo: os segmentos do reparo (nó P, adjacência P→Q) e o SID do destino."##),
+A pilha de rótulos do reserva, de cima para baixo: os segmentos do reparo (nó P, adjacência P-Q) e o SID do destino."##),
     (r##"ospf.frr.primary"##, r##"## O que é
 O próximo salto principal: endereço · interface."##),
     (r##"ospf.frr.protected"##, r##"## O que é
@@ -215,7 +215,7 @@ Se a rota tem reserva pronto."##),
     (r##"ospf.frr.reason"##, r##"## O que é
 Por que a rota está sem reserva: único caminho (o enlace é ponte), conectada, anunciada fora da área, nó protegido igual ao destino, ou um roteador do caminho sem SID."##),
     (r##"ospf.frr.segments"##, r##"## O que é
-Os segmentos do reparo calculados como o `ospfd` faz (nó PQ, ou nó P e adjacência P→Q)."##),
+Os segmentos do reparo calculados como o `ospfd` faz (nó PQ, ou nó P e adjacência P-Q)."##),
     (r##"ospf.frr.views"##, r##"## O que é
 **Rotas**: cada rota com o próximo salto principal e o de reserva e a pilha de rótulos (como o next-hop de reserva do Junos). **Sem proteção**: as rotas sem reserva e por quê (único caminho, conectada, externa, roteador sem SID). **Simular corte de link**: escolha um vizinho e veja o reserva de cada rota afetada e o caminho depois da convergência, sem tocar a rede."##),
     (r##"ospf.instance"##, r##"## O que é

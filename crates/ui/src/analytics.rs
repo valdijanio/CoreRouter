@@ -66,6 +66,8 @@ pub(crate) struct AnalyticsPanel {
     base: Form,
     waiting: usize,
     pub(crate) error: Option<String>,
+    /// The `warning` of the last Apply (amber, with the "warning" chip).
+    pub(crate) warning: Option<String>,
     /// Some rule sends log events to the `analytics` action.
     pub(crate) has_log_rule: Option<bool>,
     /// Traffic Flow is on (`None`: no such command on this router).
@@ -265,7 +267,8 @@ impl PanelState for AnalyticsPanel {
             (Reply::Set(form), Ok(v)) => {
                 let form = *form;
                 self.waiting = self.waiting.saturating_sub(1);
-                self.error = v.get("warning").and_then(Value::as_str).map(|w| format!("⚠ {w}"));
+                self.error = None;
+                self.warning = v.get("warning").and_then(Value::as_str).map(str::to_owned);
                 let mut base = form;
                 base.password.clear();
                 base.private_key.clear();
@@ -451,9 +454,14 @@ impl AnalyticsPanel {
                 ui.weak(format!("{} {}", crate::dialog::UNSAVED, tr(l, "not applied")));
             }
         });
+        if let Some(w) = &self.warning {
+            ui.horizontal_wrapped(|ui| {
+                chip::chip(ui, tr(l, "warning"), chip::AMBER.tone(ui.visuals()));
+                ui.label(w.as_str());
+            });
+        }
         if let Some(e) = &self.error {
-            let color = if e.starts_with('⚠') { ui.visuals().warn_fg_color } else { ui.visuals().error_fg_color };
-            ui.colored_label(color, e.as_str());
+            ui.colored_label(ui.visuals().error_fg_color, e.as_str());
         }
         if apply && let Some(p) = self.form.set_params(&self.base) {
             self.waiting += 1;
@@ -462,6 +470,7 @@ impl AnalyticsPanel {
         if revert {
             self.form = self.base.clone();
             self.error = None;
+            self.warning = None;
         }
     }
 

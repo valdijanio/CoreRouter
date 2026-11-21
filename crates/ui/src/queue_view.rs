@@ -715,7 +715,7 @@ impl Live {
         });
         if !kept {
             let why = if st.get("refused").and_then(Value::as_bool) == Some(true) {
-                "Not kept: the history would pass the graphing memory cap (Graphs → Settings)."
+                "Not kept: the history would pass the graphing memory cap (Graphs › Settings)."
             } else if marked {
                 "Kept from now on: the first points come within a minute."
             } else {

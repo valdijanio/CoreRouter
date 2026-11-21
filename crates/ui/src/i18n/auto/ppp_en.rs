@@ -125,7 +125,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("ppp.service.server", "The PPPoE server of this table (one per access port)."),
     ("ppp.service.sessions", "Sessions up that asked for this name."),
     ("ppp.services", "## Service Names\n\nThe server's Service-Name table (Junos `service-name-tables`): one server per port serves several services, each with its profile. A name lands on one row: the equal name, else the empty-name row, else the other-names row. terminate answers now, delay later (a backup BNG), drop never (RFC 2516 §5.2). RFC 2516 §9 recommends never refusing by name."),
-    ("ppp.why", "## Why?\n\nWhere the logins of a user or MAC get to (PADI → PADR → LCP → Auth → NCP → up), how many attempts at each stage, and why the last one stopped, with what to do."),
+    ("ppp.why", "## Why?\n\nWhere the logins of a user or MAC get to (PADI › PADR › LCP › Auth › NCP › up), how many attempts at each stage, and why the last one stopped, with what to do."),
     ("ppp.why.mac", "The CPE's MAC (Caller ID): useful when the login never got that far."),
     ("ppp.why.name", "The PPP login (as in Secrets or RADIUS)."),
     ("ppp.why.reply_message", "The RADIUS Reply-Message (RFC 2865 §5.18) of the last answer."),

@@ -114,10 +114,10 @@ impl Line {
                 }
             }
             if let Some(e) = d.get("error").and_then(Value::as_str) {
-                out.push_str(" → erro: ");
+                out.push_str(" -> erro: ");
                 out.push_str(e);
             } else if let Some(r) = d.get("result").filter(|r| !r.is_null()) {
-                out.push_str(" → ");
+                out.push_str(" -> ");
                 out.push_str(&r.to_string());
             }
             if let Some(rev) = d.get("revision").and_then(Value::as_u64) {
