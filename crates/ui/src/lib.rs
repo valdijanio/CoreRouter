@@ -1212,12 +1212,24 @@ impl CoreRouterUi {
                     } else {
                         "Re-arm"
                     };
+                    // G1.6qg: a detached one is re-armed detached.
+                    let detached = matches!(v, SafeModeView::Mine { detached: true, .. });
                     for (mins, secs) in [(1, 60), (5, 300), (10, 600)] {
                         pick(
                             ui,
                             &format!("{verb} with a {mins} min timeout"),
                             "config.safe-mode.enter",
-                            json!({ "timeout_secs": secs }),
+                            json!({ "timeout_secs": secs, "detach": detached }),
+                        );
+                    }
+                    if !detached {
+                        // G1.6qg: survives this window closing or the link
+                        // dropping; only the deadline or a confirmation ends it.
+                        pick(
+                            ui,
+                            "Detach: keep it 10 min after this window closes",
+                            "config.safe-mode.enter",
+                            json!({ "timeout_secs": 600, "detach": true }),
                         );
                     }
                     if matches!(v, SafeModeView::Mine { .. }) {
@@ -1386,9 +1398,12 @@ enum SafeModeView {
     Mine {
         entry_revision: u64,
         expires_in: Option<u64>,
+        /// G1.6qg: outlives the connection (ended by the deadline).
+        detached: bool,
     },
     Theirs {
         owner: String,
+        detached: bool,
     },
 }
 
@@ -1399,6 +1414,7 @@ impl SafeModeView {
         if sm.get("active").and_then(Value::as_bool) != Some(true) {
             return Self::Off { last: text("last") };
         }
+        let detached = sm.get("detached").and_then(Value::as_bool) == Some(true);
         if sm.get("yours").and_then(Value::as_bool) == Some(true) {
             Self::Mine {
                 entry_revision: sm
@@ -1406,10 +1422,12 @@ impl SafeModeView {
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
                 expires_in: sm.get("expires_in").and_then(Value::as_u64),
+                detached,
             }
         } else {
             Self::Theirs {
                 owner: text("owner").unwrap_or_default(),
+                detached,
             }
         }
     }
@@ -1422,7 +1440,7 @@ impl SafeModeView {
                 ..
             } => format!("Safe Mode {}:{:02}", t / 60, t % 60),
             Self::Mine { .. } => "Safe Mode".into(),
-            Self::Theirs { owner } => format!("Safe Mode: {owner}"),
+            Self::Theirs { owner, .. } => format!("Safe Mode: {owner}"),
         }
     }
 
@@ -1440,6 +1458,17 @@ impl SafeModeView {
             Self::Mine {
                 entry_revision,
                 expires_in,
+                detached: true,
+            } => format!(
+                "Safe Mode is on, detached: changes since revision {entry_revision} are undone in \
+                 {} s unless confirmed, even if this window closes.\nClick to keep them; right \
+                 click to undo or re-arm.",
+                expires_in.unwrap_or(0)
+            ),
+            Self::Mine {
+                entry_revision,
+                expires_in,
+                ..
             } => {
                 let deadline = expires_in
                     .map(|t| format!(", or in {t} s without confirmation"))
@@ -1448,7 +1477,14 @@ impl SafeModeView {
                     "Safe Mode is on: changes since revision {entry_revision} are undone if                      this connection drops{deadline}.\nClick to keep them; right click to undo."
                 )
             }
-            Self::Theirs { owner } => format!(
+            Self::Theirs {
+                owner,
+                detached: true,
+            } => format!(
+                "Safe Mode is held by {owner}, detached: their changes are undone at its \
+                 deadline unless they confirm. Right click to release or undo it."
+            ),
+            Self::Theirs { owner, .. } => format!(
                 "Safe Mode is held by {owner}: their changes are undone if they disconnect. \
                  Right click to release or undo it."
             ),
@@ -1502,10 +1538,35 @@ mod tests {
             view,
             SafeModeView::Mine {
                 entry_revision: 0,
-                expires_in: Some(300)
+                expires_in: Some(300),
+                detached: false,
             }
         );
         assert_eq!(view.label(), "Safe Mode 5:00");
+        // G1.6qg: re-armed detached, the hover says it outlives the window.
+        app.run(
+            "config.safe-mode.enter",
+            json!({"timeout_secs": 600, "detach": true}),
+        );
+        app.pump();
+        frame(&mut app);
+        let view = SafeModeView::from_summary(&app.cache.summary);
+        assert!(
+            matches!(
+                view,
+                SafeModeView::Mine {
+                    detached: true,
+                    expires_in: Some(600),
+                    ..
+                }
+            ),
+            "{view:?}"
+        );
+        assert!(
+            view.hover().contains("even if this window closes"),
+            "{}",
+            view.hover()
+        );
 
         app.run("config.safe-mode.cancel", json!({}));
         app.pump();

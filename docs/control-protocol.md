@@ -219,6 +219,35 @@ conexão é `corerouter_engine::safe_mode::NEEDS_OPEN_CONNECTION`. `state.inspec
 expires_in, last}` — `yours` é relativo à conexão que pergunta. A GUI com `--control` repassa
 cada cliente por uma conexão própria ao daemon, então o dono é esse cliente, não a janela.
 
+**Safe Mode destacado (G1.6qg).** É como o `commit confirmed N` do Junos e o
+`commit-confirm N` do VyOS: `config.safe-mode.enter {timeout_secs?, detach: true}` sobrevive à
+conexão que o abriu. Sem `timeout_secs`, o prazo é de 600 s, os 10 min dos dois. Ele só acaba
+de três jeitos:
+
+- no prazo, desfazendo as mudanças;
+- com `config.safe-mode.exit`, mantendo as mudanças;
+- com `config.safe-mode.cancel`, desfazendo na hora.
+
+Os três podem ser feitos pelo **mesmo usuário**, de qualquer conexão. Para o token local, todas
+as conexões contam como um usuário só. Os outros usuários precisam de `force: true`, como no
+Safe Mode comum. Entrar de novo com `detach: true` reinicia o prazo e mantém o ponto de entrada.
+Entrar de novo sem `detach` é recusado: a conexão nova viraria dona e desfaria tudo ao fechar.
+
+Por isso o `corerouter-cli run` aceita a entrada com `detach: true`:
+
+```sh
+corerouter-cli run config.safe-mode.enter '{"timeout_secs":300,"detach":true}'
+corerouter-cli run …                      # mudanças, uma conexão por comando
+corerouter-cli run config.safe-mode.exit  # mantém; sem isso, desfaz em 300 s
+```
+
+Enquanto ele roda, todo login recebe o aviso `safe_mode` no `auth.whoami`. A CLI e o MCP o
+imprimem com quem entrou, quantas mudanças estão pendentes e o tempo que falta. O log registra
+a entrada, o fechamento da conexão dona e o fim. O `state.inspect` traz ainda `detached`,
+`owner_user` e `owner_connected`. Se o daemon reiniciar no meio, ele sobe com a config da
+entrada, como no Safe Mode comum. Na GUI, o botão Safe Mode ganha "Detach: keep it 10 min after
+this window closes" no clique direito.
+
 ## Descoberta (CRDP)
 
 O anúncio CRDP leva também as portas TLS (`TLS_PORT` 14 = `--listen`, `WSS_PORT` 15 =

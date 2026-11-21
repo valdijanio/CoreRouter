@@ -215,6 +215,10 @@ impl Remote {
             if let Some(w) = nic_warning(&nic_problems) {
                 log::warn!("{target}: {w}");
             }
+            // G1.6qg: a detached Safe Mode undoes the changes at its deadline.
+            if let Some(w) = me.get("safe_mode").and_then(Value::as_str) {
+                log::warn!("{target}: {}", w.chars().take(400).collect::<String>());
+            }
         }
         Ok((client, has_ui, no_password, boot_errors, nic_problems))
     }
