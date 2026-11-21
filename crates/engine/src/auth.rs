@@ -273,6 +273,12 @@ pub fn whoami(s: &crate::Session, principal: &Principal, via: &str) -> Value {
     {
         o.insert("nic_problems".into(), Value::from(cards));
     }
+    // G1.6qg: a detached Safe Mode runs; every login is told when it ends.
+    if let Some(w) = s.safe_mode_warning()
+        && let Some(o) = out.as_object_mut()
+    {
+        o.insert("safe_mode".into(), Value::from(w));
+    }
     out
 }
 

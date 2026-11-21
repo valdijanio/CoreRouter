@@ -388,6 +388,13 @@ fn websocket(
 }
 
 /// The lab's diagnostic tools: this host's ICMP or the simulated network.
+/// Seconds on `CLOCK_MONOTONIC` since the first call: the lab's deadlines
+/// ignore steps of the wall clock, as a real router's do (G0.13).
+fn monotonic_secs() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs()
+}
+
 fn lab_tools(lab: VirtualHal, how: &str) -> Result<VirtualHal, String> {
     #[cfg(target_os = "linux")]
     let host = corerouter_hal_linux::icmp::HostProber::detect();
@@ -529,7 +536,9 @@ fn backend(
         // G1.30: the lab has a Wi-Fi radio too (`wifi1`, off until told to
         // join one of the lab's networks).
         "virtual" => Ok(Box::new(lab_tools(
-            VirtualHal::default().with_wifi(1),
+            VirtualHal::default()
+                .with_wifi(1)
+                .with_monotonic(monotonic_secs),
             lab_ping,
         )?)),
         #[cfg(target_os = "linux")]
@@ -661,7 +670,7 @@ fn run_until_signal(
     session: &corerouter_engine::Shared,
     shutdown: &Shutdown,
     discovery: Discovery,
-    token_file: Option<PathBuf>,
+    (token_file, remove_socket): (Option<PathBuf>, Box<dyn FnOnce()>),
 ) -> ! {
     let sig = signals.wait();
     log::info!(
@@ -682,6 +691,7 @@ fn run_until_signal(
     if let Some(f) = token_file {
         let _ = std::fs::remove_file(f);
     }
+    remove_socket();
     let deadline = Instant::now() + GOODBYE_WAIT;
     let left = || deadline.saturating_duration_since(Instant::now());
     #[cfg(target_os = "linux")]
@@ -922,6 +932,24 @@ fn main() -> ExitCode {
             }
         }
     }
+    // G0.11: the local socket beside 127.0.0.1:<port>; the CLI, MCP and
+    // GUI of this OS user (and root) prefer it, no token file needed.
+    #[cfg(target_os = "linux")]
+    let socket_file = match corerouter_control::unix::bind(args.port).and_then(|l| {
+        let file = l.file();
+        let shown = l.path().display().to_string();
+        corerouter_control::unix::spawn_until(l, host.clone(), gate.clone(), shutdown.clone())
+            .map(|_| (file, shown))
+    }) {
+        Ok((file, path)) => {
+            log::info!("control socket for this OS user and root: {path}");
+            Some(file)
+        }
+        Err(e) => {
+            log::warn!("control socket not served ({e}): local clients use 127.0.0.1");
+            None
+        }
+    };
     let stop = shutdown.clone();
     let control = thread::Builder::new()
         .name("control".into())
@@ -930,5 +958,21 @@ fn main() -> ExitCode {
         eprintln!("cannot start the control thread: {e}");
         return ExitCode::FAILURE;
     }
-    run_until_signal(signals, &session, &shutdown, discovery, token_file)
+    // G0.11: the socket goes with the token (the process may exit before
+    // its accept loop wakes up to remove it).
+    #[cfg(target_os = "linux")]
+    let remove_socket: Box<dyn FnOnce()> = Box::new(move || {
+        if let Some(f) = socket_file {
+            f.remove();
+        }
+    });
+    #[cfg(not(target_os = "linux"))]
+    let remove_socket: Box<dyn FnOnce()> = Box::new(|| {});
+    run_until_signal(
+        signals,
+        &session,
+        &shutdown,
+        discovery,
+        (token_file, remove_socket),
+    )
 }

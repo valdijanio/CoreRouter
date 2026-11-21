@@ -993,7 +993,7 @@ pub(super) fn al_add(s: &mut Session, p: &Value) -> Result<Value> {
                 format!("at most {MAX_DYNAMIC} dynamic entries"),
             ));
         }
-        let now = s.now();
+        let now = s.steady_now();
         let entry = DynamicEntry {
             id: s.dynamic_addresses.next_id(),
             list,
@@ -1093,7 +1093,7 @@ fn al_set(s: &mut Session, p: &Value) -> Result<Value> {
 fn al_remove(s: &mut Session, p: &Value) -> Result<Value> {
     take_force(s, p)?;
     let id: ItemId = req_parse(p, "id")?;
-    let now = s.now();
+    let now = s.steady_now();
     if let Some(e) = s.dynamic_addresses.remove(id) {
         if let Err(err) = s
             .hal_mut()
@@ -1113,7 +1113,7 @@ fn al_remove(s: &mut Session, p: &Value) -> Result<Value> {
 fn al_list(s: &mut Session, p: &Value) -> Result<Value> {
     let filter: Option<Name> = opt_parse(p, "list")?;
     s.expire_dynamic_addresses();
-    let now = s.now();
+    let now = s.steady_now();
     // Under the lock: two pointers; 100 000 rows are built after (G0.31b).
     let lists = s.store().candidate().ip.firewall.address_lists.list().clone();
     let dynamic = s.dynamic_addresses.shared();
