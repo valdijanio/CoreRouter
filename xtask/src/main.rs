@@ -8,6 +8,7 @@ mod changes;
 mod ci_runner;
 mod ebpf;
 mod layers;
+mod nightly;
 mod os;
 mod oui;
 mod package;
@@ -302,6 +303,17 @@ fn main() -> ExitCode {
                 Outcome::Ok | Outcome::Skip(_) => ExitCode::SUCCESS,
                 Outcome::Fail(why) => {
                     eprintln!("FAIL ci-runner: {why}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        // G0.30k: the nightly regression check (docs/ci-runner.md).
+        "nightly" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            return match nightly::main(&rest) {
+                Outcome::Ok | Outcome::Skip(_) => ExitCode::SUCCESS,
+                Outcome::Fail(why) => {
+                    eprintln!("FAIL nightly: {why}");
                     ExitCode::FAILURE
                 }
             };
