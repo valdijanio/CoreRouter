@@ -466,7 +466,9 @@ slowdisk_up() {
 	loop=$(losetup -f --show "$W/slowdisk.img")
 	sectors=$(blockdev --getsz "$loop")
 	dmsetup create crslowcfg --table "0 $sectors delay $loop 0 0 $loop 0 0 $loop 0 $CONFIG_FLUSH_MS"
-	mkfs.ext4 -q /dev/mapper/crslowcfg
+	# Initialized now, not by ext4lazyinit in the background during the
+	# run (its writes queue behind the late flushes too).
+	mkfs.ext4 -q -E lazy_itable_init=0,lazy_journal_init=0 /dev/mapper/crslowcfg
 	mount /dev/mapper/crslowcfg "$W/dut/tmp/cfg"
 	SLOWDISK=$loop
 	log "DUT /config on dm-delay: flushes $CONFIG_FLUSH_MS ms late"
