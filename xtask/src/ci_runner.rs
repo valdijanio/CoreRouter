@@ -62,6 +62,16 @@ const BASE_SNAPSHOT: &str = "base";
 const REGISTERED_SNAPSHOT: &str = "registered";
 /// `reset --if-due` without a number: ~10 batches of 4 jobs.
 const DUE_DEFAULT: u64 = 40;
+/// `reset --if-due` also resets, wiping the build caches, once the cache
+/// disk is this full. The cargo targets never drop old artifacts: the three
+/// grew to 51–53 GB each and filled the 196 GB disk at 35 jobs since the last
+/// reset (2026-11-21, measured), failing every batch with ENOSPC. Right after
+/// a wipe and a full `cargo xtask ci` per slot they take ~27 GB each
+/// (measured 2026-10-29), ~50 % with the 17 GB swap file.
+const CACHE_FULL_PCT: u64 = 75;
+/// `pkill -f` pattern for the runner processes a `systemctl stop` leaves
+/// behind (the unit's `KillMode=process`): listener and worker of every slot.
+const LEFTOVERS: &str = "'^/opt/actions-runner/[0-9]+/bin/Runner\\.(Listener|Worker)'";
 
 const PACKAGES: &[&str] = &[
     "build-essential",
@@ -116,7 +126,8 @@ const HELP: &str = "usage: cargo xtask ci-runner <subcommand>   (docs/ci-runner.
                     the runners' environment and target dir /var/cache/corerouter-ci/target-try<N>
   reset [--if-due [N]] [--wipe-cache] [--force]
                     back to `registered` (else `base`); the cache disk stays. --if-due: only
-                    when N jobs ran since (default 40); refused while a job runs, unless --force
+                    when N jobs ran since (default 40) or the cache disk is 75 % full (then
+                    it also wipes the build caches); refused while a job runs, unless --force
   unregister [--yes]
                     THE USER RUNS THIS: removes the corerouter-ci-* runners from GitHub
                     (gh api); without --yes only lists them
@@ -782,11 +793,27 @@ impl Vm {
                 .trim()
                 .parse()
                 .unwrap_or(0);
-            if done < n {
-                println!("ci-runner: {done} of {n} jobs since the last reset; not due");
+            let used = self
+                .ssh_output(&format!("df --output=pcent {CACHE} | tail -1"))
+                .ok()
+                .and_then(|s| parse_pcent(&s));
+            let d = due_decision(done, n, used);
+            if !d.due {
+                println!(
+                    "ci-runner: {done} of {n} jobs since the last reset, cache disk {}; not due",
+                    used.map_or_else(|| "?".to_owned(), |u| format!("{u} %"))
+                );
                 return Ok(());
             }
-            println!("ci-runner: {done} jobs since the last reset (>= {n}); resetting");
+            if d.wipe {
+                wipe = true;
+                println!(
+                    "ci-runner: cache disk {} % full (>= {CACHE_FULL_PCT} %); resetting and wiping the build caches",
+                    used.unwrap_or(0)
+                );
+            } else {
+                println!("ci-runner: {done} jobs since the last reset (>= {n}); resetting");
+            }
         }
         if running && !force {
             // Stop taking jobs first, then make sure none was running.
@@ -806,18 +833,26 @@ impl Vm {
             self.ssh_output("sudo systemctl stop 'corerouter-runner@*.service'")?;
             let busy = self.ssh_output(&format!("ls {RUN} 2>/dev/null | grep '^busy-' || true"))?;
             if !busy.trim().is_empty() {
-                let _ = self.ssh_output("sudo systemctl start --all 'corerouter-runner@*.service'");
+                // The unit has `KillMode=process` and `PrivateTmp=yes`: the
+                // stop ended `run.sh` only, and the `Runner.Listener` (and the
+                // job) live on in a /tmp systemd already removed. Every job it
+                // takes then fails ("Cannot create temporary file in /tmp/",
+                // SIGABRT in the linker), and the restarted unit cannot take
+                // the runner's session while it lives (2026-11-21, measured).
+                // That job is lost either way: end the leftovers, then start.
+                let _ = self.ssh_output(&format!(
+                    "sudo pkill -TERM -f {LEFTOVERS}; sleep 3; sudo pkill -KILL -f {LEFTOVERS}; \
+                     sudo systemctl start --all 'corerouter-runner@*.service'"
+                ));
                 return Err(format!(
-                    "a job started while stopping ({}); runners restarted, try again later",
+                    "a job started while stopping ({}); it was ended and the runners restarted, \
+                     try again later",
                     busy.trim()
                 ));
             }
         }
         if wipe && running {
-            self.ssh_output(&format!(
-                "sudo rm -rf {CACHE}/target-* {CACHE}/try {CACHE}/work-*"
-            ))?;
-            println!("ci-runner: build caches wiped");
+            self.wipe_cache()?;
         }
         let snap = if self.snapshots()?.iter().any(|s| s == REGISTERED_SNAPSHOT) {
             REGISTERED_SNAPSHOT
@@ -827,11 +862,21 @@ impl Vm {
         self.define_filter()?;
         self.revert(snap)?;
         if wipe && !running {
-            self.ssh_output(&format!(
-                "sudo rm -rf {CACHE}/target-* {CACHE}/try {CACHE}/work-*"
-            ))?;
-            println!("ci-runner: build caches wiped");
+            self.wipe_cache()?;
         }
+        Ok(())
+    }
+
+    /// Deletes the build caches and makes it durable before anything
+    /// powers the VM off: `revert` ends it with `virsh destroy`, and a
+    /// deletion still in the page cache and ext4 journal was undone by that
+    /// (2026-11-21: `reset --wipe-cache` printed "wiped" and the 186 GB were
+    /// all back after the boot, measured).
+    fn wipe_cache(&self) -> Result<(), String> {
+        self.ssh_output(&format!(
+            "sudo rm -rf {CACHE}/target-* {CACHE}/try {CACHE}/work-* && sync -f {CACHE}"
+        ))?;
+        println!("ci-runner: build caches wiped");
         Ok(())
     }
 
@@ -951,6 +996,11 @@ impl Vm {
         check_snapshot_name(name)?;
         let started = Instant::now();
         if self.require()? == "running" {
+            // `destroy` pulls the plug: flush what the jobs (and a wipe) left
+            // in the guest's page cache first, so the cache disk that stays is
+            // whole. Best effort: a VM that no longer answers is reverted
+            // anyway.
+            let _ = self.ssh_output("timeout 120 sync");
             self.close_master();
             virsh(&["destroy", NAME])?;
         }
@@ -1543,9 +1593,100 @@ echo $((n + 1)) > "$state/jobs-done"
 exit 0
 "#;
 
+/// What `reset --if-due` does.
+#[derive(Debug, PartialEq, Eq)]
+struct Due {
+    due: bool,
+    wipe: bool,
+}
+
+/// `done` jobs since the last reset, due after `n`; `used` is the cache
+/// disk's use in percent (`None` when `df` could not tell: the job count
+/// alone decides, as before).
+fn due_decision(done: u64, n: u64, used: Option<u64>) -> Due {
+    let wipe = used.is_some_and(|u| u >= CACHE_FULL_PCT);
+    Due {
+        due: wipe || done >= n,
+        wipe,
+    }
+}
+
+/// The last line of `df --output=pcent` (" 87%").
+fn parse_pcent(s: &str) -> Option<u64> {
+    let t = s.trim();
+    let n: u64 = t.strip_suffix('%')?.trim().parse().ok()?;
+    (n <= 100).then_some(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_full_cache_disk_resets_and_wipes_before_the_job_count() {
+        // 2026-11-21: 100 % full at 35 of 40 jobs.
+        assert_eq!(
+            due_decision(35, 40, Some(100)),
+            Due {
+                due: true,
+                wipe: true
+            }
+        );
+        assert_eq!(
+            due_decision(0, 40, Some(CACHE_FULL_PCT)),
+            Due {
+                due: true,
+                wipe: true
+            }
+        );
+        assert_eq!(
+            due_decision(35, 40, Some(CACHE_FULL_PCT - 1)),
+            Due {
+                due: false,
+                wipe: false
+            }
+        );
+        // The job count alone still resets, keeping the cache.
+        assert_eq!(
+            due_decision(40, 40, Some(50)),
+            Due {
+                due: true,
+                wipe: false
+            }
+        );
+        assert_eq!(
+            due_decision(40, 40, None),
+            Due {
+                due: true,
+                wipe: false
+            }
+        );
+        assert_eq!(
+            due_decision(3, 40, None),
+            Due {
+                due: false,
+                wipe: false
+            }
+        );
+    }
+
+    #[test]
+    fn df_percent_is_parsed_and_junk_is_not() {
+        assert_eq!(parse_pcent(" 87%\n"), Some(87));
+        assert_eq!(parse_pcent("100%"), Some(100));
+        assert_eq!(parse_pcent("9%"), Some(9));
+        for junk in [
+            "",
+            "Use%",
+            "87",
+            "-3%",
+            "101%",
+            "x%",
+            "ssh: connect timed out",
+        ] {
+            assert_eq!(parse_pcent(junk), None, "{junk:?}");
+        }
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
