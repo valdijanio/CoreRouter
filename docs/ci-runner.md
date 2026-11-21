@@ -72,10 +72,17 @@ ping), endereços das faixas privadas e IPv6 não. O `create` falha se algo vaza
   VM desligada: o snapshot interno do libvirt leva todos os discos, e o de cache tem de ficar.
 - `reset` desliga os runners (recusa se houver job em andamento, salvo `--force`), volta o disco
   de sistema ao snapshot `registered` (ou `base`, antes do registro) e liga. O disco de cache
-  fica; `--wipe-cache` o limpa (use depois de um incidente ou se o cache crescer demais).
-- `reset --if-due [N]` só reseta depois de N jobs (padrão 40, ~10 lotes). A fila contínua o
-  chama quando fica ociosa (no máximo a cada 10 min; `CI_RUNNER_RESET_JOBS`). Durante o reset
-  (~1 min) os runners ficam offline e o próximo lote vai para o GitHub.
+  fica; `--wipe-cache` o limpa (use depois de um incidente ou se o cache crescer demais). Antes de
+  desligar a VM à força (`virsh destroy`), o `reset` roda `sync` nela, e a limpeza termina com
+  `sync -f`: sem isso, a remoção ainda no cache de páginas e no journal do ext4 se perdia no
+  desligamento, e o `--wipe-cache` dizia "wiped" com os 186 GB de volta depois do boot
+  (2026-11-21, **medido**).
+- `reset --if-due [N]` só reseta depois de N jobs (padrão 40, ~10 lotes) **ou** com o disco de
+  cache a 75 % ou mais; nesse caso também limpa os targets. Os targets do cargo nunca apagam
+  artefatos velhos: os três chegaram a 51–53 GB cada e encheram o disco com 35 jobs desde o
+  último reset, e todo lote falhou com "No space left on device" (2026-11-21, **medido**). A fila
+  contínua o chama quando fica ociosa (no máximo a cada 10 min; `CI_RUNNER_RESET_JOBS`). Durante
+  o reset (~1 min) os runners ficam offline e o próximo lote vai para o GitHub.
 - **Por que não `--ephemeral`/JIT:** um runner efêmero se desregistra depois de um job e precisa
   de um token novo a cada job. O token de registro vale 1 hora, então isso exigiria guardar no
   host um token de administrador (PAT ou GitHub App) para gerar os JIT — um segredo mais
