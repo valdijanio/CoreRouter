@@ -176,7 +176,8 @@ fn chosen(env: &Env, name: &str) -> Result<ServerIdentity, String> {
 
 fn open_ssl(env: &Env, l: &WebListener, id: &ServerIdentity) -> Result<Open, String> {
     let addr = SocketAddr::new(l.address, l.port);
-    let listener = TcpListener::bind(addr).map_err(|e| bind_error(addr, &e))?;
+    // G3.4zb: in its VRF, if it has one.
+    let listener = super::listen_vrf::bind(addr, &l.vrf).map_err(|e| bind_error(addr, &e))?;
     let at = listener.local_addr().unwrap_or(addr);
     let (refused, allow) = counter(l);
     let mut endpoint = Endpoint::tls(listener, id.config.clone());
@@ -197,9 +198,10 @@ fn open_ssl(env: &Env, l: &WebListener, id: &ServerIdentity) -> Result<Open, Str
         stop.clone(),
     )
     .map_err(|e| format!("cannot start the www-ssl thread: {e}"))?;
+    let vrf = if l.vrf.is_main() { String::new() } else { format!(" in VRF {}", l.vrf) };
     match &env.files {
-        Some(dir) => log::info!("web GUI at https://{at}/ (files in {})", dir.display()),
-        None => log::info!("WebSocket over TLS at wss://{at}/ws (no GUI files)"),
+        Some(dir) => log::info!("web GUI at https://{at}/{vrf} (files in {})", dir.display()),
+        None => log::info!("WebSocket over TLS at wss://{at}/ws{vrf} (no GUI files)"),
     }
     Ok(Open {
         at,
@@ -210,7 +212,7 @@ fn open_ssl(env: &Env, l: &WebListener, id: &ServerIdentity) -> Result<Open, Str
 
 fn open_redirect(health: &super::Health, l: &WebListener, ssl_port: u16) -> Result<Open, String> {
     let addr = SocketAddr::new(l.address, l.port);
-    let listener = TcpListener::bind(addr).map_err(|e| bind_error(addr, &e))?;
+    let listener = super::listen_vrf::bind(addr, &l.vrf).map_err(|e| bind_error(addr, &e))?;
     listener
         .set_nonblocking(true)
         .map_err(|e| format!("{addr}: {e}"))?;

@@ -115,6 +115,12 @@ pub const UNITS: &[Unit] = &[
         run: management_guard_checks,
     },
     Unit {
+        name: "service-vrf",
+        // G3.4zb: the VRF a service listens in is an interface.
+        reads: small_and(Sections::INTERFACES),
+        run: service_vrf_checks,
+    },
+    Unit {
         name: "routing-rules",
         // A rule names interfaces and tables, and the mangle's marks.
         reads: small_and(Sections::INTERFACES.union(Sections::MANGLE)),
@@ -218,6 +224,20 @@ fn management_guard_checks(cfg: &Config) -> Vec<Issue> {
                 format!("no VRF '{}' for the guard of {} (interface.vrf.add, or vrf main)", n.vrf, n.network),
             )
         })
+        .collect()
+}
+
+/// G3.4zb: the VRF of `/ip service` exists (a listener bound to a missing
+/// device would never open).
+fn service_vrf_checks(cfg: &Config) -> Vec<Issue> {
+    let rows = [
+        ("system.web.www_ssl.vrf", "www-ssl", &cfg.system.web.www_ssl.vrf),
+        ("system.web.www.vrf", "www", &cfg.system.web.www.vrf),
+        ("system.metrics.vrf", "metrics", &cfg.system.metrics.vrf),
+    ];
+    rows.into_iter()
+        .filter(|(_, _, v)| !v.is_main() && !route::is_vrf_table(cfg, v))
+        .map(|(at, name, v)| Issue::new(at, format!("no VRF '{v}' for ip.service {name} (ip.vrf.add, or vrf main)")))
         .collect()
 }
 
