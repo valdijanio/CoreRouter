@@ -304,7 +304,57 @@ pub(crate) fn learned(
     if names.is_empty() {
         return Ok(Vec::new());
     }
-    with_kernel(|k| async move { k.learned(names).await.map_err(HalError::Io) })
+    with_strict_kernel(|k| async move { k.learned(names).await.map_err(HalError::Io) })
+}
+
+/// The IPv6 state of every link of `names` (index → name), read for the
+/// clock with the session unlocked (G1.3i): what [`learned`] and
+/// [`address_states`] would say, each entry with its link's index (the hal
+/// keeps the managed ones). One address dump serves both.
+#[derive(Debug, Default)]
+pub(crate) struct V6Read {
+    pub learned: Vec<(u32, Learned)>,
+    pub states: Vec<(u32, corerouter_hal::address_state::AddressState)>,
+}
+
+/// `ra`: read the `proto ra` routes too (some link accepts RA).
+pub(crate) fn v6_read(
+    names: &std::collections::BTreeMap<u32, IfName>,
+    ra: bool,
+) -> Result<V6Read, HalError> {
+    if names.is_empty() {
+        return Ok(V6Read::default());
+    }
+    with_strict_kernel(|k| async move {
+        let addresses = k.addresses_v6().await.map_err(HalError::Io)?;
+        let mut out = V6Read::default();
+        for m in &addresses {
+            let index = m.header.index;
+            let Some(interface) = names.get(&index) else {
+                continue;
+            };
+            if let Some(st) = address_state(m, interface.clone()) {
+                out.states.push((index, st));
+            }
+            if let Some((address, valid_secs, preferred_secs)) = self_made(m) {
+                out.learned.push((
+                    index,
+                    Learned::Address {
+                        interface: interface.clone(),
+                        address,
+                        valid_secs,
+                        preferred_secs,
+                    },
+                ));
+            }
+        }
+        if ra {
+            for (oif, route) in k.ra_routes(names).await.map_err(HalError::Io)? {
+                out.learned.push((oif, route));
+            }
+        }
+        Ok(out)
+    })
 }
 
 /// The addresses on the links of `names` the kernel holds in a state other
@@ -559,13 +609,45 @@ where
     F: FnOnce(Kernel) -> Fut,
     Fut: Future<Output = Result<T, HalError>>,
 {
+    with_kernel_on(false, f)
+}
+
+/// [`with_kernel`] on a socket with `NETLINK_GET_STRICT_CHK` (G1.3i): the
+/// kernel filters a dump by the request's header (a route dump by
+/// protocol, table, type) instead of sending everything. Strict also means
+/// a request the kernel finds malformed is refused, so only the dumps
+/// written for it run here. A kernel without the option (before 4.20)
+/// dumps everything, as before.
+pub(crate) fn with_strict_kernel<T, F, Fut>(f: F) -> Result<T, HalError>
+where
+    F: FnOnce(Kernel) -> Fut,
+    Fut: Future<Output = Result<T, HalError>>,
+{
+    with_kernel_on(true, f)
+}
+
+fn with_kernel_on<T, F, Fut>(strict: bool, f: F) -> Result<T, HalError>
+where
+    F: FnOnce(Kernel) -> Fut,
+    Fut: Future<Output = Result<T, HalError>>,
+{
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()
         .map_err(|e| HalError::Io(format!("netlink runtime: {e}")))?;
     rt.block_on(async {
-        let (conn, handle, _) = rtnetlink::new_connection()
+        let (mut conn, handle, _) = rtnetlink::new_connection()
             .map_err(|e| HalError::Io(format!("netlink socket: {e}")))?;
+        if strict {
+            use netlink_sys::AsyncSocket as _;
+            if let Err(e) = conn
+                .socket_mut()
+                .socket_ref()
+                .set_netlink_get_strict_chk(true)
+            {
+                log::debug!("netlink: no strict dump checking ({e}): dumps come unfiltered");
+            }
+        }
         let task = tokio::spawn(conn);
         let out = f(Kernel {
             handle,
@@ -1742,10 +1824,11 @@ impl Kernel {
     }
 
     async fn addresses_v6(&self) -> Result<Vec<AddressMessage>, String> {
-        self.handle
-            .address()
-            .get()
-            .execute()
+        // AF_INET6 in the request: only the IPv6 handler dumps (AF_UNSPEC
+        // ran every family's and the IPv4 ones were thrown away here).
+        let mut get = self.handle.address().get();
+        get.message_mut().header.family = AddressFamily::Inet6;
+        get.execute()
             .try_filter(|m| futures_util::future::ready(m.header.family == AddressFamily::Inet6))
             .take(MAX_DUMP)
             .try_collect()
@@ -1830,21 +1913,50 @@ impl Kernel {
                 });
             }
         }
-        for m in self.routes_v6().await? {
+        out.extend(self.ra_routes(names).await?.into_iter().map(|(_, r)| r));
+        Ok(out)
+    }
+
+    /// The routes of protocol `ra` on the links of `names`, with the
+    /// link's index. On a strict socket ([`with_strict_kernel`]) the kernel
+    /// sends only those: `ip_valid_fib_dump_req` takes `rtm_protocol` as a
+    /// filter (net/ipv4/fib_frontend.c:974 in Linux 6.18.59) and
+    /// `rt6_dump_route` skips the others (net/ipv6/route.c:6090) before
+    /// writing them. Without it (a kernel before 4.20) the whole table
+    /// comes and [`ra_route`] filters here: 136 ms a dump with 100 000 BGP
+    /// routes against ~1 ms filtered (**medido**, G1.3i).
+    async fn ra_routes(
+        &self,
+        names: &std::collections::BTreeMap<u32, IfName>,
+    ) -> Result<Vec<(u32, Learned)>, String> {
+        let query = RouteMessageBuilder::<Ipv6Addr>::new()
+            .table_id(0)
+            .protocol(RouteProtocol::Ra)
+            .build();
+        let mut out = Vec::new();
+        let mut dump = std::pin::pin!(self.handle.route().get(query).execute().take(MAX_DUMP));
+        while let Some(m) = dump
+            .try_next()
+            .await
+            .map_err(|e| format!("listing routes: {}", readable(&e)))?
+        {
             let Some((dst, gateway, oif, metric, table, expires_secs)) = ra_route(&m) else {
                 continue;
             };
             let Some(interface) = names.get(&oif) else {
                 continue;
             };
-            out.push(Learned::Route {
-                interface: interface.clone(),
-                dst,
-                gateway,
-                metric,
-                table,
-                expires_secs,
-            });
+            out.push((
+                oif,
+                Learned::Route {
+                    interface: interface.clone(),
+                    dst,
+                    gateway,
+                    metric,
+                    table,
+                    expires_secs,
+                },
+            ));
         }
         Ok(out)
     }
