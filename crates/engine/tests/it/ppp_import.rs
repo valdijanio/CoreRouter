@@ -412,3 +412,33 @@ fn hundred_thousand_secrets() {
         rss()
     );
 }
+
+/// G0.33b: a large import first saves the running config as an automatic
+/// checkpoint; a small one does not.
+#[test]
+fn a_large_import_saves_an_automatic_checkpoint_first() {
+    let storage = MemoryStorage::default();
+    let mut s = boot(&storage);
+    let small = s
+        .execute("ppp.secret.import", &json!({"text": "/ppp secret\nadd name=a password=x\n"}))
+        .unwrap();
+    assert!(small.get("checkpoint").is_none(), "{small}");
+    let before = s.store().current_revision();
+    let mut text = String::from("/ppp secret\n");
+    for i in 0..100 { // config_checkpoint::LARGE_IMPORT
+        text.push_str(&format!("add name=c{i} password=x\n"));
+    }
+    let out = s.execute("ppp.secret.import", &json!({"text": text})).unwrap();
+    let name = out["checkpoint"]["name"].as_str().unwrap().to_owned();
+    assert_eq!(out["checkpoint"]["revision"], before);
+    assert_eq!(out["added"], 100);
+    // Back to before the import.
+    s.execute("config.checkpoint.restore", &json!({"name": name})).unwrap();
+    assert!(s.store().running().ppp.secret("c0").is_none());
+    assert!(s.store().running().ppp.secret("a").is_some());
+    // A dry run saves nothing.
+    let dry = s
+        .execute("ppp.secret.import", &json!({"text": text, "dry_run": true}))
+        .unwrap();
+    assert!(dry.get("checkpoint").is_none(), "{dry}");
+}

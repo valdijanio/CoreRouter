@@ -12,7 +12,8 @@
 //!   (physical ports, BGP instances) become a `set`, and so do rows the
 //!   router marks `default=yes` (they exist in every new config, like the
 //!   interface lists LAN and WAN, so `add` would fail on import). Dynamic
-//!   rows (flag `D`, `dynamic=yes`) are not configuration and are skipped.
+//!   rows (flag `D`, `dynamic=yes`) and rows kept outside the config
+//!   (`in_config=no`, the checkpoints) are not configuration and are skipped.
 //! - a one-object menu (`get`): one `set` with every field `set` declares.
 //!
 //! Order is safe for import: each line comes after the lines creating the
@@ -111,10 +112,13 @@ fn arg_text(v: &Value) -> String {
     value_text(v)
 }
 
-/// Not configuration: dynamic rows, and rows the router says it does not
-/// manage (`managed=no`: links of the host it leaves alone).
+/// Not configuration: dynamic rows, rows the router says it does not
+/// manage (`managed=no`: links of the host it leaves alone), and rows kept
+/// outside the config (`in_config=no`: the checkpoints, whole configs of
+/// their own; G0.33b found `/export` writing them as `add` lines).
 fn dynamic(row: &Value) -> bool {
     row.get("managed").and_then(Value::as_bool) == Some(false)
+        || row.get("in_config").and_then(Value::as_bool) == Some(false)
         || row.get("dynamic").and_then(Value::as_bool) == Some(true)
         || row
             .get("flags")

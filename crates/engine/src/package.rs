@@ -81,6 +81,41 @@ impl JobKind {
     }
 
     /// Does it end in a reboot into a trial slot?
+    /// Installs another image (or boots the other slot): the jobs that
+    /// save an automatic checkpoint first (G0.33b).
+    pub fn replaces_image(&self) -> bool {
+        matches!(
+            self,
+            JobKind::Update { .. }
+                | JobKind::Downgrade { .. }
+                | JobKind::Upload { check: false, .. }
+                | JobKind::Download { check: false, .. }
+        )
+    }
+
+    /// The command that queued it, for the checkpoint's comment.
+    pub fn describe(&self) -> String {
+        match self {
+            JobKind::Update { path } => format!("system.package.update {path}"),
+            JobKind::Downgrade { path: Some(path) } => format!("system.package.downgrade {path}"),
+            JobKind::Downgrade { path: None } => "system.package.downgrade".to_owned(),
+            JobKind::Upload { downgrade: true, .. } => "system.package.upload (downgrade)".to_owned(),
+            JobKind::Upload { .. } => "system.package.upload".to_owned(),
+            JobKind::Download { url, .. } => {
+                // A user:password@ in the URL stays out of the comment.
+                let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+                let host = rest.split('/').next().unwrap_or("");
+                let rest = match host.rsplit_once('@') {
+                    Some((_, after)) => rest.replacen(host, after, 1),
+                    None => rest.to_owned(),
+                };
+                let url: String = format!("{scheme}://{rest}").chars().take(200).collect();
+                format!("system.package.download {url}")
+            }
+            other => format!("system.package {}", other.name()),
+        }
+    }
+
     pub fn arms_trial(&self) -> bool {
         matches!(
             self,

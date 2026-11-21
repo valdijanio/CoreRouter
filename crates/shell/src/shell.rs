@@ -135,6 +135,10 @@ struct Ask {
     first: Option<String>,
 }
 
+/// Commands from which `/import` saves an automatic checkpoint first
+/// (G0.33b; `LARGE_IMPORT` of the engine's `config_checkpoint`).
+const LARGE_IMPORT: usize = 100;
+
 /// Moves `/import` may make of a failing step to the end (see `import_batch`).
 const MAX_DEFERRED: usize = 64;
 
@@ -1191,7 +1195,40 @@ impl Shell {
         }
         let order = (0..steps.len()).collect();
         let retry = Retry::new(steps.len());
-        import_batch(steps, order, retry)
+        if steps.len() < LARGE_IMPORT {
+            return import_batch(steps, order, retry);
+        }
+        // G0.33b: a large import first saves the running config as an
+        // automatic checkpoint (outside the batch: a file written cannot be
+        // taken back by it). Not saved, the import still runs, and says so.
+        let comment = format!("before /import of {} commands", steps.len());
+        let save = Request::execute("config.checkpoint.add", json!({ "comment": comment }));
+        Next::Send(
+            vec![save],
+            Box::new(move |sh, replies| {
+                let note = match reply(&replies, 0) {
+                    Ok(v) => {
+                        let name = v.get("name").and_then(Value::as_str).unwrap_or("?").to_owned();
+                        Line::styled(
+                            Style::Dim,
+                            format!(
+                                "checkpoint {name} saved first (config.checkpoint.restore name={name} goes back)"
+                            ),
+                        )
+                    }
+                    Err(e) => Line::styled(Style::Warn, format!("no checkpoint saved first: {e}")),
+                };
+                let next = import_batch(steps, order, retry);
+                chain(
+                    sh,
+                    next,
+                    Box::new(move |_, mut out| {
+                        out.lines.insert(0, note);
+                        Next::Done(out)
+                    }),
+                )
+            }),
+        )
     }
 
     /// `?`: a menu's sub-menus and commands, or one command's parameters.
