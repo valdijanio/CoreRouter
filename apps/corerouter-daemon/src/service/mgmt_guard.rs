@@ -58,16 +58,17 @@ fn run(session: &Shared, health: &super::Health) -> Result<(), String> {
     let mut last = (usize::MAX, usize::MAX);
     while !health.stopping() {
         health.beat();
-        let pairs = lock(session).mgmt_guard_probes();
-        let asks: Vec<_> = pairs.iter().map(|(peer, local)| (*peer, Some(*local))).collect();
-        let answers = match corerouter_hal_linux::fib_match::lookup(&asks) {
+        let probes = lock(session).mgmt_guard_probes();
+        // G3.4za: a session in a VRF is looked up in its table.
+        let asks: Vec<_> = probes.iter().map(|p| (p.peer, Some(p.local), p.vrf.clone())).collect();
+        let answers = match corerouter_hal_linux::fib_match::lookup_in(&asks) {
             Ok(a) => a,
             Err(e) => {
                 health.error(format!("route lookup: {e}"));
                 Vec::new()
             }
         };
-        let fed: Vec<_> = pairs.into_iter().zip(answers).collect();
+        let fed: Vec<_> = probes.iter().map(|p| p.pair()).zip(answers).collect();
         let now = {
             let mut s = lock(session);
             s.mgmt_guard_feed(fed);
