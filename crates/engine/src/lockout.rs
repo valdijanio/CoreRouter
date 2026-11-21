@@ -347,7 +347,7 @@ fn cut(table: Table, o: Outcome) -> bool {
 impl Session {
     /// The dynamic address-list entries as the data plane holds them.
     pub(crate) fn dynamic_now(&self) -> Vec<DynamicAddress> {
-        let now = self.now();
+        let now = self.steady_now();
         self.dynamic_addresses
             .entries()
             .iter()

@@ -161,6 +161,21 @@ impl Default for Leases6 {
 }
 
 impl Leases6 {
+    /// The wall clock stepped by `delta` seconds (G0.13): ends and
+    /// last-seen times move with it (see `Leases::shift`).
+    pub fn shift(&mut self, delta: i64) {
+        use crate::shift_secs;
+        self.by_end = self
+            .by_end
+            .iter()
+            .map(|(free, e, net)| (*free, shift_secs(*e, delta), *net))
+            .collect();
+        for l in self.by_net.values_mut() {
+            l.expires = shift_secs(l.expires, delta);
+            l.last_seen = shift_secs(l.last_seen, delta);
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.by_net.len()
     }
@@ -1312,6 +1327,13 @@ impl Server6 {
     }
 
     /// Once a second: bindings, offers and holds that ran out.
+    /// The wall clock stepped by `delta` seconds (G0.13): see
+    /// `Server::clock_step`.
+    pub fn clock_step(&mut self, delta: i64) {
+        self.leases.shift(delta);
+        self.last_tick = crate::shift_secs(self.last_tick, delta);
+    }
+
     pub fn tick(&mut self, now: Now) -> Vec<Effect6> {
         let mut out = Vec::new();
         if now.unix == self.last_tick {

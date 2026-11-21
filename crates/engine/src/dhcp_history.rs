@@ -41,6 +41,17 @@ pub struct HistoryRuntime {
 const COMPACT_RETRY_SECS: u64 = 60;
 
 impl Session {
+    /// The wall clock stepped by `step` seconds (G0.13): the compaction
+    /// timers move with it (a step back would hold compaction for as long as
+    /// the step). The records keep the times they were written with.
+    pub(crate) fn dhcp_history_clock_step(&mut self, step: i64) {
+        use corerouter_proto_dhcp::shift_secs;
+        if let Some(rt) = self.ext_mut::<HistoryRuntime>() {
+            rt.compacted_at = shift_secs(rt.compacted_at, step);
+            rt.retry_at = shift_secs(rt.retry_at, step);
+        }
+    }
+
     fn history_retention(&self) -> u64 {
         u64::from(self.store().running().ip.dhcp_server.config.history_retention)
     }

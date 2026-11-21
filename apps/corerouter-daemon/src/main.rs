@@ -388,6 +388,13 @@ fn websocket(
 }
 
 /// The lab's diagnostic tools: this host's ICMP or the simulated network.
+/// Seconds on `CLOCK_MONOTONIC` since the first call: the lab's deadlines
+/// ignore steps of the wall clock, as a real router's do (G0.13).
+fn monotonic_secs() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs()
+}
+
 fn lab_tools(lab: VirtualHal, how: &str) -> Result<VirtualHal, String> {
     #[cfg(target_os = "linux")]
     let host = corerouter_hal_linux::icmp::HostProber::detect();
@@ -529,7 +536,9 @@ fn backend(
         // G1.30: the lab has a Wi-Fi radio too (`wifi1`, off until told to
         // join one of the lab's networks).
         "virtual" => Ok(Box::new(lab_tools(
-            VirtualHal::default().with_wifi(1),
+            VirtualHal::default()
+                .with_wifi(1)
+                .with_monotonic(monotonic_secs),
             lab_ping,
         )?)),
         #[cfg(target_os = "linux")]

@@ -213,7 +213,7 @@ fn verdict(v: corerouter_firewall::eval::Verdict) -> &'static str {
 fn preview(s: &mut Session, _p: &Value) -> Result<Value> {
     // Pointers under the lock; both rulesets are rendered and compared
     // after it (G0.31b). The dynamic entries as `dynamic_now` gives them.
-    let (dynamic, now) = (s.dynamic_addresses.shared(), s.now());
+    let (dynamic, now) = (s.dynamic_addresses.shared(), s.steady_now());
     let (run, cand) = (s.store().running().clone(), s.store().candidate().clone());
     s.defer(move || {
         let dynamic: Vec<_> = dynamic.iter().map(|e| e.data_plane(now)).collect();

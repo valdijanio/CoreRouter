@@ -14,6 +14,7 @@
 use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use corerouter_engine::{ConfigStorage, MemoryStorage, Slot, StorageError};
@@ -173,6 +174,9 @@ impl DhcpServerPort for FloodPort {
 pub struct FloodHal {
     pub inner: VirtualHal,
     pub flood: Shared,
+    /// (wall, monotonic) clocks the test moves by hand (G0.13); `None`:
+    /// the virtual lab's (none).
+    pub clocks: Option<(Arc<AtomicU64>, Arc<AtomicU64>)>,
 }
 
 impl FloodHal {
@@ -180,6 +184,7 @@ impl FloodHal {
         Self {
             inner: VirtualHal::default(),
             flood,
+            clocks: None,
         }
     }
 }
@@ -202,7 +207,17 @@ impl Hal for FloodHal {
     }
 
     fn now_unix(&self) -> Option<u64> {
-        self.inner.now_unix()
+        match &self.clocks {
+            Some((wall, _)) => Some(wall.load(Ordering::SeqCst)),
+            None => self.inner.now_unix(),
+        }
+    }
+
+    fn monotonic_secs(&self) -> Option<u64> {
+        match &self.clocks {
+            Some((_, mono)) => Some(mono.load(Ordering::SeqCst)),
+            None => self.inner.monotonic_secs(),
+        }
     }
 
     fn address_list_dynamic(&mut self, change: DynamicChange<'_>) -> Result<(), HalError> {
