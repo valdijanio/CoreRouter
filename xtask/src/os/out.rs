@@ -1,7 +1,8 @@
 //! processo (build rápido da imagem): where `cargo xtask os` keeps its
 //! build — the extracted Buildroot and its output (`O=`), ccache, the cargo
-//! targets (image, web GUI, the `push` CLI), the test work directories and
-//! the image signing key — and how parallel the top-level `make` runs
+//! targets (image, web GUI, the `push` CLI) and the test work directories
+//! (not the signing key since G1.6qm: [`dev_keys`]) — and how parallel the
+//! top-level `make` runs
 //! (docs/os-image.md, "Onde fica o build").
 //!
 //! The directory, first match:
@@ -85,34 +86,162 @@ fn has_key(keys: &Path) -> bool {
 
 pub fn resolve(root: &Path) -> Result<Out, String> {
     let root = std::fs::canonicalize(root).map_err(|e| format!("{}: {e}", root.display()))?;
-    let legacy_keys = root.join("os/out/keys");
     let disk = Path::new(BUILD_DISK);
     let writable = std::fs::metadata(disk).is_ok_and(|m| m.is_dir() && !m.permissions().readonly());
     let out = choose(
         &root,
         std::env::var_os(ENV),
-        has_key(&legacy_keys),
+        has_key(&root.join("os/out/keys")),
         writable.then_some(disk),
     );
-    // A new directory with no key while the checkout's os/out has one: the
-    // build would make another key, and every router updated so far would
-    // refuse its packages. Say how to carry the key instead.
-    if out.source == Source::Env
-        && out.dir != root.join("os/out")
-        && !has_key(&out.dir.join("keys"))
-        && has_key(&legacy_keys)
-    {
-        return Err(format!(
-            "${ENV}={} has no signing key, and {} has one: copy it first \
-             (mkdir -p {dir} && cp -a {legacy} {dir}/), or the routers refuse the new packages \
-             (docs/os-image.md, \"Onde fica o build\")",
-            out.dir.display(),
-            legacy_keys.display(),
-            dir = out.dir.display(),
-            legacy = legacy_keys.display(),
-        ));
-    }
     Ok(out)
+}
+
+/// G1.6qm: the variable that moves the development signing key (tests).
+pub const DEV_KEY_ENV: &str = "COREROUTER_DEV_KEY_DIR";
+
+/// What [`dev_keys`] does with the shared directory.
+#[derive(Debug, PartialEq)]
+enum KeyPlan {
+    /// It has a key (or none exists anywhere: `corerouter-image key`
+    /// makes one there).
+    Use,
+    /// It has none, and this build directory (or the checkout's old
+    /// `os/out`) has one: move a copy there first, so the routers that
+    /// trust it keep taking the packages.
+    Migrate(PathBuf),
+}
+
+fn key_plan(shared_has_key: bool, with_key: &[PathBuf]) -> KeyPlan {
+    match with_key.first() {
+        Some(from) if !shared_has_key => KeyPlan::Migrate(from.clone()),
+        _ => KeyPlan::Use,
+    }
+}
+
+/// `$XDG_CONFIG_HOME` (absolute only, as the spec says) or `~/.config`.
+fn config_home(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    xdg.map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            home.filter(|h| !h.is_empty())
+                .map(|h| PathBuf::from(h).join(".config"))
+        })
+}
+
+/// The public key ids (`pub/<id>.pub`) in a key directory, sorted.
+fn key_ids(keys: &Path) -> Vec<String> {
+    let mut ids: Vec<String> = std::fs::read_dir(keys.join("pub"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(".pub").map(str::to_owned)
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// G1.6qm: where the development signing key lives —
+/// `$COREROUTER_DEV_KEY_DIR`, or `~/.config/corerouter/dev-image-key/`,
+/// one key for every checkout and build directory of the user. It used to
+/// live in `<out>/keys/`: deleting a build directory to free disk took the
+/// key along, and every router updated from it refused the next package
+/// ("signed by key …, which this image does not trust"; the test notebook,
+/// 2026-11-21). A build directory that still has its own key hands it over
+/// the first time (copied, the old one stays). Without a home directory,
+/// `<out>/keys/` as before.
+pub fn dev_keys(root: &Path, out: &Path) -> Result<PathBuf, String> {
+    let shared = match std::env::var_os(DEV_KEY_ENV).filter(|v| !v.is_empty()) {
+        Some(d) => PathBuf::from(d),
+        None => match config_home(
+            std::env::var_os("XDG_CONFIG_HOME"),
+            std::env::var_os("HOME"),
+        ) {
+            Some(c) => c.join("corerouter/dev-image-key"),
+            None => return Ok(out.join("keys")),
+        },
+    };
+    let own = [out.join("keys"), root.join("os/out/keys")];
+    let with_key: Vec<PathBuf> = own.iter().filter(|d| has_key(d)).cloned().collect();
+    match key_plan(has_key(&shared), &with_key) {
+        KeyPlan::Migrate(from) => migrate(&from, &shared)?,
+        KeyPlan::Use => {
+            let ours = key_ids(&shared);
+            for d in &with_key {
+                let theirs = key_ids(d);
+                if !theirs.is_empty() && theirs != ours {
+                    eprintln!(
+                        "note: {} holds key {} and the packages are now signed with the shared \
+                         key {} ({}); a router updated from that directory refuses them until \
+                         it trusts the shared key (docs/os-image.md, \"A chave\")",
+                        d.display(),
+                        theirs.join(","),
+                        ours.join(","),
+                        shared.display()
+                    );
+                }
+            }
+        }
+    }
+    Ok(shared)
+}
+
+/// Copy `from` (`dev-image-key.pk8`, `pub/*.pub`) to `to` through a
+/// temporary directory renamed into place: two builds migrating at once
+/// end with one complete copy, never a mix.
+fn migrate(from: &Path, to: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let err = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    let parent = to
+        .parent()
+        .ok_or_else(|| format!("{}: no parent", to.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| err(parent, e))?;
+    let tmp = parent.join(format!(".dev-image-key.{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("pub")).map_err(|e| err(&tmp, e))?;
+    let private = 0o600;
+    for (dir, mode) in [(from.to_path_buf(), private), (from.join("pub"), 0o644)] {
+        let target = if dir == from {
+            tmp.clone()
+        } else {
+            tmp.join("pub")
+        };
+        for entry in std::fs::read_dir(&dir).map_err(|e| err(&dir, e))?.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let dst = target.join(entry.file_name());
+            std::fs::copy(&path, &dst).map_err(|e| err(&path, e))?;
+            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(mode))
+                .map_err(|e| err(&dst, e))?;
+        }
+    }
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| err(&tmp, e))?;
+    match std::fs::rename(&tmp, to) {
+        Ok(()) => {
+            eprintln!(
+                "note: development signing key {} moved to {} (from {}; G1.6qm)",
+                key_ids(to).join(","),
+                to.display(),
+                from.display()
+            );
+            Ok(())
+        }
+        // Another build got there first: keep its copy.
+        Err(_) if has_key(to) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            Err(err(to, e))
+        }
+    }
 }
 
 /// One `os build` per directory: an exclusive `flock` held until the
@@ -212,6 +341,69 @@ mod tests {
         assert_eq!(e.dir, root.join("rel"));
         let e = choose(root, Some("".into()), false, None);
         assert_eq!((e.source, e.dir), (Source::Checkout, root.join("os/out")));
+    }
+
+    #[test]
+    fn the_dev_key_is_shared_and_migrates_once() {
+        let a = PathBuf::from("/srv/build/os-out/a/keys");
+        let legacy = PathBuf::from("/w/os/out/keys");
+        // Nothing anywhere: the shared directory (the tool makes the key).
+        assert_eq!(key_plan(false, &[]), KeyPlan::Use);
+        // The shared key wins over a build directory's own.
+        assert_eq!(key_plan(true, std::slice::from_ref(&a)), KeyPlan::Use);
+        // No shared key yet: the build directory's is carried over, before
+        // the checkout's old os/out.
+        assert_eq!(key_plan(false, &[a.clone(), legacy]), KeyPlan::Migrate(a));
+    }
+
+    #[test]
+    fn config_home_follows_xdg() {
+        let home = Some(OsString::from("/home/u"));
+        assert_eq!(
+            config_home(None, home.clone()),
+            Some(PathBuf::from("/home/u/.config"))
+        );
+        assert_eq!(
+            config_home(Some("/x/cfg".into()), home.clone()),
+            Some(PathBuf::from("/x/cfg"))
+        );
+        // A relative XDG_CONFIG_HOME is ignored (XDG Base Directory spec).
+        assert_eq!(
+            config_home(Some("rel".into()), home),
+            Some(PathBuf::from("/home/u/.config"))
+        );
+        assert_eq!(config_home(None, None), None);
+        assert_eq!(config_home(None, Some("".into())), None);
+    }
+
+    #[test]
+    fn migration_copies_the_key_and_keeps_the_old_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = std::env::temp_dir().join(format!("g16qm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let out = t.join("out/keys");
+        std::fs::create_dir_all(out.join("pub")).unwrap();
+        std::fs::write(out.join("dev-image-key.pk8"), "secret").unwrap();
+        std::fs::write(out.join("pub/abcd.pub"), "pub").unwrap();
+        let shared = t.join("cfg/corerouter/dev-image-key");
+        migrate(&out, &shared).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(shared.join("dev-image-key.pk8")).unwrap(),
+            "secret"
+        );
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&shared.join("dev-image-key.pk8")), 0o600);
+        assert_eq!(mode(&shared), 0o700);
+        assert_eq!(key_ids(&shared), ["abcd"]);
+        assert!(has_key(&out), "the build directory keeps its copy");
+        // A second migration (another build that raced) keeps the first.
+        std::fs::write(out.join("dev-image-key.pk8"), "other").unwrap();
+        migrate(&out, &shared).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(shared.join("dev-image-key.pk8")).unwrap(),
+            "secret"
+        );
+        std::fs::remove_dir_all(&t).unwrap();
     }
 
     #[test]

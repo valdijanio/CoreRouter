@@ -13,8 +13,9 @@
 //!   boot entries) and `corerouter-init run <command>`.
 //!
 //! The private key: `--key <pkcs8>` or `$COREROUTER_IMAGE_KEY`; without
-//! either, a development key generated once in `<out>/keys/` (the build's
-//! directory, `os/out.rs`; never in git nor in the image). The image only
+//! either, a development key generated once in
+//! `~/.config/corerouter/dev-image-key/` (G1.6qm, `os/out.rs`: one for all
+//! checkouts and build directories; never in git nor in the image). The image only
 //! carries the public key.
 
 // `serde_json::Value` indexing (`v["slots"]`) gives `Null` for a missing
@@ -61,13 +62,12 @@ pub(super) fn run_tool(tool: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 /// The signing key and the public-key directory (`corerouter-image key`),
-/// under `top`, the build's directory.
+/// in `keys` (`out::dev_keys`).
 pub fn ensure_key(
-    top: &Path,
+    keys: &Path,
     tool: &Path,
     given: Option<&Path>,
 ) -> Result<(PathBuf, PathBuf), String> {
-    let keys = top.join("keys");
     let keys = keys.to_string_lossy().into_owned();
     let mut args = vec!["key", "--keys", keys.as_str()];
     let given = given.map(|g| g.to_string_lossy().into_owned());
@@ -105,8 +105,7 @@ fn package(
     let version = format!("{}{suffix}", m["version"].as_str().unwrap_or("0"));
     let build = (m["build"].as_u64().unwrap_or(0) + 1).to_string();
     let images = ctx.images.to_string_lossy().into_owned();
-    let keys = super::out_dir(&ctx.root)?
-        .join("keys")
+    let keys = super::out::dev_keys(&ctx.root, &super::out_dir(&ctx.root)?)?
         .to_string_lossy()
         .into_owned();
     let out_s = out.to_string_lossy().into_owned();

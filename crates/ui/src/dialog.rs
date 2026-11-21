@@ -36,6 +36,10 @@ pub(crate) enum Press<B> {
 pub(crate) struct Status {
     /// Last engine error, shown at the bottom like WinBox does.
     pub error: Option<String>,
+    /// What the last command applied with a warning (its reply's
+    /// `warnings`, G1.5d): above the error line, each with the amber
+    /// "warning" chip, until the next command is sent.
+    pub warnings: Vec<String>,
     /// Commands sent and not answered yet: OK, Apply and the dialog's own
     /// buttons do nothing meanwhile (never apply twice).
     pub waiting: usize,
@@ -61,6 +65,7 @@ impl Status {
     /// A command of this dialog is about to be sent.
     pub(crate) fn sent(&mut self) {
         self.error = None;
+        self.warnings.clear();
         self.waiting += 1;
     }
 
@@ -73,6 +78,39 @@ impl Status {
         }
         self.waiting == 0 && self.close_on_success && self.error.is_none()
     }
+
+    /// [`Self::replied`], and keep the reply's `warnings`: a dialog that
+    /// was to close stays open while there is one to read (OK again, with
+    /// nothing changed, closes it).
+    pub(crate) fn replied_warned(&mut self, result: &Result<Value, String>) -> bool {
+        let close = self.replied(result);
+        self.warn(warnings_of(result));
+        close && self.warnings.is_empty()
+    }
+
+    /// Show `warnings` (repeats dropped).
+    pub(crate) fn warn(&mut self, warnings: Vec<String>) {
+        for w in warnings {
+            if !self.warnings.contains(&w) {
+                self.warnings.push(w);
+            }
+        }
+    }
+}
+
+/// The `warnings` of a successful reply (`{…, warnings: [string]}`).
+pub(crate) fn warnings_of(result: &Result<Value, String>) -> Vec<String> {
+    result
+        .as_ref()
+        .ok()
+        .and_then(|v| v.get("warnings"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The buttons under the fields.
@@ -220,6 +258,7 @@ pub(crate) fn show<B>(
     status.focus_error = false;
     let busy = status.busy();
     let error = status.error.as_deref();
+    let warnings = status.warnings.as_slice();
     let mut open = true;
     let resizable = floats.resizable(head.id);
     let room_id = head.id.with("footer-room");
@@ -257,7 +296,7 @@ pub(crate) fn show<B>(
                 view = matches!(footer.buttons, Buttons::View);
                 can_ok = footer.ok.is_ok();
                 let top = ui.cursor().top();
-                let pressed = buttons(ui, footer, error, busy);
+                let pressed = buttons(ui, footer, warnings, error, busy);
                 if resizable {
                     let used = ui.min_rect().bottom() - top + ui.spacing().item_spacing.y;
                     ui.ctx().data_mut(|d| d.insert_temp(room_id, used));
@@ -292,9 +331,15 @@ pub(crate) fn show<B>(
     }
 }
 
-/// The error line and the button row. OK is the default button (Enter),
-/// drawn in the accent colour.
-fn buttons<B>(ui: &mut Ui, footer: Footer<B>, error: Option<&str>, busy: bool) -> Option<Press<B>> {
+/// The warnings, the error line and the button row. OK is the default
+/// button (Enter), drawn in the accent colour.
+fn buttons<B>(ui: &mut Ui, footer: Footer<B>, warnings: &[String], error: Option<&str>, busy: bool) -> Option<Press<B>> {
+    for w in warnings {
+        ui.horizontal_wrapped(|ui| {
+            crate::chip::chip(ui, "warning", crate::chip::AMBER.tone(ui.visuals()));
+            ui.label(w.as_str());
+        });
+    }
     if let Some(e) = error {
         ui.colored_label(ui.visuals().error_fg_color, e);
     }
