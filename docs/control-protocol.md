@@ -152,6 +152,23 @@ token: o mesmo usuário do sistema entra sem senha (grupo `full`), **outro usuá
 não consegue ler o arquivo e precisa logar** como qualquer um. O token local só vale no TCP de
 loopback e no `--ws` de loopback, nunca nos endpoints TLS.
 
+**Socket local (G0.11, Linux).** Ao lado do `127.0.0.1:<porta>`, o daemon e a GUI com
+`--control` servem `control-<porta>.sock` na mesma pasta (diretório 0700, socket 0600), com os
+mesmos métodos. O kernel diz quem conectou (`SO_PEERCRED`, que o cliente não forja): o usuário do
+sistema que roda o roteador e o root entram como o token local, **sem arquivo de token**. Qualquer
+outro uid é recusado na hora, antes de qualquer pedido, com o motivo, e não ocupa vaga, nem com
+login nem sem. A pasta e o modo já o barram; a checagem vale mesmo se alguém afrouxar os dois.
+No TCP de loopback todos os usuários da máquina dividem a origem `127.0.0.1`, e um usuário sem
+privilégio ocupava as 8 vagas sem login e atrasava a CLI, o MCP e a GUI do operador. No socket
+isso não acontece: até 32 conexões, 24 por uid. Pedido com token (login com `--user` pelo socket)
+age como o token diz; token inválido é recusado, não vira o usuário do sistema. CLI, MCP e GUI
+preferem o socket para um alvo de loopback e voltam ao TCP com o token se ele não existir ou não
+responder. Também conferem o uid de quem serve o socket (o próprio usuário ou root), então um
+socket deixado por outro usuário nunca é usado. `COREROUTER_NO_UNIX_SOCKET=1` força o TCP. O
+daemon apaga o socket ao sair. Um socket velho no caminho é substituído pelo roteador mais novo,
+como o arquivo de token, para os dois nomearem sempre o mesmo roteador. O caminho tem limite de
+107 bytes (`sun_path`): com uma pasta longa demais, o socket não é servido e o log diz por quê.
+
 **Tela de conexão da GUI (G0.3c).** Login vem preenchido com `admin`. Em `127.0.0.1`/`::1` a
 GUI nativa primeiro pergunta `server.info` sem credencial: sem o campo `auth` é um roteador
 anterior ao G0.3 (sem usuários nem login), e a tela diz "This router runs an old version
