@@ -24,7 +24,8 @@
 //!   other loopback still answers over OSPF;
 //! - G1.6zz: every control-plane process has the `oom_score_adj` init
 //!   gives it, and an OOM provoked on r2 kills the hog, never the daemon
-//!   nor FRR.
+//!   nor FRR; G1.6qj: the health check names the victim from the kernel
+//!   log.
 
 #![allow(clippy::indexing_slicing)]
 
@@ -550,6 +551,20 @@ fn oom(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), S
         ping.contains(" 0% packet loss"),
         format!("r2: ping 10.255.0.1 after the OOM: {ping}"),
     )?;
+    // G1.6qj: the OS Log read the kernel's line and the health check
+    // names the victim.
+    let h = until(vm, log, 30, "system.health.check", "{}", |v| {
+        v["result"]["checks"].as_array().is_some_and(|c| {
+            c.iter()
+                .any(|c| c["key"] == "oom" && c["reason"].as_str().is_some_and(|r| r.contains("tail (pid")))
+        })
+    })?;
+    let reason = h["result"]["checks"]
+        .as_array()
+        .and_then(|c| c.iter().find(|c| c["key"] == "oom"))
+        .map(|c| c["reason"].as_str().unwrap_or("").to_owned())
+        .unwrap_or_default();
+    nums.put("r2: health check after the OOM", reason);
     nums.put(
         "r2: OOM provoked (tail /dev/zero): killed",
         format!(
