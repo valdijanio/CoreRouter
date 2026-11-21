@@ -781,7 +781,7 @@ pub fn oom_kill(message: &str) -> Option<OomKill> {
     let fields = rest.get(end + 1..).unwrap_or("");
     let field = |name: &str| -> Option<&str> {
         fields
-            .split(|c: char| c == ' ' || c == ',')
+            .split([' ', ','])
             .find_map(|w| w.strip_prefix(name))
     };
     Some(OomKill {
