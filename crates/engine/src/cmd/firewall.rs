@@ -48,7 +48,7 @@ pub const MATCHERS: [&str; 19] = [
 ];
 
 /// Action parameters and the actions each one belongs to.
-const ACTION_FIELDS: [(&str, &[&str]); 12] = [
+pub(super) const ACTION_FIELDS: [(&str, &[&str]); 12] = [
     ("reject_with", &["reject"]),
     ("jump_target", &["jump"]),
     ("log_prefix", &["log"]),
