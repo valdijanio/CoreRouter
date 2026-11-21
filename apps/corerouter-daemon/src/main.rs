@@ -879,6 +879,12 @@ fn main() -> ExitCode {
     // The TLS endpoints never take the local token: it proves a local
     // OS user, which a remote peer is not.
     let remote_gate = Gate::default();
+    // G0.12: `user.lockout.list`/`clear` reach both gates' counters.
+    {
+        let mut s = lock(&session);
+        gate.attach(&mut s);
+        remote_gate.attach(&mut s);
+    }
     let ctx = service::Ctx {
         session: session.clone(),
         shutdown: shutdown.clone(),

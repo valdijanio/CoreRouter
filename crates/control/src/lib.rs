@@ -27,6 +27,7 @@ pub mod dispatch;
 pub mod fuzz;
 pub mod known_hosts;
 pub mod local_token;
+mod lockout;
 pub mod server;
 pub mod tasks;
 pub mod tls;
