@@ -81,7 +81,8 @@ da VM única: a G3.4z esperou a rodada do DNS, que segurava a VM havia 919 s (**
 - **Ferramentas:** a VM 2 criada com `--from 1` herda as do snapshot `tools` da 1. O que faltar
   aparece em `cargo xtask vm-lab --vm 2 tools --check`, e quem instala é o usuário
   (`cargo xtask vm-lab --vm 2 tools`). Em 2026-11-20 faltavam nas duas `qemu-system-x86`,
-  `unzip` e `traceroute` (só o interop com o CHR usa).
+  `unzip` e `traceroute` (só o interop com o CHR usa); com o pedido do usuário, as duas voltaram
+  ao `tools`, receberam os três e ganharam um `tools` novo (14 de 14, sem caches de build).
 
 ### CPUs por VM
 
