@@ -391,8 +391,8 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// Kernel links the platform says CoreRouter must not change (G1.18).
-pub(super) fn unmanaged(s: &mut Session) -> BTreeMap<IfName, String> {
-    s.hal_mut().unmanaged().into_iter().collect()
+pub(super) fn unmanaged(s: &mut Session) -> corerouter_hal::Unmanaged {
+    s.hal_mut().unmanaged()
 }
 
 /// Refuse when an interface named by `keys` in `p` (a name, a list, or a

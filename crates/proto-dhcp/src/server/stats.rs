@@ -183,6 +183,15 @@ impl Stats {
         }
     }
 
+    /// The wall clock stepped by `delta` seconds (G0.13).
+    pub fn shift(&mut self, delta: i64) {
+        for t in &mut self.acks_at {
+            *t = crate::shift_secs(*t, delta);
+        }
+        self.peak_at = crate::shift_secs(self.peak_at, delta);
+        self.since = crate::shift_secs(self.since, delta);
+    }
+
     pub fn sent(&mut self, k: Kind, now: u64) {
         if let Some(n) = self.sent.get_mut(slot(k)) {
             *n = n.saturating_add(1);

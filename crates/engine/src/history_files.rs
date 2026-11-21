@@ -56,8 +56,8 @@
 //! revision files of the slot's revision and the newer ones (the boot
 //! rebuilds them from the journal, from either slot, and ignores their
 //! files) wait for the save that next writes the slot, which writes them
-//! first, together (`ConfigStorage::save_revisions`: one `syncfs` on
-//! Linux). A commit was a revision file plus a line, two flushes; on the
+//! first, together (`ConfigStorage::save_revisions`: their fsyncs at
+//! once). A commit was a revision file plus a line, two flushes; on the
 //! phase C notebook's USB SSD that was ~29 ms of each command's ~40
 //! (**medido**: `ip.dns.set` p50 41 ms, `ip.dns.get` 12 ms).
 

@@ -592,6 +592,18 @@ impl Session {
         true
     }
 
+    /// The wall clock stepped by `step` seconds (G0.13): the bindings keep
+    /// the time they had left; the journal is rewritten at the next round.
+    pub(crate) fn dhcp6_clock_step(&mut self, step: i64) {
+        if let Some(rt) = self.ext_mut::<Dhcp6Runtime>() {
+            if let Some(core) = rt.core.as_mut() {
+                core.clock_step(step);
+            }
+            // Due now: the records on disk still have the old times.
+            rt.compacted_at = 0;
+        }
+    }
+
     fn dhcp6_compact(&mut self, now: Now) {
         let due = self.ext::<Dhcp6Runtime>().is_some_and(|r| {
             let records = r.core.as_ref().map_or(0, |c| c.leases().len() as u64);

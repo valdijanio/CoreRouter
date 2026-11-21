@@ -304,6 +304,22 @@ impl Leases {
             .filter_map(|(_, ip)| self.by_addr.get(&Ipv4Addr::from(*ip)))
     }
 
+    /// The wall clock stepped by `delta` seconds (G0.13): every end and
+    /// last-seen time moves with it, so a lease keeps the time it had left
+    /// (an NTP step ahead must not end them all, a step back must not
+    /// stretch them). O(n) once per step; the free index keeps its order.
+    pub fn shift(&mut self, delta: i64) {
+        self.free = self
+            .free
+            .iter()
+            .map(|(e, ip)| (crate::shift_secs(*e, delta), *ip))
+            .collect();
+        for l in self.by_addr.values_mut() {
+            l.expires = crate::shift_secs(l.expires, delta);
+            l.last_seen = crate::shift_secs(l.last_seen, delta);
+        }
+    }
+
     /// Insert or replace the record of `l.address`.
     pub fn put(&mut self, l: Lease) {
         let ip = l.address;

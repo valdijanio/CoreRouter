@@ -107,6 +107,42 @@ pub struct FileStorage {
 pub const SLOW_FLUSH: Duration = Duration::from_millis(100);
 const SLOW_LOG_EVERY: Duration = Duration::from_secs(10);
 
+/// How many fsyncs [`FileStorage::sync_files`] runs at once (G0.30n): 8
+/// and 16 measured the same, and a checkpoint writes at most 64 files.
+const SYNC_THREADS: usize = 16;
+
+/// `fsync` of every file of `paths`, [`SYNC_THREADS`] at a time, each
+/// thread one share of them; the first error, if any. A thread that cannot
+/// be started leaves its share to this one.
+fn sync_all_at_once(paths: &[PathBuf]) -> io::Result<()> {
+    fn sync(share: &[PathBuf]) -> io::Result<()> {
+        for p in share {
+            File::open(p)?.sync_all()?;
+        }
+        Ok(())
+    }
+    let per = paths.len().div_ceil(SYNC_THREADS).max(1);
+    std::thread::scope(|s| {
+        let mut started = Vec::new();
+        let mut here = Ok(());
+        for share in paths.chunks(per) {
+            match std::thread::Builder::new()
+                .name("config-fsync".into())
+                .spawn_scoped(s, move || sync(share))
+            {
+                Ok(t) => started.push(t),
+                Err(_) => here = here.and(sync(share)),
+            }
+        }
+        started.into_iter().fold(here, |first, t| {
+            let r = t
+                .join()
+                .unwrap_or_else(|_| Err(io::Error::other("a config-fsync thread panicked")));
+            first.and(r)
+        })
+    })
+}
+
 #[derive(Debug, Clone, Default)]
 struct SlowFlushes {
     told: Option<Instant>,
@@ -325,25 +361,22 @@ impl FileStorage {
         };
     }
 
-    /// G4.1zn: the files of `revs` durable together. Linux: one `syncfs`
-    /// of the config's filesystem (64 revision files on a disk with 15 ms
-    /// flushes: 1.8 s one fsync each, 37–69 ms with one syncfs, **medido**
-    /// in the VM over dm-delay). Elsewhere, one fsync each.
+    /// G4.1zn: the files of `revs` durable together: their fsyncs at
+    /// once, [`SYNC_THREADS`] at a time, so the filesystem joins them in
+    /// one journal commit instead of one flush after another (64 files on
+    /// a disk with 15 ms flushes took 1.8 s one after another, **medido**
+    /// in the VM over dm-delay).
+    ///
+    /// G0.30n: not a `syncfs`. It flushes the whole filesystem and waits
+    /// for what every other program wrote to it: a log, a graph store, a
+    /// package being downloaded, another build on a shared disk. 64 files
+    /// with another program leaving 2 GB to write on the same disk: syncfs
+    /// 10.7–32 s, these fsyncs 0.10–0.23 s; on a quiet disk 16–114 ms
+    /// against 68–112 ms (**medido**, NVMe ext4, 2026-11-21). The shutdown
+    /// checkpoint hung on it past the tests' 10 s.
     fn sync_files(&self, files: &[String]) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            let _ = files;
-            let d = File::open(&self.dir)?;
-            self.flush("syncfs", || rustix::fs::syncfs(&d).map_err(io::Error::from))
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            for f in files {
-                let file = File::open(self.path(f))?;
-                self.flush(f, || file.sync_all())?;
-            }
-            Ok(())
-        }
+        let paths: Vec<PathBuf> = files.iter().map(|f| self.path(f)).collect();
+        self.flush("the revision files", || sync_all_at_once(&paths))
     }
 }
 
@@ -545,8 +578,7 @@ impl ConfigStorage for FileStorage {
     /// them is written. A crash before that leaves files the slot on disk
     /// does not need (the revisions its journal still holds, which the boot
     /// ignores); the next checkpoint writes them again. One file: the
-    /// single path (a `syncfs` would also flush everything else on the
-    /// disk).
+    /// single path.
     fn save_revisions(&mut self, files: &[(u32, &str)]) -> Vec<Result<(), StorageError>> {
         if files.len() < 2 {
             return files
@@ -698,6 +730,40 @@ mod tests {
         let mut st = FileStorage::open(&d).unwrap();
         assert!(!d.join("checkpoint-c.json.tmp").exists());
         assert_eq!(st.list_checkpoints().unwrap(), ["before-lab"]);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// G0.30n: every file gets its fsync, in shares over the threads (1,
+    /// fewer than, as many as and more than [`SYNC_THREADS`] files), and a
+    /// file that is gone fails the whole call while the rest still run.
+    #[test]
+    fn the_revision_files_are_synced_at_once() {
+        let d = std::env::temp_dir().join(format!("storage-fs-sync-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let paths: Vec<PathBuf> = (0..SYNC_THREADS * 4 + 3)
+            .map(|i| {
+                let p = d.join(format!("f{i}"));
+                fs::write(&p, "x").unwrap();
+                p
+            })
+            .collect();
+        for n in [0, 1, SYNC_THREADS - 1, SYNC_THREADS, paths.len()] {
+            sync_all_at_once(&paths[..n]).unwrap();
+        }
+        let mut gone = paths.clone();
+        gone.insert(5, d.join("missing"));
+        let e = sync_all_at_once(&gone).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        // Through the storage: a checkpoint of many revisions.
+        let mut st = FileStorage::open(&d).unwrap();
+        let files: Vec<(u32, String)> = (0..40).map(|i| (i, format!("{{\"r\":{i}}}"))).collect();
+        let refs: Vec<(u32, &str)> = files.iter().map(|(n, s)| (*n, s.as_str())).collect();
+        assert!(st.save_revisions(&refs).iter().all(Result::is_ok));
+        assert_eq!(
+            fs::read_to_string(d.join(revision_file(39))).unwrap(),
+            "{\"r\":39}"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 

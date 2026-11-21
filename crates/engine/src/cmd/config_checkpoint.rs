@@ -22,6 +22,19 @@
 //! each restore or diff parses the whole file.
 //! Accounts are not in the config, so a restore never brings back an old
 //! password (as with `config.rollback`).
+//!
+//! G0.33b — automatic checkpoints. `config.checkpoint.add` without a name,
+//! an update (`system.package.update`, `downgrade`, `upload`, `download`),
+//! a large `ppp.secret.import` and a large `/import` of the terminal save
+//! `auto-<yyyymmdd>-<hhmmss>` (UTC) of the running config before they
+//! change anything, as Arista EOS saves one before `configure replace` and
+//! Cisco IOS-XE `archive` keeps a rotating set. The automatic ones rotate
+//! among themselves (the newest [`MAX_AUTO`]; the oldest goes when a new
+//! one is saved, or when the disk share needs its room) and never count
+//! toward the named ones' limit nor remove one: a name the operator gave
+//! stays until the operator removes it. The `auto-` prefix is theirs, so
+//! `config.checkpoint.add` refuses it as a name. A failed automatic save
+//! never stops the update: its result says why it was not saved.
 
 use std::collections::BTreeMap;
 
@@ -29,7 +42,7 @@ use corerouter_model::persist::{self, CheckpointInfo};
 use corerouter_model::Config;
 use serde_json::{Value, json};
 
-use super::args::{opt_bool, opt_text, req_str};
+use super::args::{opt_bool, opt_str, opt_text, req_str};
 use super::{CommandSpec, always};
 use crate::{CommitMode, EngineError, Result, Session};
 
@@ -37,18 +50,30 @@ use crate::{CommitMode, EngineError, Result, Session};
 /// each is a whole config on a `/config` that may be 56 MB.
 pub const MAX_CHECKPOINTS: usize = 16;
 
+/// Automatic checkpoints kept (G0.33b): the newest four, rotated among
+/// themselves (Cisco IOS-XE `archive maximum` goes up to 14; four updates
+/// back is past what an operator rolls back to, and each is a whole config).
+pub const MAX_AUTO: usize = 4;
+
+/// Names of the automatic checkpoints (reserved: `add` refuses them).
+pub const AUTO_PREFIX: &str = "auto-";
+
+/// Imported items from which a `ppp.secret.import` (or a terminal
+/// `/import`) is large enough to save an automatic checkpoint first.
+pub const LARGE_IMPORT: usize = 100;
+
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(
         "config.checkpoint.add",
         "Save Checkpoint",
         ["System", "History"],
         None,
-        "{name: string (letters, digits, - and _, up to 32), comment?: string} → {name, revision, bytes, pending}",
+        "{name?: string (letters, digits, - and _, up to 32; without it an automatic one, auto-<date>, kept among the newest 4 automatic ones), comment?: string} → {name, revision, bytes, pending, rotated: [string] (automatic ones removed to make room)}",
         always,
         add
     ),
     cmd!(query "config.checkpoint.list", "Checkpoints", ["System", "History"], None,
-        "{} → [{name, comment, revision, timestamp, bytes, error?}]",
+        "{} → [{name, comment, revision, timestamp, bytes, auto, in_config (always no: kept apart, not exported), error?}]",
         always, list),
     cmd!(query "config.checkpoint.diff", "Changes Since Checkpoint", ["System", "History"], None,
         "{name: string} → [{op: add|remove|change, path, value | from, to}]",
@@ -206,9 +231,32 @@ fn budget(s: &Session) -> usize {
     })
 }
 
+/// Whether `name` is one of the automatic checkpoints.
+pub fn is_auto(name: &str) -> bool {
+    name.starts_with(AUTO_PREFIX)
+}
+
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
-    let name = name_param(p)?;
     let comment = opt_text(p, "comment", 256)?.unwrap_or_default();
+    if opt_str(p, "name")?.is_none() {
+        return save_auto(s, &comment);
+    }
+    let name = name_param(p)?;
+    if is_auto(name) {
+        return Err(EngineError::bad(
+            "name",
+            format!(
+                "'{name}': names starting with {AUTO_PREFIX} are the automatic checkpoints \
+                 (config.checkpoint.add without a name saves one)"
+            ),
+        ));
+    }
+    let name = name.to_owned();
+    save(s, &name, comment)
+}
+
+/// Why a checkpoint cannot be saved now (Safe Mode, no storage).
+fn save_guard(s: &mut Session) -> Result<()> {
     if s.in_safe_mode() {
         return Err(EngineError::bad(
             "name",
@@ -219,6 +267,57 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(why) = s.storage_mut().unavailable() {
         return Err(EngineError::NotSaved(why));
     }
+    Ok(())
+}
+
+/// The running config as a checkpoint named `name`, encoded.
+fn encode(s: &Session, name: &str, comment: String) -> Result<(CheckpointInfo, String)> {
+    let info = CheckpointInfo {
+        name: name.to_owned(),
+        comment,
+        revision: s.store().current_revision(),
+        timestamp: s.now(),
+    };
+    let unencodable = |e: persist::PersistError| EngineError::Internal(format!("checkpoint: {e}"));
+    let config = persist::encode_config(s.store().running()).map_err(unencodable)?;
+    let text = persist::encode_checkpoint(&info, &config).map_err(unencodable)?;
+    Ok((info, text))
+}
+
+/// Writes checkpoint `name` and lists it.
+fn write(s: &mut Session, info: CheckpointInfo, text: &str) -> Result<()> {
+    s.storage_mut()
+        .save_checkpoint(&info.name, text)
+        .map_err(storage_error)?;
+    let bytes = text.len();
+    log::info!(
+        "checkpoint {} saved at revision {} ({bytes} bytes)",
+        info.name,
+        info.revision
+    );
+    entries(s)?.insert(
+        info.name.clone(),
+        Entry {
+            info,
+            bytes,
+            error: None,
+        },
+    );
+    Ok(())
+}
+
+fn too_big(name: &str, needs: usize, used: usize, cap: usize) -> EngineError {
+    EngineError::NotSaved(format!(
+        "checkpoint '{name}' needs {}, and the checkpoints already take {} of the {} \
+         they may use on /config: remove one first (config.checkpoint.list)",
+        crate::config_disk::mib(needs as u64),
+        crate::config_disk::mib(used as u64),
+        crate::config_disk::mib(cap as u64)
+    ))
+}
+
+fn save(s: &mut Session, name: &str, comment: String) -> Result<Value> {
+    save_guard(s)?;
     let list = entries(s)?;
     if list.contains_key(name) {
         return Err(EngineError::bad(
@@ -229,7 +328,7 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
             ),
         ));
     }
-    if list.len() >= MAX_CHECKPOINTS {
+    if list.keys().filter(|n| !is_auto(n)).count() >= MAX_CHECKPOINTS {
         return Err(EngineError::bad(
             "name",
             format!(
@@ -239,46 +338,119 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         ));
     }
     let used: usize = list.values().map(|e| e.bytes).sum();
-    let info = CheckpointInfo {
-        name: name.to_owned(),
-        comment,
-        revision: s.store().current_revision(),
-        timestamp: s.now(),
-    };
-    let unencodable = |e: persist::PersistError| EngineError::Internal(format!("checkpoint: {e}"));
-    let config = persist::encode_config(s.store().running()).map_err(unencodable)?;
-    let text = persist::encode_checkpoint(&info, &config).map_err(unencodable)?;
+    let (info, text) = encode(s, name, comment)?;
     let cap = budget(s);
     if used.saturating_add(text.len()) > cap {
-        return Err(EngineError::NotSaved(format!(
-            "checkpoint '{name}' needs {}, and the checkpoints already take {} of the {} \
-             they may use on /config: remove one first (config.checkpoint.list)",
-            crate::config_disk::mib(text.len() as u64),
-            crate::config_disk::mib(used as u64),
-            crate::config_disk::mib(cap as u64)
-        )));
+        return Err(too_big(name, text.len(), used, cap));
     }
-    s.storage_mut()
-        .save_checkpoint(name, &text)
-        .map_err(storage_error)?;
-    let bytes = text.len();
     let revision = info.revision;
-    entries(s)?.insert(
-        name.to_owned(),
-        Entry {
-            info,
-            bytes,
-            error: None,
-        },
-    );
-    log::info!("checkpoint {name} saved at revision {revision} ({bytes} bytes)");
+    write(s, info, &text)?;
     Ok(json!({
         "name": name,
         "revision": revision,
-        "bytes": bytes,
+        "bytes": text.len(),
         // Uncommitted changes are not in it: the checkpoint is the running config.
         "pending": s.store().is_dirty(),
+        "rotated": [],
     }))
+}
+
+/// `auto-<yyyymmdd>-<hhmmss>` (UTC) of `now`, or `auto-r<revision>`
+/// without a clock; `-2`, `-3`… when taken (two in one second).
+fn auto_name(s: &mut Session) -> Result<String> {
+    let base = match s.now() {
+        Some(t) => {
+            let t = i64::try_from(t).unwrap_or(i64::MAX);
+            let (y, m, d) = crate::x509::civil_day(t);
+            let secs = t.rem_euclid(86_400);
+            format!(
+                "{AUTO_PREFIX}{y:04}{m:02}{d:02}-{:02}{:02}{:02}",
+                secs / 3600,
+                secs / 60 % 60,
+                secs % 60
+            )
+        }
+        None => format!("{AUTO_PREFIX}r{}", s.store().current_revision()),
+    };
+    let list = entries(s)?;
+    if !list.contains_key(&base) {
+        return Ok(base);
+    }
+    (2..100)
+        .map(|i| format!("{base}-{i}"))
+        .find(|n| !list.contains_key(n) && persist::checkpoint_name_ok(n))
+        .ok_or_else(|| EngineError::NotSaved(format!("checkpoint {base}: no free name")))
+}
+
+/// G0.33b: an automatic checkpoint of the running config, `comment`
+/// saying what comes next. The oldest automatic ones go to keep
+/// [`MAX_AUTO`] and to fit the disk share; the named ones are never
+/// touched (a checkpoint that fits only without them is not saved).
+pub(crate) fn save_auto(s: &mut Session, comment: &str) -> Result<Value> {
+    save_guard(s)?;
+    let name = auto_name(s)?;
+    let comment: String = comment.chars().take(256).collect();
+    let (info, text) = encode(s, &name, comment)?;
+    let cap = budget(s);
+    let list = entries(s)?;
+    // Oldest first: by time, then revision (a clock that was not set).
+    let mut autos: Vec<(Option<u64>, u32, String, usize)> = list
+        .values()
+        .filter(|e| is_auto(&e.info.name))
+        .map(|e| (e.info.timestamp, e.info.revision, e.info.name.clone(), e.bytes))
+        .collect();
+    autos.sort();
+    let mut used: usize = list.values().map(|e| e.bytes).sum();
+    let mut rotated: Vec<String> = Vec::new();
+    for (_, _, old, bytes) in &autos {
+        let keep = autos.len().saturating_sub(rotated.len());
+        let over = keep >= MAX_AUTO || used.saturating_add(text.len()) > cap;
+        if !over {
+            break;
+        }
+        rotated.push(old.clone());
+        used = used.saturating_sub(*bytes);
+    }
+    if used.saturating_add(text.len()) > cap {
+        return Err(too_big(&name, text.len(), used, cap));
+    }
+    let revision = info.revision;
+    write(s, info, &text)?;
+    // The new one is in: the old ones go (a failure only leaves one more).
+    let mut gone = Vec::new();
+    for old in rotated {
+        match s.storage_mut().remove_checkpoint(&old) {
+            Ok(()) => {
+                entries(s)?.remove(&old);
+                gone.push(old);
+            }
+            Err(e) => log::warn!("automatic checkpoint {old} not rotated out: {e}"),
+        }
+    }
+    Ok(json!({
+        "name": name,
+        "revision": revision,
+        "bytes": text.len(),
+        "pending": s.store().is_dirty(),
+        "rotated": gone,
+    }))
+}
+
+/// [`save_auto`] for a command about to change the router (an update, a
+/// large import): never fails it, the answer says what was saved or why
+/// not (`{name, revision}` or `{error}`).
+pub(crate) fn before_change(s: &mut Session, what: &str) -> Value {
+    match save_auto(s, &format!("before {what}")) {
+        Ok(v) => json!({
+            "name": v.get("name"),
+            "revision": v.get("revision"),
+            "rotated": v.get("rotated"),
+        }),
+        Err(e) => {
+            log::warn!("no automatic checkpoint before {what}: {e}");
+            json!({ "error": e.to_string() })
+        }
+    }
 }
 
 fn list(s: &mut Session, _: &Value) -> Result<Value> {
@@ -293,6 +465,9 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
                     "revision": e.info.revision,
                     "timestamp": e.info.timestamp,
                     "bytes": e.bytes,
+                    "auto": is_auto(&e.info.name),
+                    // Not configuration: `/export` leaves it out.
+                    "in_config": false,
                 });
                 if let (Some(error), Some(o)) = (e.error, row.as_object_mut()) {
                     o.insert("error".into(), json!(error));
@@ -609,5 +784,104 @@ mod tests {
         let e = s.execute("config.checkpoint.add", &json!({"name": "a"})).unwrap_err();
         assert!(e.to_string().contains("not supported"), "{e}");
         assert_eq!(s.execute("config.checkpoint.list", &json!({})).unwrap(), json!([]));
+    }
+
+    fn autos(s: &mut Session) -> Vec<String> {
+        let list = s.execute("config.checkpoint.list", &json!({})).unwrap();
+        list.as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["auto"] == true)
+            .map(|r| r["name"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// G0.33b: the automatic ones rotate among themselves (the newest 4)
+    /// and never take a named one, nor count toward the named limit.
+    #[test]
+    fn automatic_checkpoints_rotate_among_themselves() {
+        let storage = MemoryStorage::default();
+        let mut s = boot(&storage);
+        s.safe_mode_mut().clock = Some(1_795_000_000); // 2026-11-18 11:06:40 UTC
+        s.execute("config.checkpoint.add", &json!({"name": "mine"})).unwrap();
+        let mut names = Vec::new();
+        for i in 0..6u64 {
+            rename(&mut s, &format!("r{i}"));
+            s.safe_mode_mut().clock = Some(1_795_000_000 + i);
+            let r = s.execute("config.checkpoint.add", &json!({"comment": format!("n{i}")})).unwrap();
+            names.push(r["name"].as_str().unwrap().to_owned());
+            if i >= 4 {
+                assert_eq!(r["rotated"], json!([names.get(i as usize - 4).unwrap()]), "{r}");
+            } else {
+                assert_eq!(r["rotated"], json!([]), "{r}");
+            }
+        }
+        assert_eq!(names.first().unwrap(), "auto-20261118-110640");
+        assert_eq!(autos(&mut s), names.get(2..).unwrap().to_vec());
+        assert!(storage.checkpoint("mine").is_some());
+        assert!(storage.checkpoint(names.first().unwrap()).is_none());
+        // Two in the same second do not collide.
+        s.safe_mode_mut().clock = Some(1_795_000_100);
+        let a = s.execute("config.checkpoint.add", &json!({})).unwrap();
+        let b = s.execute("config.checkpoint.add", &json!({})).unwrap();
+        assert_eq!(b["name"], format!("{}-2", a["name"].as_str().unwrap()));
+        assert_eq!(autos(&mut s).len(), super::MAX_AUTO);
+        // The named limit counts only the named ones.
+        for i in 1..super::MAX_CHECKPOINTS {
+            s.execute("config.checkpoint.add", &json!({"name": format!("c{i}")})).unwrap();
+        }
+        s.execute("config.checkpoint.add", &json!({"name": "more"})).unwrap_err();
+        s.execute("config.checkpoint.add", &json!({})).unwrap();
+        // An automatic one restores like any other, across a restart.
+        let last = autos(&mut s).last().unwrap().clone();
+        drop(s);
+        let mut s = boot(&storage);
+        rename(&mut s, "after");
+        s.execute("config.checkpoint.restore", &json!({"name": last})).unwrap();
+        assert_eq!(identity(&mut s), "r5");
+    }
+
+    #[test]
+    fn the_auto_prefix_is_reserved() {
+        let mut s = boot(&MemoryStorage::default());
+        let e = s.execute("config.checkpoint.add", &json!({"name": "auto-x"})).unwrap_err();
+        assert!(e.to_string().contains("automatic checkpoints"), "{e}");
+        // Without a clock: named by the revision.
+        let r = s.execute("config.checkpoint.add", &json!({})).unwrap();
+        assert_eq!(r["name"], format!("auto-r{}", s.store().current_revision()));
+        // Safe Mode: not saved (its changes are not kept yet).
+        s.execute("config.safe-mode.enter", &json!({})).unwrap();
+        let e = s.execute("config.checkpoint.add", &json!({})).unwrap_err();
+        assert!(e.to_string().contains("Safe Mode"), "{e}");
+    }
+
+    /// The disk share: older automatic ones go to make room, the named
+    /// ones never; with no room even then, nothing is saved nor removed.
+    #[test]
+    fn automatic_ones_make_room_but_never_take_a_named_one() {
+        let storage = MemoryStorage::default();
+        let mut s = boot(&storage);
+        s.safe_mode_mut().clock = Some(1_795_000_000);
+        let first = s.execute("config.checkpoint.add", &json!({})).unwrap();
+        let size = storage.checkpoint(first["name"].as_str().unwrap()).unwrap().len() as u64;
+        // A share that holds two and a half.
+        let capacity = size * 5 / 2 * 100 / crate::config_disk::CHECKPOINT_PERCENT;
+        s.set_config_capacity(Some(capacity));
+        s.safe_mode_mut().clock = Some(1_795_000_001);
+        let second = s.execute("config.checkpoint.add", &json!({})).unwrap();
+        assert_eq!(second["rotated"], json!([]));
+        s.safe_mode_mut().clock = Some(1_795_000_002);
+        let third = s.execute("config.checkpoint.add", &json!({})).unwrap();
+        assert_eq!(third["rotated"], json!([first["name"]]), "{third}");
+        // Two named ones fill the share: the automatic one cannot fit.
+        s.execute("config.checkpoint.remove", &json!({"name": second["name"]})).unwrap();
+        s.execute("config.checkpoint.remove", &json!({"name": third["name"]})).unwrap();
+        s.execute("config.checkpoint.add", &json!({"name": "a"})).unwrap();
+        s.execute("config.checkpoint.add", &json!({"name": "b"})).unwrap();
+        s.safe_mode_mut().clock = Some(1_795_000_003);
+        let e = s.execute("config.checkpoint.add", &json!({})).unwrap_err();
+        assert!(e.to_string().contains("remove one first"), "{e}");
+        assert!(storage.checkpoint("a").is_some() && storage.checkpoint("b").is_some());
+        assert!(autos(&mut s).is_empty());
     }
 }

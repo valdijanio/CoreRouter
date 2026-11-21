@@ -152,6 +152,23 @@ token: o mesmo usuário do sistema entra sem senha (grupo `full`), **outro usuá
 não consegue ler o arquivo e precisa logar** como qualquer um. O token local só vale no TCP de
 loopback e no `--ws` de loopback, nunca nos endpoints TLS.
 
+**Socket local (G0.11, Linux).** Ao lado do `127.0.0.1:<porta>`, o daemon e a GUI com
+`--control` servem `control-<porta>.sock` na mesma pasta (diretório 0700, socket 0600), com os
+mesmos métodos. O kernel diz quem conectou (`SO_PEERCRED`, que o cliente não forja): o usuário do
+sistema que roda o roteador e o root entram como o token local, **sem arquivo de token**. Qualquer
+outro uid é recusado na hora, antes de qualquer pedido, com o motivo, e não ocupa vaga, nem com
+login nem sem. A pasta e o modo já o barram; a checagem vale mesmo se alguém afrouxar os dois.
+No TCP de loopback todos os usuários da máquina dividem a origem `127.0.0.1`, e um usuário sem
+privilégio ocupava as 8 vagas sem login e atrasava a CLI, o MCP e a GUI do operador. No socket
+isso não acontece: até 32 conexões, 24 por uid. Pedido com token (login com `--user` pelo socket)
+age como o token diz; token inválido é recusado, não vira o usuário do sistema. CLI, MCP e GUI
+preferem o socket para um alvo de loopback e voltam ao TCP com o token se ele não existir ou não
+responder. Também conferem o uid de quem serve o socket (o próprio usuário ou root), então um
+socket deixado por outro usuário nunca é usado. `COREROUTER_NO_UNIX_SOCKET=1` força o TCP. O
+daemon apaga o socket ao sair. Um socket velho no caminho é substituído pelo roteador mais novo,
+como o arquivo de token, para os dois nomearem sempre o mesmo roteador. O caminho tem limite de
+107 bytes (`sun_path`): com uma pasta longa demais, o socket não é servido e o log diz por quê.
+
 **Tela de conexão da GUI (G0.3c).** Login vem preenchido com `admin`. Em `127.0.0.1`/`::1` a
 GUI nativa primeiro pergunta `server.info` sem credencial: sem o campo `auth` é um roteador
 anterior ao G0.3 (sem usuários nem login), e a tela diz "This router runs an old version
@@ -218,6 +235,35 @@ conexão é `corerouter_engine::safe_mode::NEEDS_OPEN_CONNECTION`. `state.inspec
 `safe_mode: {active, owner, yours, since, entry_revision, pending_revisions, timeout_secs,
 expires_in, last}` — `yours` é relativo à conexão que pergunta. A GUI com `--control` repassa
 cada cliente por uma conexão própria ao daemon, então o dono é esse cliente, não a janela.
+
+**Safe Mode destacado (G1.6qg).** É como o `commit confirmed N` do Junos e o
+`commit-confirm N` do VyOS: `config.safe-mode.enter {timeout_secs?, detach: true}` sobrevive à
+conexão que o abriu. Sem `timeout_secs`, o prazo é de 600 s, os 10 min dos dois. Ele só acaba
+de três jeitos:
+
+- no prazo, desfazendo as mudanças;
+- com `config.safe-mode.exit`, mantendo as mudanças;
+- com `config.safe-mode.cancel`, desfazendo na hora.
+
+Os três podem ser feitos pelo **mesmo usuário**, de qualquer conexão. Para o token local, todas
+as conexões contam como um usuário só. Os outros usuários precisam de `force: true`, como no
+Safe Mode comum. Entrar de novo com `detach: true` reinicia o prazo e mantém o ponto de entrada.
+Entrar de novo sem `detach` é recusado: a conexão nova viraria dona e desfaria tudo ao fechar.
+
+Por isso o `corerouter-cli run` aceita a entrada com `detach: true`:
+
+```sh
+corerouter-cli run config.safe-mode.enter '{"timeout_secs":300,"detach":true}'
+corerouter-cli run …                      # mudanças, uma conexão por comando
+corerouter-cli run config.safe-mode.exit  # mantém; sem isso, desfaz em 300 s
+```
+
+Enquanto ele roda, todo login recebe o aviso `safe_mode` no `auth.whoami`. A CLI e o MCP o
+imprimem com quem entrou, quantas mudanças estão pendentes e o tempo que falta. O log registra
+a entrada, o fechamento da conexão dona e o fim. O `state.inspect` traz ainda `detached`,
+`owner_user` e `owner_connected`. Se o daemon reiniciar no meio, ele sobe com a config da
+entrada, como no Safe Mode comum. Na GUI, o botão Safe Mode ganha "Detach: keep it 10 min after
+this window closes" no clique direito.
 
 ## Descoberta (CRDP)
 

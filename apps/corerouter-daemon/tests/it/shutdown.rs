@@ -132,6 +132,17 @@ fn goodbye_on(signal: &str) {
     thread::sleep(Duration::from_millis(1500));
     assert!(sees(&a, &b_name));
 
+    #[cfg(target_os = "linux")]
+    let sock = b
+        .control
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .and_then(corerouter_control::unix::path);
+    #[cfg(target_os = "linux")]
+    if let Some(sock) = &sock {
+        assert!(sock.exists(), "{} was never served", sock.display());
+    }
     let status = Command::new("kill")
         .args([&format!("-{signal}"), &b.child.id().to_string()])
         .status()
@@ -151,6 +162,15 @@ fn goodbye_on(signal: &str) {
         assert!(sent.elapsed() < Duration::from_secs(5), "B did not exit");
         thread::sleep(Duration::from_millis(20));
     };
+    // G0.11: the local socket goes with the process, as the token does.
+    #[cfg(target_os = "linux")]
+    if let Some(sock) = &sock {
+        assert!(
+            !sock.exists(),
+            "{} left behind after {signal}",
+            sock.display()
+        );
+    }
     let mut log = String::new();
     b.child
         .stderr

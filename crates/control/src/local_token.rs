@@ -71,7 +71,7 @@ pub fn create(port: u16, token: &str) -> io::Result<PathBuf> {
     Ok(file)
 }
 
-fn create_private_dir(dir: &std::path::Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(dir: &std::path::Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};

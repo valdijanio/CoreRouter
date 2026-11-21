@@ -11,6 +11,18 @@
 //! - a restart in the middle boots the entry config, because nothing was
 //!   saved since the entry (G0.6 storage still holds it).
 //!
+//! G1.6qg, detached Safe Mode (`detach: true`), as Junos `commit confirmed
+//! N` and VyOS `commit-confirm N`: it outlives the connection that entered
+//! it and is undone only when the timeout expires (default
+//! [`DEFAULT_DETACHED_SECS`], Junos' and VyOS' 10 minutes) unless someone
+//! confirms. For a script or a one-shot `corerouter-cli run`, whose
+//! connection closes after each command. Who may confirm, cancel or re-arm
+//! it: the same user (the same login name, or the local token) from any
+//! connection; anyone else with `force: true`, as for an attached one. Every
+//! login while it runs gets a warning with the time left (`auth.whoami`), and
+//! the log says when it was entered, when its connection closed and how it
+//! ended.
+//!
 //! The engine has no clock of its own (it compiles for wasm32): time comes
 //! from [`Hal::now_unix`](corerouter_hal::Hal::now_unix) or from
 //! [`Session::tick`], which the daemon calls every second. Expiry is checked
@@ -115,6 +127,16 @@ impl Default for Caller {
 /// and point to a persistent one (G1.6qf).
 pub const NEEDS_OPEN_CONNECTION: &[&str] = &["config.safe-mode.enter"];
 
+/// Whether `params` make a [`NEEDS_OPEN_CONNECTION`] command independent of
+/// its connection (G1.6qg: `config.safe-mode.enter {detach: true}`).
+pub fn detached(params: &Value) -> bool {
+    params.get("detach").and_then(Value::as_bool) == Some(true)
+}
+
+/// The timeout of a detached Safe Mode entered without one (Junos `commit
+/// confirmed` and VyOS `commit-confirm`: 10 minutes).
+pub const DEFAULT_DETACHED_SECS: u32 = 600;
+
 /// Bounds of `timeout_secs`: long enough to read the screen and confirm,
 /// short enough that a lost router comes back the same day.
 pub const MIN_TIMEOUT_SECS: u32 = 10;
@@ -129,6 +151,11 @@ pub(crate) struct Active {
     entry_revision: u32,
     since: Option<u64>,
     timeout_secs: Option<u32>,
+    /// G1.6qg: outlives its connection; ended by the same user or the
+    /// timeout.
+    detached: bool,
+    /// The owner's connection closed (a detached one goes on).
+    owner_gone: bool,
     /// On the wall clock (platforms without a monotonic one).
     deadline: Option<u64>,
     /// On the monotonic clock, when the platform has one: preferred.
@@ -136,6 +163,15 @@ pub(crate) struct Active {
 }
 
 impl Active {
+    /// Whether `caller` holds it: its connection, or for a detached one
+    /// the same user from any connection (the local token is one user).
+    fn held_by(&self, caller: &Caller) -> bool {
+        self.owner.id == caller.id
+            || (self.detached
+                && !matches!(caller.principal, Principal::Anonymous)
+                && caller.principal == self.owner.principal)
+    }
+
     /// Seconds left, or `None` without a timeout (or a clock).
     fn left(&self, now: Option<u64>, mono: Option<u64>) -> Option<u64> {
         match (self.mono_deadline, mono) {
@@ -198,12 +234,25 @@ impl Session {
     /// are undone (that is the whole point: the operator lost the router).
     pub fn hang_up(&mut self, caller_id: u64) {
         crate::mgmt_guard::gone(self, caller_id);
-        let owned = self
+        let (owned, detached) = self
             .safe_mode()
             .active
             .as_ref()
-            .is_some_and(|a| a.owner.id == caller_id);
-        if owned {
+            .filter(|a| a.owner.id == caller_id)
+            .map_or((false, false), |a| (true, a.detached));
+        if owned && detached {
+            // G1.6qg: that is what detached is for; said once in the log.
+            let left = self.safe_mode_left();
+            if let Some(a) = self.safe_mode_mut().active.as_mut() {
+                a.owner_gone = true;
+            }
+            let text = format!(
+                "Safe Mode (detached): the connection that entered it closed; the changes are undone {} unless config.safe-mode.exit confirms them",
+                left.map_or_else(|| "at the deadline".to_owned(), |l| format!("in {l} s"))
+            );
+            log::warn!("{text}");
+            self.log_event(&["system", "warning"], "safe-mode", text, json!({"detached": true, "expires_in": left}));
+        } else if owned {
             let reason = "the owner's connection closed";
             let result = self.undo_safe_mode(reason);
             self.record_automatic("config.safe-mode.cancel", reason, &result);
@@ -255,7 +304,35 @@ impl Session {
         }
     }
 
-    pub(crate) fn safe_mode_enter(&mut self, timeout_secs: Option<u32>) -> Result<Value> {
+    /// Seconds a timed Safe Mode has left.
+    fn safe_mode_left(&self) -> Option<u64> {
+        let now = self.now();
+        let mono = self.hal().monotonic_secs();
+        self.safe_mode().active.as_ref().and_then(|a| a.left(now, mono))
+    }
+
+    /// The warning every login gets while a detached Safe Mode runs
+    /// (G1.6qg): who, how long, how to keep the changes.
+    pub fn safe_mode_warning(&self) -> Option<String> {
+        let a = self.safe_mode().active.as_ref().filter(|a| a.detached)?;
+        let left = self.safe_mode_left();
+        Some(format!(
+            "WARNING: Safe Mode (detached) entered by {} ({}) at revision {}: {} change(s) are undone {} unless config.safe-mode.exit confirms them (the same user, or force: true).",
+            a.owner.principal.label(),
+            a.owner.name,
+            a.entry_revision,
+            self.store().current_revision().saturating_sub(a.entry_revision),
+            left.map_or_else(|| "at the deadline".to_owned(), |l| format!("in {l} s")),
+        ))
+    }
+
+    pub(crate) fn safe_mode_enter(&mut self, timeout_secs: Option<u32>, detach: bool) -> Result<Value> {
+        // G1.6qg: a detached one always has a deadline (nothing else would
+        // ever undo it).
+        let timeout_secs = match (timeout_secs, detach) {
+            (None, true) => Some(DEFAULT_DETACHED_SECS),
+            (t, _) => t,
+        };
         if let Some(t) = timeout_secs
             && !(MIN_TIMEOUT_SECS..=MAX_TIMEOUT_SECS).contains(&t)
         {
@@ -282,8 +359,14 @@ impl Session {
             .map(|(t, m)| m.saturating_add(u64::from(t)));
         let caller = self.caller().clone();
         if let Some(a) = self.safe_mode().active.as_ref() {
-            if a.owner.id != caller.id {
+            if !a.held_by(&caller) {
                 return Err(disabled("config.safe-mode.enter", held_by(a, now)));
+            }
+            if a.detached && !detach {
+                return Err(EngineError::bad(
+                    "detach",
+                    "this Safe Mode is detached (it outlives its connection); enter it again with detach: true to re-arm it, or confirm it (config.safe-mode.exit)",
+                ));
             }
         } else if self.store().is_dirty() {
             return Err(disabled(
@@ -298,11 +381,18 @@ impl Session {
         let entry = self.store().running().clone();
         let state = self.safe_mode_mut();
         match state.active.as_mut() {
-            // The owner again: re-arm the timeout, keep the entry point.
+            // The owner again: re-arm the timeout, keep the entry point. A
+            // detached one is now held by this connection too (the old one
+            // may be gone); an attached one may become detached.
             Some(a) => {
                 a.timeout_secs = timeout_secs;
                 a.deadline = deadline;
                 a.mono_deadline = mono_deadline;
+                if detach {
+                    a.detached = true;
+                    a.owner = caller;
+                    a.owner_gone = false;
+                }
             }
             None => {
                 state.active = Some(Active {
@@ -311,11 +401,21 @@ impl Session {
                     entry_revision,
                     since: now,
                     timeout_secs,
+                    detached: detach,
+                    owner_gone: false,
                     deadline,
                     mono_deadline,
                 });
                 log::info!("safe mode entered at revision {entry_revision}");
             }
+        }
+        if detach {
+            let text = format!(
+                "Safe Mode (detached) entered by {} at revision {entry_revision}: changes are undone in {} s unless config.safe-mode.exit confirms them",
+                self.caller().principal.label(),
+                timeout_secs.unwrap_or(DEFAULT_DETACHED_SECS)
+            );
+            self.log_event(&["system", "warning"], "safe-mode", text, json!({"detached": true, "timeout_secs": timeout_secs}));
         }
         Ok(self.safe_mode_summary())
     }
@@ -362,7 +462,10 @@ impl Session {
         json!({
             "active": true,
             "owner": a.owner.name,
-            "yours": a.owner.id == self.caller().id,
+            "yours": a.held_by(self.caller()),
+            "detached": a.detached,
+            "owner_user": a.owner.principal.label(),
+            "owner_connected": !a.owner_gone,
             "since": a.since,
             "entry_revision": a.entry_revision,
             "pending_revisions": self.store().current_revision().saturating_sub(a.entry_revision),
@@ -373,13 +476,13 @@ impl Session {
     }
 
     fn take_owned(&mut self, id: &str, force: bool) -> Result<Active> {
-        let caller_id = self.caller().id;
+        let caller = self.caller().clone();
         let now = self.now();
         let state = self.safe_mode_mut();
         let Some(a) = state.active.as_ref() else {
             return Err(disabled(id, "not in Safe Mode".into()));
         };
-        if a.owner.id != caller_id && !force {
+        if !a.held_by(&caller) && !force {
             return Err(disabled(
                 id,
                 format!("{}; pass force: true to end it from here", held_by(a, now)),
@@ -456,8 +559,13 @@ fn held_by(a: &Active, now: Option<u64>) -> String {
         (Some(s), None) => format!(" since {}", utc(s)),
         _ => String::new(),
     };
+    let kind = if a.detached {
+        format!(" (detached, user {}: it outlives its connection)", a.owner.principal.label())
+    } else {
+        String::new()
+    };
     format!(
-        "Safe Mode is held by {}{since}, entered at revision {}",
+        "Safe Mode is held by {}{kind}{since}, entered at revision {}",
         a.owner.name, a.entry_revision
     )
 }

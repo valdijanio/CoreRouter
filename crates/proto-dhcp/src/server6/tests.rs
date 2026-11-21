@@ -230,6 +230,29 @@ fn rapid_commit_renew_rebind_release() {
     assert_eq!(sent(&fx).unwrap().0.ia_pd[0].prefixes[0].prefix, p);
 }
 
+/// G0.13: a step of the wall clock (NTP) leaves each binding the time it
+/// had left; it still ends on time.
+#[test]
+fn a_clock_step_keeps_the_time_left() {
+    let gone = |fx: &[Effect6]| fx.iter().filter(|e| matches!(e, Effect6::Gone(_))).count();
+    for step in [1_700_000_000i64, -500, 30] {
+        let mut c = cfg();
+        c.ipv6.dhcp_server.servers[0].rapid_commit = true;
+        let mut lab = Lab::new(&c);
+        let fx = lab.send(ll(2), &out(msg::SOLICIT, 2, None, true, None, None));
+        let (rep, _, _) = sent(&fx).unwrap();
+        let valid = u64::from(rep.ia_na[0].addrs[0].valid);
+        lab.now.unix = crate::shift_secs(lab.now.unix, step);
+        lab.srv.clock_step(step);
+        lab.now.unix += 1;
+        assert_eq!(gone(&lab.srv.tick(lab.now)), 0, "step {step}");
+        lab.now.unix += valid - 2;
+        assert_eq!(gone(&lab.srv.tick(lab.now)), 0, "step {step}: early");
+        lab.now.unix += 1;
+        assert_eq!(gone(&lab.srv.tick(lab.now)), 2, "step {step}: late");
+    }
+}
+
 #[test]
 fn identifiers_confirm_information_and_decline() {
     let mut lab = Lab::new(&cfg());

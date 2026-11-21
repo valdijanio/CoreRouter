@@ -14,7 +14,7 @@ use super::args::{opt_bool, opt_parse, opt_str, opt_text, opt_u32, req_parse, re
 use super::{CommandSpec, always};
 use crate::dhcp_client::is_dynamic;
 use crate::lockout::{discard_for, plain_ends, take_force};
-use crate::route_table::{Changed, Line, Origin, RouteWatch, State};
+use crate::route_table::{Changed, Line, Origin, RouteWatch, Routes, State};
 use crate::validate::route_issues;
 use crate::{EngineError, Result, Session};
 
@@ -554,16 +554,15 @@ impl Drop for LargeSlot {
     }
 }
 
-fn large_slot(s: &mut Session, rows: usize) -> Result<Option<LargeSlot>> {
+fn large_slot(
+    slots: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    rows: usize,
+) -> Result<Option<LargeSlot>> {
     use std::sync::atomic::Ordering;
     if rows < LARGE_LIST {
         return Ok(None);
     }
-    let Some(l) = s.ext_mut::<LargeLists>() else {
-        return Ok(None);
-    };
-    let busy = l
-        .0
+    let busy = slots
         .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
         .is_err();
     if busy {
@@ -576,7 +575,7 @@ fn large_slot(s: &mut Session, rows: usize) -> Result<Option<LargeSlot>> {
             ),
         });
     }
-    Ok(Some(LargeSlot(l.0.clone())))
+    Ok(Some(LargeSlot(std::sync::Arc::clone(slots))))
 }
 
 fn list(s: &mut Session, p: &Value) -> Result<Value> {
@@ -594,28 +593,62 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
     // the neighbour table and the LDP bindings (G0.31b). The rows of
     // 60 000 routes are written after it is released, one at a time
     // (G0.31h).
-    let (lines, now) = s.watched_route_lines();
-    let slot = if lines.len() >= LARGE_LIST {
-        large_slot(s, lines.iter().filter(|l| keep(l)).count())?
-    } else {
-        None
+    // G0.31g: lines to build (a change since the last look) are built
+    // after it is released too, and the big-list check counts them then.
+    let (routes, now) = s.watched_routes();
+    let large = s.ext_mut::<LargeLists>().map(|l| std::sync::Arc::clone(&l.0));
+    let (lines, slot) = match routes {
+        Routes::Ready(lines, ..) => {
+            let slot = match large.as_ref() {
+                Some(slots) if lines.len() >= LARGE_LIST => {
+                    large_slot(slots, lines.iter().filter(|l| keep(l)).count())?
+                }
+                _ => None,
+            };
+            (Lines::Ready(lines), Some(slot))
+        }
+        Routes::Stale(job) => (Lines::Build(job), None),
     };
     let answer = ListAnswer {
+        garbage: Some(s.route_garbage()),
         lines,
+        large,
         keep: Box::new(keep),
         now,
         neigh: s.neigh_fresh(),
         changed: s.ext::<RouteWatch>().map(RouteWatch::changed),
         ldp: crate::mpls::ldp_state(s),
         refused: s.boot_refused("routes"),
-        _slot: slot,
+        slot,
     };
     s.defer_stream(answer)
 }
 
+/// The lines of a list: cached, or to build (G0.31g).
+enum Lines {
+    Ready(std::sync::Arc<Vec<Line>>),
+    Build(Box<crate::route_table::RouteJob>),
+}
+
+impl Lines {
+    /// The lines, built now if they were not.
+    fn built(&mut self) -> std::sync::Arc<Vec<Line>> {
+        let lines = match std::mem::replace(self, Lines::Ready(std::sync::Arc::default())) {
+            Lines::Ready(lines) => lines,
+            Lines::Build(job) => job.run().0,
+        };
+        *self = Lines::Ready(std::sync::Arc::clone(&lines));
+        lines
+    }
+}
+
 /// What `ip.route.list` needs to answer without the session (G0.31h).
 struct ListAnswer {
-    lines: std::sync::Arc<Vec<Line>>,
+    lines: Lines,
+    /// Tables the route cache let go of, freed once the answer starts.
+    garbage: Option<crate::route_table::RouteGarbage>,
+    /// The big lists' slots (G0.31h).
+    large: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     keep: Box<dyn Fn(&Line) -> bool + Send>,
     now: Option<u64>,
     neigh: crate::neigh_table::NeighShared,
@@ -623,17 +656,20 @@ struct ListAnswer {
     ldp: Option<std::sync::Arc<corerouter_model::mpls_state::LdpState>>,
     /// G1.3g: routes the kernel refused at boot, with why.
     refused: std::collections::HashMap<ItemId, String>,
-    _slot: Option<LargeSlot>,
+    /// The slot this list holds while it is written: taken under the lock
+    /// for cached lines (`Some`), in `prepare` for built ones (`None`).
+    slot: Option<Option<LargeSlot>>,
 }
 
 impl ListAnswer {
     /// Each row in order, to `f`.
-    fn each(&self, mut f: impl FnMut(Row<'_>) -> std::io::Result<()>) -> std::io::Result<()> {
+    fn each(mut self, mut f: impl FnMut(Row<'_>) -> std::io::Result<()>) -> std::io::Result<()> {
+        let lines = self.lines.built();
         // The neighbour table only for this pass: a slow reader must not
         // hold it while the rows go out.
         let unresolved: std::collections::HashSet<usize> = {
             let neigh = self.neigh.lock();
-            self.lines
+            lines
                 .iter()
                 .enumerate()
                 .filter(|(_, l)| (self.keep)(l) && incomplete(l, &neigh))
@@ -641,7 +677,7 @@ impl ListAnswer {
                 .collect()
         };
         let labels = crate::mpls::LdpLabels::new(self.ldp.as_deref());
-        for (i, l) in self.lines.iter().enumerate().filter(|(_, l)| (self.keep)(l)) {
+        for (i, l) in lines.iter().enumerate().filter(|(_, l)| (self.keep)(l)) {
             let mut r = Row::new(l, self.changed.as_ref(), self.now);
             if unresolved.contains(&i) {
                 r.gateway_status = Some("incomplete");
@@ -662,6 +698,27 @@ impl ListAnswer {
 }
 
 impl crate::off_lock::Streamed for ListAnswer {
+    /// Build the lines if they were stale, then take a big list's slot:
+    /// the count is exact (a filter that leaves a few routes is no big
+    /// list) and made without the session.
+    fn prepare(&mut self) -> Result<()> {
+        drop(self.garbage.take());
+        let lines = self.lines.built();
+        if self.slot.is_some() {
+            return Ok(());
+        }
+        let rows = if lines.len() < LARGE_LIST {
+            0
+        } else {
+            lines.iter().filter(|l| (self.keep)(l)).count()
+        };
+        self.slot = Some(match self.large.as_ref() {
+            Some(slots) => large_slot(slots, rows)?,
+            None => None,
+        });
+        Ok(())
+    }
+
     fn write(self: Box<Self>, w: &mut dyn std::io::Write) -> std::io::Result<()> {
         w.write_all(b"[")?;
         let mut first = true;

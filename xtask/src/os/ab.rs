@@ -780,10 +780,16 @@ fn scenario_update(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
     )?;
     // The router reboots as soon as the slot is written: the numbers come
     // back with the trial's state.
-    vm.ok(
+    let u = vm.ok(
         &mut log,
         "system.package.update",
         r#"{"path":"/dev/vdb","timeout":120}"#,
+    )?;
+    // G0.33b: the config before the update, kept as an automatic checkpoint.
+    let auto = u["checkpoint"]["name"].as_str().unwrap_or("").to_owned();
+    check(
+        auto.starts_with("auto-"),
+        format!("update without its checkpoint: {u}"),
     )?;
     vm.wait_exit(&mut log, 120)?;
     drop(vm);
@@ -825,6 +831,13 @@ fn scenario_update(ctx: &mut Ctx, n: &mut Numbers) -> Result<(), String> {
         v["running"] == "b" && v["last"]["result"] == "confirmed",
         format!("after confirm: {v}"),
     )?;
+    let list = vm.ok(&mut log, "config.checkpoint.list", "{}")?;
+    check(
+        list.as_array()
+            .is_some_and(|l| l.iter().any(|c| c["name"] == auto.as_str())),
+        format!("checkpoint {auto} not on slot B: {list}"),
+    )?;
+    n.put("automatic checkpoint before the update", auto.clone());
     let rr = &v["last"]["stats"];
     n.put(
         "write slot B (kernel + rootfs, streamed and hashed)",
