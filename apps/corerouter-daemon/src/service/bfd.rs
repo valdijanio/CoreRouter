@@ -197,11 +197,12 @@ fn run(session: &Shared, threads: Option<usize>, dp_path: Option<PathBuf>, healt
         while let Ok(m) = dp_rx.try_recv() {
             msgs.push(m);
         }
-        if !msgs.is_empty() {
+        if !msgs.is_empty() || !ctl.dp_waiting.is_empty() {
             let cfg = lock(session).store().running().clone();
             for m in msgs {
                 ctl.on_bfdd(m, &cfg, health);
             }
+            ctl.retry_waiting(&cfg, health);
         }
         // A simulated failure of the BNG pair silences its sessions now,
         // not at the next config pass.
@@ -275,6 +276,7 @@ fn dp_spec(cfg: &corerouter_model::Config, m: &corerouter_proto_bfd::dplane::DpS
     spec.cfg.detect_mult = m.detect_mult.max(1);
     spec.cfg.passive = m.passive();
     spec.cfg.admin_down = m.shutdown();
+    spec.resume_us = resume_us(&spec.cfg);
     // G3.9fj: bfdd's SESSION_CBIT (`bgpd`'s `bfd check-control-plane-failure`)
     // is not followed: this engine dies with the daemon while the kernel
     // keeps forwarding, so C = 1 would be a lie (RFC 5880 §6.8.7). Sending
@@ -352,7 +354,23 @@ struct Controller {
     sessions: BTreeMap<BfdKey, (u32, engine::Spec)>,
     /// bfdd's sessions by its discriminator, and what it last said of each.
     dp_sessions: BTreeMap<u32, (engine::Spec, corerouter_proto_bfd::dplane::DpSession)>,
+    /// G3.6n: bfdd's sessions the engine could not start yet (its ports
+    /// still held by bfdd's own sockets while it hands them over): tried
+    /// again every [`DP_TICK`].
+    dp_waiting: BTreeMap<u32, corerouter_proto_bfd::dplane::DpSession>,
     dp: Option<std::os::unix::net::UnixStream>,
+}
+
+/// G3.6n: how long a session bfdd hands over first listens, to be resumed
+/// Up (`Session::resume`): half the peer's Detection Time as it likely is
+/// (its Detect Mult × our transmit interval, RFC 5880 §6.8.4, with its
+/// multiplier taken as ours), so a peer that sends at our rate is heard at
+/// least once and the silence it sees stays under its Detection Time.
+/// Without FRR's fix of the software fallback (os/patches/frr/0008) bfdd
+/// takes the sessions down when we restart, and this only delays the first
+/// Down packet.
+fn resume_us(cfg: &corerouter_proto_bfd::session::Config) -> u64 {
+    (u64::from(cfg.desired_min_tx) * u64::from(cfg.detect_mult.max(1)) / 2).clamp(20_000, 1_500_000)
 }
 
 /// The BNG pair's BFD sessions (G3.6h): to the peer on the sync and the
@@ -380,6 +398,7 @@ fn spec_of(key: BfdKey, prof: &BfdProfile, users: Vec<String>) -> engine::Spec {
         min_ttl: prof.min_ttl,
         users,
         profile: prof.name.clone(),
+        resume_us: 0,
     }
 }
 
@@ -493,6 +512,18 @@ impl Controller {
         }
     }
 
+    /// G3.6n: the sessions waiting for the engine, again.
+    fn retry_waiting(&mut self, cfg: &corerouter_model::Config, health: &super::Health) {
+        let waiting = std::mem::take(&mut self.dp_waiting);
+        for (_, m) in waiting {
+            self.on_bfdd(
+                dplane::DpIn::Msg(corerouter_proto_bfd::dplane::FromBfdd::AddSession(m)),
+                cfg,
+                health,
+            );
+        }
+    }
+
     /// A message of bfdd (data plane mode).
     fn on_bfdd(&mut self, m: dplane::DpIn, cfg: &corerouter_model::Config, health: &super::Health) {
         use corerouter_proto_bfd::dplane as dp;
@@ -504,6 +535,7 @@ impl Controller {
             dplane::DpIn::Lost(why) => {
                 log::warn!("BFD: lost bfdd ({why}); its sessions stop until it is back");
                 self.dp = None;
+                self.dp_waiting.clear();
                 if let Some(eng) = self.engine.as_mut() {
                     for (lid, (spec, _)) in std::mem::take(&mut self.dp_sessions) {
                         eng.remove(lid, &spec.key);
@@ -524,6 +556,7 @@ impl Controller {
                     return;
                 }
                 if !self.ensure_engine(self.dp_sessions.len() + 1, health) {
+                    self.dp_waiting.insert(lid, m);
                     return;
                 }
                 let Some(eng) = self.engine.as_mut() else { return };
@@ -534,6 +567,7 @@ impl Controller {
                 }
             }
             dplane::DpIn::Msg(dp::FromBfdd::DeleteSession(m)) => {
+                self.dp_waiting.remove(&m.lid);
                 if let (Some((spec, _)), Some(eng)) = (self.dp_sessions.remove(&m.lid), self.engine.as_mut()) {
                     eng.remove(m.lid, &spec.key);
                 }

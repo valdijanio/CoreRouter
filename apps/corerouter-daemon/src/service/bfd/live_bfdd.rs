@@ -63,6 +63,7 @@ fn spec_from(local: Ipv4Addr, peer: Ipv4Addr, prof: &BfdProfile) -> Spec {
         min_ttl: prof.min_ttl,
         users: vec!["lab".into()],
         profile: prof.name.clone(),
+        resume_us: 0,
     }
 }
 

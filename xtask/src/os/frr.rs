@@ -453,6 +453,7 @@ pub fn frr_test(root: &Path, images: &Path, args: &[String]) -> Result<(), Strin
     );
     let res = verify(&mut r1, &mut log, &mut nums, 1, frr.as_deref(), t0)
         .and_then(|()| verify(&mut r2, &mut log, &mut nums, 2, frr.as_deref(), t0))
+        .and_then(|()| bfd_survives(&mut r1, &mut r2, &mut log, &mut nums))
         .and_then(|()| on_demand(&mut r1, &mut log, &mut nums))
         .and_then(|()| oom(&mut r2, &mut log, &mut nums));
     if let Err(e) = res {
@@ -492,6 +493,62 @@ pub fn frr_test(root: &Path, images: &Path, args: &[String]) -> Result<(), Strin
     for n in [1, 2] {
         let _ = std::fs::remove_file(work.join(format!("r{n}.qcow2")));
     }
+    Ok(())
+}
+
+/// r2's BFD session to r1: (state, state changes, local discriminator).
+fn bfd_of(vm: &mut Vm, log: &mut std::fs::File) -> Result<(String, u64, u64), String> {
+    let v = vm.run(log, "routing.bfd.session.list", "{}")?;
+    let s = &v["result"]["sessions"][0];
+    Ok((
+        s["state"].as_str().unwrap_or("?").to_owned(),
+        s["state_changes"].as_u64().unwrap_or(u64::MAX),
+        s["local_discr"].as_u64().unwrap_or(0),
+    ))
+}
+
+/// G3.6n: a `kill -9` of r1's daemon, the BFD engine bfdd hands its
+/// sessions to, does not take r2's session down: bfdd runs it in software
+/// while the daemon is gone (os/patches/frr/0008) and the restarted daemon
+/// takes it back Up (`Session::resume`). r2's session stays Up the whole
+/// time, with no state change, and r1's comes back with the same
+/// discriminator.
+fn bfd_survives(r1: &mut Vm, r2: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), String> {
+    let (state, changes, _) = bfd_of(r2, log)?;
+    check(state == "up", format!("r2: BFD {state} before the kill"))?;
+    let (_, _, discr) = bfd_of(r1, log)?;
+    let pid = sh(r1, log, "pidof corerouter-daemon")?;
+    let t0 = Instant::now();
+    sh(r1, log, "kill -9 $(pidof corerouter-daemon)")?;
+    let mut seen = Vec::new();
+    // Past the daemon's restart (the init's backoff) and its reconnection.
+    while t0.elapsed().as_secs() < 12 {
+        let (s, c, _) = bfd_of(r2, log)?;
+        seen.push(format!("{:.1}s {s}", t0.elapsed().as_secs_f64()));
+        check(
+            s == "up" && c == changes,
+            format!("r2: BFD went {s} after r1's daemon was killed ({} state changes): {seen:?}", c.saturating_sub(changes)),
+        )?;
+    }
+    let back = until(r1, log, 30, "routing.bfd.session.list", "{}", |v| {
+        v["result"]["sessions"][0]["state"] == "up"
+    })?;
+    let now = sh(r1, log, "pidof corerouter-daemon")?;
+    check(now != pid, format!("r1: the daemon was not restarted ({pid})"))?;
+    check(
+        back["result"]["sessions"][0]["local_discr"].as_u64() == Some(discr),
+        format!("r1: the session came back with another discriminator: {back}"),
+    )?;
+    let (s, c, _) = bfd_of(r2, log)?;
+    check(s == "up" && c == changes, format!("r2: BFD {s}, {c} changes after r1 took it back"))?;
+    let bfdd = sh(r1, log, "grep -ciE 'fallback|software' /var/log/frr-bfdd.log; echo")?;
+    nums.put(
+        "r1: kill -9 of corerouter-daemon (BFD by bfdd in software, then back)",
+        format!(
+            "r2's BFD session stayed up, 0 state changes in {:.0} s; r1's came back with discriminator {discr} ({bfdd})",
+            t0.elapsed().as_secs_f64()
+        ),
+    );
     Ok(())
 }
 

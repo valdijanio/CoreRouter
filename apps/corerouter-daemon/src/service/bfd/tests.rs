@@ -49,6 +49,7 @@ fn spec(peer: IpAddr, local: Option<IpAddr>, prof: &BfdProfile) -> Spec {
         min_ttl: prof.min_ttl,
         users: vec!["test".into()],
         profile: prof.name.clone(),
+        resume_us: 0,
     }
 }
 

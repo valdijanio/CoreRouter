@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CoreRouter <noreply@corerouter>
+Date: Sat, 21 Nov 2026 03:30:00 -0300
+Subject: [PATCH] bfdd: make the software fallback of a lost data plane work
+
+When a distributed data plane (--dplaneaddr) disconnects,
+_bfd_session_unregister_dplane() hands its sessions back to software
+("Fallback to software", bfd_session_enable()), keeping the state the
+data plane last reported. Two things keep that fallback from holding a
+session that was Up:
+
+- bfd_vrf_start_sockets() returns early whenever bg_use_dplane is set,
+  so the fallback never opens the listening sockets: bfdd receives
+  nothing and the Detection Time expires;
+- software never ran the session, so its timers are still the slow ones
+  of a new session (cur_timers and xmt_TO at 1 s): the first packet
+  leaves after 0.75-1 s, past the peer's Detection Time.
+
+Seen with a data plane that restarts (a kill -9 of it, or an upgrade),
+BFD 100 ms x 3, FRR 10.7.1: the neighbor's session went Down and bgpd
+took the BGP session down with a Cease/BFD Down (RFC 9384) while bgpd,
+zebra and the kernel's forwarding were untouched; the neighbor lost its
+routes 416-423 ms after the data plane died.
+
+Open the listening sockets while no data plane is attached (the session
+count that starts them in bfd_session_enable() and stops them in
+bfd_session_disable(), when the sessions move to a data plane that
+connects, already tracks the software sessions), and give a fallen back
+Up session the negotiated timers the data plane reported in its state
+changes (RFC 5880, sections 6.8.3, 6.8.4 and 6.8.7), sending one packet
+at once.
+
+Signed-off-by: CoreRouter <noreply@corerouter>
+---
+ bfdd/bfd.c    |  8 ++++++--
+ bfdd/dplane.c | 22 ++++++++++++++++++++++
+ 2 files changed, 28 insertions(+), 2 deletions(-)
+
+--- a/bfdd/bfd.c
++++ b/bfdd/bfd.c
+@@ -2913,8 +2913,12 @@
+  */
+ int bfd_vrf_start_sockets(struct bfd_vrf_global *bvrf)
+ {
+-	/* Don't open sockets when using data plane. */
+-	if (bglobal.bg_use_dplane)
++	/*
++	 * Don't open sockets while a data plane runs the sessions. Without one
++	 * (it disconnected, or has not connected yet) the sessions fall back to
++	 * software (_bfd_session_unregister_dplane()), which must receive.
++	 */
++	if (bglobal.bg_use_dplane && !TAILQ_EMPTY(&bglobal.bg_dplaneq))
+ 		return 0;
+ 
+ 	if (!bfd_vrf_is_perm(bvrf->vrf->name))
+--- a/bfdd/dplane.c
++++ b/bfdd/dplane.c
+@@ -677,6 +677,28 @@
+ 
+ 	/* Fallback to software. */
+ 	bfd_session_enable(bs);
++
++	/*
++	 * A session the data plane had Up goes on Up: software never ran it, so
++	 * its timers are still the slow ones of a new session (RFC 5880, Section
++	 * 6.8.3), and the first packet would leave after up to a second, past
++	 * the peer's Detection Time. Use the negotiated timers the data plane
++	 * reported (the state change message) and send at once.
++	 */
++	if (bs->ses_state == PTM_BFD_UP && bs->sock != -1) {
++		bs->cur_timers.desired_min_tx = bs->timers.desired_min_tx;
++		bs->cur_timers.required_min_rx = bs->timers.required_min_rx;
++		bs->xmt_TO = MAX(bs->timers.desired_min_tx,
++				 bs->remote_timers.required_min_rx);
++		bs->detect_TO = (uint64_t)(bs->remote_detect_mult
++						   ? bs->remote_detect_mult
++						   : bs->detect_mult) *
++				MAX(bs->cur_timers.required_min_rx,
++				    bs->remote_timers.desired_min_tx);
++		bfd_recvtimer_update(bs);
++		ptm_bfd_snd(bs, 0);
++		ptm_bfd_start_xmt_timer(bs, false);
++	}
+ }
+ 
+ static void bfd_dplane_ctx_free(struct bfd_dplane_ctx *bdc)
+-- 
+2.43.0
+
