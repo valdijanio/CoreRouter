@@ -39,7 +39,7 @@ outros usam a VM 1, como antes.
 | `sync` | `rsync` da worktree para `/srv/lab/<worktree>/src` (sem `target*`, `.git`, `.claude/`, `vm/`, `plan/`; o app copia o `.claude/` para cada worktree, com o que estiver estacionado lá). |
 | `put <arquivo…>` | Copia arquivos do host para `/srv/lab/inbox/` na VM (uma captura, um arquivo de config). |
 | `tools [--check]` | Instala as ferramentas de terceiros declaradas em `xtask/src/vm_tools.rs` que faltam, imprime o que está instalado e tira o snapshot `tools`; `--check` só confere e diz o que falta. Idempotente. Veja "Ferramentas de terceiros". |
-| `run [--perf] [--vm N] [--no-sync] [--shared] [--lock-timeout 30m] -- <cmd…>` | Escolhe a VM (veja "Duas VMs": `--perf` é a 1; sem `--vm`, a livre, a 2 primeiro) e diz qual na primeira linha. Confere a saúde da VM (root, processos novos, disco > 2 GiB e memória > 1 GiB livres; o que faz quando falha está em "Saúde da VM: reiniciar ou esperar": disco curto apaga os `target` que nenhuma rodada usa, e o `reset` sozinho só acontece sem outra rodada na VM), `sync`, pega a trava `/run/corerouter-lab.lock` (uma rodada por vez; `--shared` pula, só para compilar) e roda o comando **como root** em `/srv/lab/<worktree>/src`, com `CARGO_TARGET_DIR=/srv/lab/<worktree>/target`; saída ao vivo, código de saída repassado, tempo da rodada no fim. Um argumento só é uma linha de shell (`run -- 'a && b'`); vários são citados um a um. Espera a trava até `--lock-timeout` (ou `$COREROUTER_VM_LOCK_TIMEOUT`; padrão 30 min; `900`, `90s`, `30m`, `1h`) e então falha com código 75 dizendo quem a segura; o prazo vale só para a espera, nunca para a rodada. No fim avisa dos processos que o comando deixou vivos na VM. Uma rodada por worktree: se já há uma rodada da mesma worktree esperando ou rodando na VM, o `run` recusa antes do `sync` (ele sobrescreveria o código dela em `src`); `--no-sync` roda sobre o código que está lá. |
+| `run [--perf [--no-quiet]] [--vm N] [--no-sync] [--shared] [--lock-timeout 30m] -- <cmd…>` | Escolhe a VM (veja "Duas VMs": `--perf` é a 1; sem `--vm`, a livre, a 2 primeiro) e diz qual na primeira linha. Com `--perf`, tira das CPUs da VM 1 os processos deste usuário no host enquanto a rodada segura a trava ("Medição silenciosa"). Confere a saúde da VM (root, processos novos, disco > 2 GiB e memória > 1 GiB livres; o que faz quando falha está em "Saúde da VM: reiniciar ou esperar": disco curto apaga os `target` que nenhuma rodada usa, e o `reset` sozinho só acontece sem outra rodada na VM), `sync`, pega a trava `/run/corerouter-lab.lock` (uma rodada por vez; `--shared` pula, só para compilar) e roda o comando **como root** em `/srv/lab/<worktree>/src`, com `CARGO_TARGET_DIR=/srv/lab/<worktree>/target`; saída ao vivo, código de saída repassado, tempo da rodada no fim. Um argumento só é uma linha de shell (`run -- 'a && b'`); vários são citados um a um. Espera a trava até `--lock-timeout` (ou `$COREROUTER_VM_LOCK_TIMEOUT`; padrão 30 min; `900`, `90s`, `30m`, `1h`) e então falha com código 75 dizendo quem a segura; o prazo vale só para a espera, nunca para a rodada. No fim avisa dos processos que o comando deixou vivos na VM. Uma rodada por worktree: se já há uma rodada da mesma worktree esperando ou rodando na VM, o `run` recusa antes do `sync` (ele sobrescreveria o código dela em `src`); `--no-sync` roda sobre o código que está lá. |
 | `pick [--perf]` | Imprime o número da VM que um `run` pegaria agora. Para roteiro que faz `put` ou `ssh` antes do `run`: `export COREROUTER_VM_LAB=${COREROUTER_VM_LAB:-$(cargo xtask vm-lab pick)}`, e os três passos vão para a mesma VM. |
 | `pin [--vm 1\|2\|ci] [--force]` | Aplica o mapa de CPUs ("CPUs por VM") com `virsh vcpupin/emulatorpin --live --config`: vale na hora e fica na definição, sem reiniciar. Sem `--vm`: as duas VMs do laboratório e o runner do CI. VM do laboratório com rodada é pulada (diz quando tentar de novo), salvo `--force`. |
 | `unlock [--force]` | Sem `--vm`, nas duas VMs. Mostra a trava: dono (worktree, PID do `run` no host, round), há quanto tempo, e os processos que a seguram, esperam por ela ou sobraram de rodadas. Com `--force`, encerra (TERM, KILL depois de 5 s) os processos de rodadas cujo `vm-lab run` já não existe no host, o que solta a trava. Nunca mexe numa rodada viva nem em quem só espera. |
@@ -102,9 +102,63 @@ está em `VMS` e `CI_VCPU_CPUS` (`xtask/src/vm_lab.rs`; teste `the_measurement_v
 entra no XML do `create` (das duas VMs e do `ci-runner create`) e o `vm-lab pin` o aplica ao vivo
 numa VM que já existe. O `status` mostra o mapa de cada VM e se ele confere.
 
-**O que o mapa não isola:** os processos do próprio host (os `cargo` das sessões, o app) podem
-rodar nas CPUs 8–15 e 24–31. Isolar de verdade pede `AllowedCPUs` no `user.slice` do systemd, uma
-configuração do sistema que fica para o usuário decidir (gap no `docs/changes/G0.26c.md`).
+**O que o mapa não isola sozinho:** os processos do próprio host (os `cargo` das sessões, o app)
+podem rodar nas CPUs 8–15 e 24–31. Para a medição, o `run --perf` os tira de lá enquanto mede
+("Medição silenciosa", abaixo).
+
+### Medição silenciosa (G0.26d)
+
+Enquanto uma rodada `run --perf` segura a trava da VM 1, os processos **deste usuário** no host
+saem das CPUs da VM 1 (8–15 e 24–31) e voltam no fim. Não precisa de root: um usuário pode mudar a
+afinidade de CPU dos próprios processos (`taskset`, do util-linux), e nada da configuração do
+sistema muda. Foi a opção escolhida pelo usuário em 2026-11-20, no lugar de `AllowedCPUs` no
+`user.slice`, que exigiria root e deixaria as compilações do host com metade das CPUs o tempo
+todo.
+
+- **Quando:** só numa rodada `--perf` exclusiva na VM 1, e só depois de ela pegar a trava. A
+  espera pela trava e uma compilação com `--shared --perf` não mexem em nada. `--no-quiet` (ou
+  `$COREROUTER_VM_QUIET=0`) mede sem isso.
+- **Como** (`xtask/src/vm_lab/quiet.rs`):
+  1. o script da rodada imprime `vm-lab: quiet: lock taken` quando pega a trava; o host lê o
+     stderr da rodada, faz a primeira varredura (0,2–1,2 s para ~300 processos, **medido**) e
+     cria `/run/corerouter-lab.quiet.<round>` na VM;
+  2. a rodada só começa o comando depois desse arquivo (no máximo 15 s);
+  3. uma thread (`vm-lab-quiet`) varre o `/proc` a cada 2 s e tira das CPUs da VM 1 cada
+     processo deste usuário que ainda esteja nelas (`taskset -a -p -c`, todas as threads). Os
+     filhos de um processo já movido herdam a máscara;
+  4. no fim, cada processo movido recebe de volta a máscara que tinha. Quem nasceu durante a
+     rodada com exatamente a máscara reduzida ganha todas as CPUs. Quem mudou de máscara no meio
+     tempo fica como está.
+- **Se o `run` morrer** (Ctrl-C, `kill -9`): o estado fica em `vm/quiet.state` (dono, CPUs e a
+  máscara original de cada processo, com o instante de início, para um PID reaproveitado não
+  passar por outro). O próximo comando `vm-lab` qualquer devolve tudo, se o dono já não existe,
+  e diz quantos devolveu. Conferido com `kill -9` no meio de uma rodada: o `status` seguinte
+  devolveu 310 processos e nenhum ficou na máscara reduzida (**medido**).
+- **O `status`** mostra a linha `quiet:` enquanto uma rodada mantém processos fora.
+- **O que não sai:** processos de outros usuários e do root (serviços, threads do kernel; num
+  2026-11-20 havia uma thread do ClickHouse do usuário `clickhouse` no CCD1) e as outras VMs (já
+  fora pelo mapa).
+
+Medição (2026-11-20, **medido**, carga do `### Medição` acima, 15 repetições por bloco):
+
+| host | `--perf` | blocos | mediana de cada bloco | CV dentro do bloco | pior |
+|---|---|---|---|---|---|
+| sem os laços (carga 4–19) | silencioso | 2 | 826, 864 ms | 1,5–2,6 % | 950 ms |
+| sem os laços (carga 4–19) | `--no-quiet` | 2 | 838, 902 ms | 0,9–7,5 % | 1056 ms |
+| 32 laços ocupados + sessões (carga 19 → 64) | silencioso | 3 | 881, 901, 951 ms | 3,5–8,6 % | 1167 ms |
+| idem | `--no-quiet` | 3 | 2155, 2622, 2695 ms | 7,0–16,3 % | 3094 ms |
+
+- **Sob carga, a medição silenciosa fica 2,9× mais rápida e com metade da variação**, a ~5–10 % do
+  host sem os laços.
+- **A sobra não é tempo de CPU.** Numa rodada silenciosa sob carga 65–83 (com o runner do CI
+  ocupado), o `/proc/stat` mostrou as CPUs 8–15 com 99 % de tempo de convidado e as irmãs 24–31
+  com 93 % ociosas (**medido**): nada mais roda ali. Os +15–25 % e os 4–9 % de variação que
+  sobram vêm do que os dois CCDs dividem (controlador de memória, interconexão, orçamento de
+  energia do pacote). Uma carga que cabe no L3 (16 MiB) deu o mesmo (CV 4–5 %), então não é só
+  banda de memória. Afinidade não resolve isso.
+- **Para comparar antes/depois de um PR:** meça os dois lados com o host em carga parecida (blocos
+  intercalados) e, para caminho quente, conte instruções (`perf stat -e instructions:u`), que não
+  dependem do clock nem da memória.
 
 ### Medição (2026-11-20, **medido**)
 

@@ -21,10 +21,14 @@ use sha2::{Digest, Sha256};
 use crate::Outcome;
 use crate::vm_tools::{self, Source, TOOLS};
 
+mod quiet;
+
 const URI: &str = "qemu:///system";
 const IMAGE: &str = "noble-server-cloudimg-amd64.img";
 const IMAGE_URL: &str = "https://cloud-images.ubuntu.com/noble/current/";
 const MAX_WIRES: u32 = 4;
+/// `0` turns off the quieting of `run --perf` (G0.26d), like `--no-quiet`.
+const QUIET_VAR: &str = "COREROUTER_VM_QUIET";
 /// Picks the VM for every subcommand (`1`, `2`, `lab`, `lab2` or the full
 /// name), like `--vm`; `--vm` wins.
 const VM_VAR: &str = "COREROUTER_VM_LAB";
@@ -129,6 +133,14 @@ impl Vm {
     fn cputune(&self, cpus: u32) -> String {
         cputune_xml(cpus, self.vcpu_cpus, self.emulator_cpus)
     }
+}
+
+/// The host CPUs of `vm` (its vCPUs and QEMU's threads): what a quiet
+/// measurement keeps free of the host's processes (G0.26d).
+fn measurement_cpus(vm: &Vm) -> std::collections::BTreeSet<u32> {
+    let mut set: std::collections::BTreeSet<u32> = vm.vcpu_cpus.iter().copied().collect();
+    set.extend(quiet::parse_cpus(vm.emulator_cpus).unwrap_or_default());
+    set
 }
 
 /// `<cputune>`: vCPU i on `vcpu_cpus[i % len]`, QEMU's threads on `emulator`.
@@ -254,8 +266,11 @@ const HELP: &str = "usage: cargo xtask vm-lab [--vm 1|2] <subcommand>
   sync              rsync this worktree to /srv/lab/<worktree>/src (no target*, .git)
   put <file...>     copy host files into /srv/lab/inbox/ (a .deb, a capture)
   status            state, CPU map, address, who holds the VM lock and for how long
-  run [--perf] [--vm N] [--no-sync] [--shared] [--lock-timeout 30m] -- <cmd...>
-                    --perf: a measurement, on VM 1; else the free VM (VM 2 first).
+  run [--perf [--no-quiet]] [--vm N] [--no-sync] [--shared] [--lock-timeout 30m] -- <cmd...>
+                    --perf: a measurement, on VM 1; else the free VM (VM 2 first). While a
+                    --perf round holds the lock, this user's host processes leave VM 1's
+                    CPUs (8-15, 24-31) and get them back at the end (--no-quiet, or
+                    $COREROUTER_VM_QUIET=0, does not).
                     health check (short disk: drop the build caches no round uses; broken:
                     reset to `tools`/`clean`, but only with no other round in the VM, else
                     wait and check again within --lock-timeout), sync, then run
@@ -328,6 +343,8 @@ fn dispatch(root: &Path, args: &[String]) -> Result<(), String> {
         None => ("", &[][..]),
     };
     let dir = vm_dir(root)?;
+    // A `run --perf` killed while quieting left the host's CPUs narrowed.
+    quiet::recover(&dir);
     let lab = |vm: Vm| Lab {
         root: root.to_path_buf(),
         dir: dir.clone(),
@@ -670,6 +687,9 @@ struct RunOpts {
     vm: Option<Vm>,
     /// `--perf`: a measurement, VM 1.
     perf: bool,
+    /// `--perf` quiets VM 1's host CPUs during the round (G0.26d);
+    /// `--no-quiet` or `$COREROUTER_VM_QUIET=0` does not.
+    quiet: bool,
 }
 
 /// `run`'s options, then the command. `env_timeout`: `$COREROUTER_VM_LOCK_TIMEOUT`.
@@ -683,6 +703,7 @@ fn parse_run(args: &[String], env_timeout: Option<&str>) -> Result<(RunOpts, Vec
         },
         vm: None,
         perf: false,
+        quiet: true,
     };
     let mut rest = args;
     while let Some((first, tail)) = rest.split_first() {
@@ -694,6 +715,7 @@ fn parse_run(args: &[String], env_timeout: Option<&str>) -> Result<(RunOpts, Vec
             "--no-sync" => o.sync = false,
             "--shared" => o.exclusive = false,
             "--perf" => o.perf = true,
+            "--no-quiet" => o.quiet = false,
             "--lock-timeout" => {
                 let (v, t) = value("--lock-timeout (30m, 900, 1h)")?;
                 o.timeout_s = parse_duration(v).map_err(|e| format!("--lock-timeout: {e}"))?;
@@ -1546,6 +1568,17 @@ impl Lab {
             return Ok(());
         };
         println!("{vm}: {state}");
+        if self.vm.num == 1
+            && let Ok(text) = std::fs::read_to_string(self.shared(quiet::STATE))
+            && let Some(q) = quiet::State::parse(&text)
+        {
+            println!(
+                "quiet: round {} keeps {} host process(es) off CPUs {} (G0.26d)",
+                q.owner,
+                q.moved.len(),
+                quiet::format_cpus(&q.avoid)
+            );
+        }
         let live = if state == "running" {
             "--live"
         } else {
@@ -1931,6 +1964,9 @@ impl Lab {
     fn run(&self, opts: &RunOpts, rest: &[String]) -> Result<(), String> {
         let vm = self.vm.name;
         let (sync, exclusive, timeout) = (opts.sync, opts.exclusive, opts.timeout_s);
+        let quiet_off = std::env::var(QUIET_VAR).is_ok_and(|v| v.trim() == "0");
+        // Only a measurement that holds VM 1 (not a `--shared` build).
+        let quieting = opts.perf && opts.quiet && !quiet_off && exclusive && self.vm.num == 1;
         let started = Instant::now();
         // Unreachable counts as unhealthy too (sshd was among the victims),
         // but nothing is reset under a live round (2026-11-13): see `verdict`.
@@ -1967,26 +2003,84 @@ impl Lab {
                 timeout_s: timeout,
                 id: &round,
                 host_pid: std::process::id(),
+                marker: quieting,
             }),
         );
         // `bash -c` (not a heredoc on stdin), so the command keeps a
         // terminal-less stdin of its own and `-t` is not needed. `env` puts
         // the round mark in the environment every process of it inherits.
-        let mut child = self
-            .ssh()?
-            .args(["sudo", "env", &format!("{ROUND_VAR}={round}"), "bash", "-c"])
+        let mut ssh = self.ssh()?;
+        ssh.args(["sudo", "env", &format!("{ROUND_VAR}={round}"), "bash", "-c"])
             .arg(shell_quote(&script))
-            .stdin(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("ssh: {e}"))?;
+            .stdin(Stdio::null());
+        if quieting {
+            ssh.stderr(Stdio::piped());
+        }
+        let mut child = ssh.spawn().map_err(|e| format!("ssh: {e}"))?;
         // From here the round is visible to the others (`live_rounds`).
         drop(health_lock);
+        let quiet = match child.stderr.take() {
+            Some(err) => self.quiet_when_locked(err, &round),
+            None => None,
+        };
         let status = child.wait().map_err(|e| format!("ssh: {e}"))?;
+        if let Some((q, relay)) = quiet {
+            if let Some(q) = q {
+                q.finish();
+            }
+            let _ = relay.join();
+        }
         eprintln!(
             "vm-lab: round (sync + command) in {vm} {:.1} s, {status}",
             started.elapsed().as_secs_f64()
         );
         exit_like(status, vm)
+    }
+
+    /// Relays the round's stderr (thread `vm-lab-relay`) and, once the round
+    /// script says it holds the lock, starts quieting VM 1's host CPUs.
+    /// Returns the quieting (none if it could not start) and the relay to
+    /// join after the round.
+    #[allow(clippy::type_complexity)]
+    fn quiet_when_locked(
+        &self,
+        mut err: std::process::ChildStderr,
+        round: &str,
+    ) -> Option<(Option<quiet::Quiet>, std::thread::JoinHandle<()>)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let relay = std::thread::Builder::new()
+            .name("vm-lab-relay".into())
+            .spawn(move || {
+                let mut out = std::io::stderr();
+                let found = quiet::relay_until_marker(&mut err, &mut out);
+                let _ = tx.send(found);
+                let _ = std::io::copy(&mut err, &mut out);
+            })
+            .map_err(|e| eprintln!("vm-lab: relay thread: {e}"))
+            .ok()?;
+        // `false`: the round ended (or failed) before taking the lock.
+        if !rx.recv().unwrap_or(false) {
+            return Some((None, relay));
+        }
+        let avoid = measurement_cpus(&self.vm);
+        let started = quiet::user_scope()
+            .and_then(|scope| quiet::Quiet::start(&self.shared(quiet::STATE), round, avoid, scope));
+        // Go, quiet or not: the round waits for this file (at most
+        // `GO_WAIT_S`) before its command.
+        let go = format!("sudo -n touch {}", shell_quote(&quiet::go_file(round)));
+        if let Err(e) = self.ssh_output(&go) {
+            eprintln!(
+                "vm-lab: quiet: could not tell the round to go ({e}); it starts after {} s",
+                quiet::GO_WAIT_S
+            );
+        }
+        match started {
+            Ok(q) => Some((Some(q), relay)),
+            Err(e) => {
+                eprintln!("vm-lab: quiet: not started ({e}); measuring without it");
+                Some((None, relay))
+            }
+        }
     }
 
     // ---- lock: status / unlock ----------------------------------------
@@ -2392,6 +2486,8 @@ struct Round<'a> {
     timeout_s: u64,
     id: &'a str,
     host_pid: u32,
+    /// Print `quiet::MARKER` once the lock is held (`run --perf`, G0.26d).
+    marker: bool,
 }
 
 /// Lists the processes of a round (`$2`, or every round when empty) and
@@ -2478,6 +2574,17 @@ fn round_script(r: &Round) -> String {
     let mut s = String::from(ROUND_HELPERS_SH);
     if r.exclusive {
         s.push_str(ROUND_LOCK_SH);
+        if r.marker {
+            // The host quiets VM 1's CPUs from here (G0.26d), not while the
+            // round only waits for the lock.
+            s.push_str(&format!("echo {} >&2\n", shell_quote(quiet::MARKER)));
+            // …and starts the command once the host says the CPUs are quiet.
+            let go = shell_quote(&quiet::go_file(r.id));
+            s.push_str(&format!(
+                "for i in $(seq {}); do [ -e {go} ] && break; sleep 0.1; done; rm -f {go}\n",
+                quiet::GO_WAIT_S * 10
+            ));
+        }
     }
     s.push_str(ROUND_CMD_SH);
     if r.exclusive {
@@ -3248,7 +3355,8 @@ mod tests {
                 exclusive: true,
                 timeout_s: LOCK_TIMEOUT_DEFAULT,
                 vm: None,
-                perf: false
+                perf: false,
+                quiet: true
             }
         );
         assert_eq!(cmd, strings(&["cargo", "xtask", "xdp-root"]));
@@ -3274,6 +3382,8 @@ mod tests {
         assert_eq!(o.timeout_s, 90);
         let (o, _) = parse_run(&strings(&["--perf", "--vm", "1", "--", "x"]), None).unwrap();
         assert_eq!((o.perf, o.vm), (true, Some(VMS[0])));
+        let (o, _) = parse_run(&strings(&["--perf", "--no-quiet", "--", "x"]), None).unwrap();
+        assert_eq!((o.perf, o.quiet), (true, false));
         let (o, _) = parse_run(&strings(&["--vm=2", "--", "x"]), None).unwrap();
         assert_eq!(o.vm, Some(VMS[1]));
         assert!(parse_run(&strings(&["--vm"]), None).is_err());
@@ -3292,6 +3402,7 @@ mod tests {
             timeout_s: 1,
             vm,
             perf,
+            quiet: true,
         };
         assert_eq!(run_vm(None, &opts(None, false)).unwrap(), None);
         assert_eq!(run_vm(None, &opts(None, true)).unwrap(), Some(VMS[0]));
@@ -3532,6 +3643,7 @@ mod tests {
             timeout_s,
             id: "4242.77",
             host_pid: 4242,
+            marker: false,
         }
     }
 
@@ -3582,6 +3694,22 @@ mod tests {
         assert!(s.contains("round=%s\\nhost_pid=%s"));
         assert!(s.contains("/srv/lab/w 4242.77 4242"));
         assert!(s.contains("exit 75"));
+        // The quiet marker (G0.26d) only when asked, after the lock.
+        assert!(!s.contains(quiet::MARKER));
+        let m = round_script(&Round {
+            marker: true,
+            ..round(LOCK, "/srv/lab/w", "x", 9)
+        });
+        let (lock_at, marker_at) = (
+            m.find("flock -w 9 9").unwrap(),
+            m.find(quiet::MARKER).unwrap(),
+        );
+        let go_at = m
+            .find("[ -e /run/corerouter-lab.quiet.4242.77 ] && break")
+            .unwrap();
+        assert!(lock_at < marker_at && marker_at < go_at);
+        assert!(go_at < m.find("( cd /srv/lab/w/src").unwrap());
+        assert!(m.contains("$(seq 150)"), "waits at most 15 s");
         // Shared rounds take no lock but still look for leftovers.
         let shared = round_script(&Round {
             exclusive: false,

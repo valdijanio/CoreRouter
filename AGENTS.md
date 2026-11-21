@@ -431,7 +431,9 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
   desempenho e a `corerouter-lab2` (VM 2), dos testes de funcionamento:
   - teste de funcionamento: `vm-lab run -- …` sem `--vm`, que pega a VM livre (a 2 primeiro);
   - número de desempenho (antes/depois, pps, latência): `vm-lab run --perf -- …`, sempre na VM 1,
-    que tem o CCD1 só para ela (mapa de CPUs em `docs/vm-lab.md`, "Duas VMs");
+    que tem o CCD1 só para ela (mapa de CPUs em `docs/vm-lab.md`, "Duas VMs"); enquanto mede,
+    os seus processos do host saem dessas CPUs e voltam no fim ("Medição silenciosa"). Por isso
+    a rodada `--perf` é só a medição: compile antes com `--shared --perf`;
   - conferir se funciona: primeiro no host, sem root (`unshare --user --map-root-user --net`,
     os `netns_*`, `dns-stress-lab.sh --userns`); a VM só para o que precisa de root de verdade,
     de placa ou do número de desempenho;
