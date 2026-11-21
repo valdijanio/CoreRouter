@@ -425,9 +425,15 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
   rodada pelo usuário (abaixo) e o runner do CI ficam como alternativas. Sessões usam só
   `vm-lab run`, sem embrulhar em `flock vm/root.lock`. VM travada (espera > 15 min):
   `cargo xtask vm-lab unlock`; regras em `docs/vm-lab.md`.
-- **A VM é uma só: ocupe-a pouco** (pedido do usuário, 2026-11-20). Uma rodada segura a VM
-  inteira e as outras sessões esperam (na rodada da fase C, a G3.4z esperou a do DNS, que já
-  segurava a VM havia 919 s, **medido**). Por isso:
+- **São duas VMs: ocupe-as pouco** (pedido do usuário, 2026-11-20; segunda VM na G0.26c). Uma
+  rodada segura a VM inteira e quem chega espera (na rodada da fase C, a G3.4z esperou a do DNS,
+  que já segurava a VM havia 919 s, **medido**). A `corerouter-lab` (VM 1) é das medições de
+  desempenho e a `corerouter-lab2` (VM 2), dos testes de funcionamento:
+  - teste de funcionamento: `vm-lab run -- …` sem `--vm`, que pega a VM livre (a 2 primeiro);
+  - número de desempenho (antes/depois, pps, latência): `vm-lab run --perf -- …`, sempre na VM 1,
+    que tem o CCD1 só para ela (mapa de CPUs em `docs/vm-lab.md`, "Duas VMs"); enquanto mede,
+    os seus processos do host saem dessas CPUs e voltam no fim ("Medição silenciosa"). Por isso
+    a rodada `--perf` é só a medição: compile antes com `--shared --perf`;
   - conferir se funciona: primeiro no host, sem root (`unshare --user --map-root-user --net`,
     os `netns_*`, `dns-stress-lab.sh --userns`); a VM só para o que precisa de root de verdade,
     de placa ou do número de desempenho;
@@ -435,9 +441,10 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
     `dns-stress-lab.sh --tests ops --duration 5`);
   - a bateria inteira, com a duração padrão, uma vez só, no fim, para o antes e depois do PR;
   - compilar dentro da VM com `vm-lab run --shared -- cargo build …` (não pega a vez
-    exclusiva) e só depois a rodada exclusiva; `--no-sync` quando nada mudou.
-
-  A segunda VM, para testes de funcionamento, é a G0.26c.
+    exclusiva; com `--perf` se a rodada seguinte for medição) e só depois a rodada exclusiva;
+    `--no-sync` quando nada mudou;
+  - `put` e `ssh` sem `--vm` vão para a VM 1: roteiro que copia antes do `run` fixa a VM com
+    `COREROUTER_VM_LAB=$(cargo xtask vm-lab pick)`.
 - **Sem a VM: rodada local pelo usuário.** É o caminho
   rápido (segundos, contra ~15 min de um `workflow_dispatch` no runner do CI, **medido** em
   2026-10-24). A sessão entrega ao usuário, pela sessão principal, o comando completo na pasta

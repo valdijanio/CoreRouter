@@ -52,6 +52,8 @@ case $mode in
 		echo "$tree is not a hostap tree (no tests/hwsim)" >&2
 		exit 2
 	}
+	# put/ssh and the run must reach the same VM (G0.26c): the free one now.
+	export COREROUTER_VM_LAB=${COREROUTER_VM_LAB:-$(cargo xtask vm-lab pick)}
 	name=$(basename "$tree")
 	tar c -C "$(dirname "$tree")" --exclude="$name/.git" --exclude="$name/build" \
 		--exclude='*.o' --exclude='*.d' --exclude='*.orig' "$name" |

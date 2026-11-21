@@ -29,14 +29,14 @@ use std::time::{Duration, Instant};
 
 use crate::Outcome;
 use crate::vm_lab::{
-    check_snapshot_name, cloud_image, download, mgmt_ipv4, output, read, run_ok, sha256_file,
-    shell_quote, unix_now, virsh, write,
+    CI_EMULATOR_CPUS, CI_VCPU_CPUS, check_snapshot_name, cloud_image, cputune_xml, download,
+    mgmt_ipv4, output, read, run_ok, sha256_file, shell_quote, unix_now, virsh, write,
 };
 
 const NAME: &str = "corerouter-ci";
 const URI: &str = "qemu:///system";
 /// Not the lab's (`…:01`): both VMs share libvirt's `default` network.
-const MGMT_MAC: &str = "52:54:00:c0:72:11";
+pub(crate) const MGMT_MAC: &str = "52:54:00:c0:72:11";
 /// SSH login with `sudo`, for the host's maintenance only.
 const ADMIN: &str = "ciadmin";
 /// Who runs the jobs: no `sudo`, no SSH key.
@@ -1156,7 +1156,7 @@ fn domain_xml(spec: &Spec, system: &Path, cache: &Path, seed: &Path) -> String {
     format!(
         "<domain type='kvm'>\n  <name>{NAME}</name>\n  \
          <description>CoreRouter self-hosted CI runner (cargo xtask ci-runner, docs/ci-runner.md)</description>\n  \
-         <memory unit='MiB'>{mem}</memory>\n  <vcpu>{cpus}</vcpu>\n  \
+         <memory unit='MiB'>{mem}</memory>\n  <vcpu>{cpus}</vcpu>\n{cputune}  \
          <os><type arch='x86_64' machine='q35'>hvm</type><boot dev='hd'/></os>\n  \
          <features><acpi/><apic/></features>\n  \
          <cpu mode='host-model' check='partial'/>\n  \
@@ -1181,6 +1181,8 @@ fn domain_xml(spec: &Spec, system: &Path, cache: &Path, seed: &Path) -> String {
          </devices>\n</domain>\n",
         mem = spec.memory_mib,
         cpus = spec.cpus,
+        // Off the lab's measurement CCD (G0.26c, `docs/vm-lab.md`).
+        cputune = cputune_xml(spec.cpus, CI_VCPU_CPUS, CI_EMULATOR_CPUS),
         system = system.display(),
         cache = cache.display(),
         seed = seed.display(),

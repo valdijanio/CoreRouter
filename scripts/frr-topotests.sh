@@ -37,6 +37,8 @@ case $mode in
 		esac
 	done
 	[ -d "$tree/tests/topotests/lib" ] && [ ${#builds[@]} -gt 0 ] && [ ${#tests[@]} -gt 0 ] || usage
+	# put/ssh and the run must reach the same VM (G0.26c): the free one now.
+	export COREROUTER_VM_LAB=${COREROUTER_VM_LAB:-$(cargo xtask vm-lab pick)}
 	cargo xtask vm-lab ssh 'sudo rm -rf /srv/frr-tt/run && sudo mkdir -p /srv/frr-tt/run' || exit 1
 	tar c -C "$tree/tests" --exclude='*.pyc' --exclude=__pycache__ topotests |
 		cargo xtask vm-lab ssh 'sudo tar x -C /srv/frr-tt/run' || exit 1

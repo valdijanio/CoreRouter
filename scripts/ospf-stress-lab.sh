@@ -56,6 +56,8 @@ case $ROOTFS in *[!A-Za-z0-9._-]* | "" | .*) echo "OSPF_STRESS_ROOTFS: a file na
 if [ "${1:-}" = "--host" ]; then
 	IMAGES=${2:?usage: $0 --host <images dir> [options]}
 	shift 2
+	# A measurement: VM 1 (G0.26c), for put and run alike.
+	export COREROUTER_VM_LAB=${COREROUTER_VM_LAB:-1}
 	# A round first: an unhealthy VM goes back to its snapshot there, which
 	# would drop what `put` copies.
 	cargo xtask vm-lab run -- true
