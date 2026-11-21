@@ -415,13 +415,37 @@ pub(crate) fn route_get(
 /// the route's protocol; one netlink connection for all of them (a lookup
 /// is one request, the kernel's trie does the longest match).
 pub(crate) fn fib_entries(
-    pairs: &[(IpAddr, Option<IpAddr>)],
+    pairs: &[(IpAddr, Option<IpAddr>, Option<IfName>)],
 ) -> Result<Vec<Result<corerouter_hal::route_get::FibEntry, String>>, HalError> {
     with_kernel(|k| async move {
         let mut names = std::collections::HashMap::new();
+        // G3.4za: each VRF's index once per batch.
+        let mut vrfs: std::collections::HashMap<IfName, Result<u32, String>> =
+            std::collections::HashMap::new();
         let mut out = Vec::with_capacity(pairs.len());
-        for (dst, src) in pairs {
-            out.push(k.fib_entry(*dst, *src, &mut names).await);
+        for (dst, src, vrf) in pairs {
+            let oif = match vrf {
+                None => None,
+                Some(v) => {
+                    if !vrfs.contains_key(v) {
+                        let got = match k.find(v).await {
+                            Ok(Some(l)) => Ok(l.index),
+                            Ok(None) => Err(format!("VRF '{v}' is not in the kernel")),
+                            Err(e) => Err(e),
+                        };
+                        vrfs.insert(v.clone(), got);
+                    }
+                    match vrfs.get(v) {
+                        Some(Ok(i)) => Some(*i),
+                        Some(Err(e)) => {
+                            out.push(Err(e.clone()));
+                            continue;
+                        }
+                        None => None,
+                    }
+                }
+            };
+            out.push(k.fib_entry(*dst, *src, oif, &mut names).await);
         }
         Ok(out)
     })
@@ -1462,6 +1486,7 @@ impl Kernel {
         &self,
         dst: IpAddr,
         src: Option<IpAddr>,
+        vrf_index: Option<u32>,
         names: &mut std::collections::HashMap<u32, Option<IfName>>,
     ) -> Result<corerouter_hal::route_get::FibEntry, String> {
         use corerouter_hal::route_get::{FibEntry, RouteKind};
@@ -1479,6 +1504,10 @@ impl Kernel {
                 b.source_prefix(s, full).map_err(|e| e.to_string())?
             }
             _ => b,
+        };
+        let b = match vrf_index {
+            Some(i) => b.output_interface(i),
+            None => b,
         };
         let mut m = b.build();
         m.header.flags |= RouteFlags::FibMatch;

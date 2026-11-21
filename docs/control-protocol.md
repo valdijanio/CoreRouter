@@ -122,7 +122,23 @@ contam por origem (endereço IPv4 ou /64 IPv6) e por nome de usuário (janela de
 livres, depois cada tentativa espera 250 ms dobrando até 8 s, e uma origem com 20 falhas é
 recusada até a janela passar. A tentativa conta ao começar e é perdoada se der certo, então
 tentativas em paralelo não escapam do limite; no máximo 2 verificações Argon2 (19 MiB cada)
-rodam ao mesmo tempo (`too many logins at once` após 5 s de espera). Cada usuário tem no máximo
+rodam ao mesmo tempo (`too many logins at once` após 5 s de espera).
+
+**Força bruta distribuída contra um nome (G0.12).** Um atacante com muitos endereços escapa do
+limite por origem. Por isso um nome de usuário com 10 falhas vindas de 3 origens distintas na
+janela de 15 min fica **bloqueado para login pela rede**: 1 min na primeira vez, o dobro a cada
+novo bloqueio em 24 h, no máximo 30 min (nunca para sempre, senão qualquer um trancaria o
+`admin`). A tentativa que chega ao limite e as seguintes são recusadas antes do Argon2, mesmo com
+a senha certa, com `too many failed logins for this user from several addresses…`. Nunca valem
+para o bloqueio: o loopback (`127.0.0.0/8`, `::1`), o token local (não passa por `auth.login`) e
+as **origens conhecidas** do usuário (de onde ele já entrou nas últimas 24 h, até 16 por
+usuário; as falhas delas, erros de digitação, também não contam). O bloqueio vale para qualquer
+nome, exista ou não, e não revela se a conta existe. `user.lockout.list` mostra os nomes com
+falhas ou bloqueados (falhas, origens, recusas durante o bloqueio, segundos restantes,
+bloqueios seguidos, origens conhecidas), `user.lockout.clear {user?}` libera (grupo `full`), e o
+log do roteador registra cada bloqueio com as origens (`system,account,warning`, uma linha por
+nome com as repetições contadas). As origens conhecidas ficam só na memória: depois de
+reiniciar o daemon, só o loopback e o token local escapam de um bloqueio em curso. Cada usuário tem no máximo
 16 sessões: o 17º login derruba o mais antigo **dele**, nunca o de outra conta. Segredo nunca
 vai em URL: o token anda no corpo JSON.
 

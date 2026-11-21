@@ -37,6 +37,11 @@ Open management sessions (GUI, terminal, MCP, CLI over the network) whose peer i
 - `in kernel`: learned routes inside it are installed."##),
     (r##"management_guard.suggest"##, r##"## What it is
 The connected networks your open management sessions come from, not guarded yet. Protect adds the network in one step (`routing.management-guard.add`)."##),
+    (r##"management_guard.vrf"##, r##"## What it is
+The routing table the network is in: `main`, or the VRF of the management port. The filter of a VRF network goes inside zebra's `vrf <name>` context and refuses only learned routes of that VRF (OSPF or BGP of that VRF); the same prefix in another VRF is another network and is left alone.
+
+## Default
+Left empty, the router picks the table the network is connected in (main when it is in main too). A guard in the wrong table protects nothing: the preview says so when the network is connected in another one."##),
     (r##"menu.management-guard"##, r##"## What it does
 Keeps learned routes (OSPF, BGP) from taking the management network: the router refuses a prefix inside it longer than it, and warns when a learned route covers an open session."##),
 ];
