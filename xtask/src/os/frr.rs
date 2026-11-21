@@ -506,7 +506,7 @@ fn oom(vm: &mut Vm, log: &mut std::fs::File, nums: &mut Numbers) -> Result<(), S
         vm,
         log,
         &format!(
-            "{{ for p in {PROCS}; do printf '%s=%s ' $p $(cat /proc/$(pidof $p)/oom_score_adj); done; echo .; }}"
+            "{{ for p in {PROCS}; do printf '%s=%s ' $p $(cat /proc/$(pidof -s $p)/oom_score_adj); done; echo .; }}"
         ),
     )?;
     let want = [
