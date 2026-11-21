@@ -80,7 +80,9 @@ outros roteadores, RFCs, kernel, crates). Antes de planejar:
 4. **Proponha o que pode ser melhor.** Em cima da ideia principal: o que simplifica a operação, o
    que evita erro do operador (lockout, conflito, regra inútil), diagnóstico, segurança por
    padrão, e o que o nosso motor (tudo é comando, transações, Safe Mode, MCP) permite que os outros
-   não permitem. Separe "entra agora" de "vira gap depois".
+   não permitem. Separe "entra agora" (o usuário escolhe no escopo) de "fica para depois": o que
+   fica vai para a seção `## ideias` do seu `docs/changes/<id>.md` (vira `docs/ideias.md`), não
+   para uma gap (veja "Gap nova ou feita na hora").
 5. **Registre a pesquisa no corpo do PR**, seção `## Pesquisa`: links das fontes (inclusive as
    RFCs e seções consultadas), como o MikroTik faz, como os outros fazem, o que adotamos, as
    melhorias propostas e o que ficou de fora e por quê. Feature grande (novo
@@ -130,7 +132,8 @@ ao usuário, nesta ordem (pule o que não cabe no pedido e diga que pulou):
    documentação do MikroTik v7 e de pelo menos dois outros (seção "Pesquisa antes de
    implementar").
 5. **Extras:** ideias que o usuário não pediu e que fariam diferença (operação, diagnóstico,
-   segurança por padrão, o que o motor permite: transação, Safe Mode, MCP).
+   segurança por padrão, o que o motor permite: transação, Safe Mode, MCP). As que ele não
+   escolher vão para `docs/ideias.md` (seção `## ideias` do arquivo de mudança), não viram gap.
 6. **Riscos do próprio pedido:** o que ele pode quebrar ou piorar (lockout, desempenho,
    compatibilidade, dado perdido, conflito com outra sessão), e como evitar.
 
@@ -476,9 +479,11 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
 - Branch: `stream/<id-da-gap>-<slug>`, ex. `stream/G1.2-netlink-addresses`.
 - **Ids de gap vêm do brief ou da `main`.** Nunca invente um id: confira `docs/gaps.md` na
   `origin/main` atualizada antes de registrar um item novo (já houve colisão de G1.20).
-- **Não abra outras sessões por conta própria.** Trabalho extra que você descobrir vira uma gap
-  nova no seu `docs/changes/<id>.md` e uma sugestão no seu relato; quem decide abrir sessão é o usuário ou a sessão
-  principal (sessões não planejadas mexem nos mesmos arquivos e geram conflito).
+- **Não abra outras sessões por conta própria.** Trabalho extra que você descobrir segue
+  "Gap nova ou feita na hora" (seção "Progresso"): o pequeno você faz; o resto vira gap ou
+  ideia no seu `docs/changes/<id>.md` e uma sugestão no seu relato. Quem decide abrir sessão é
+  o usuário ou a sessão principal (sessões não planejadas mexem nos mesmos arquivos e geram
+  conflito).
 - **PRs pequenos e focados**: entram mais rápido e reduzem a janela de conflito. Feature grande
   vira vários PRs sequenciais, um por sessão.
 - **Pode empilhar.** A parte seguinte pode sair da branch da anterior (`git switch -c
@@ -532,7 +537,9 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
     de um item;
   - o corpo é a entrada de `docs/log.md`: o que entrou, como testar, números (**medido** ou
     **estimado**);
-  - linhas de tabela `| G… |` no corpo são gaps novas (id conferido na `origin/main`).
+  - linhas de tabela `| G… |` no corpo são gaps novas (id conferido na `origin/main`), só nos
+    casos de "Gap nova ou feita na hora" (abaixo);
+  - a seção `## ideias` (opcional) vai para `docs/ideias.md`.
 - **Não edite** `docs/log.md`, `docs/gaps-history.md` nem a coluna Status de `docs/gaps.md`: a
   fila de entrada consolida os arquivos de `docs/changes/` (`cargo xtask docs fold`) um PR por
   vez, logo antes do merge, e nada conflita. `cargo xtask ci` confere o formato (passo `docs`).
@@ -541,3 +548,33 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
 - Não crie seções de "histórico de revisão" no fim de outros documentos (geram conflito entre PRs
   paralelos); o histórico do projeto é o `docs/log.md`.
 - Notas e estimativas erram para baixo; marque cada número como **medido** ou **estimado**.
+
+### Gap nova ou feita na hora (G0.34)
+
+Pedido do usuário (2026-11-21): cada gap resolvida criava outras duas ou três, e a lista não
+diminuía. De 07 a 21/11, 191 PRs criaram 175 gaps (39 deles criaram 2 ou mais) e as abertas
+ficaram em 227 (**medido**); metade das 12 gaps da rodada noturna era "o resto" do próprio
+trabalho, de 2 a 4 h (**estimado**). Por isso:
+
+- **Termine o que começou.** O que surge durante a tarefa é feito nela, no mesmo PR ou num PR
+  empilhado logo depois, pela mesma sessão, quando:
+  - é o mesmo tipo de mudança no resto do código ("as outras listas", "os outros comandos",
+    "o resto da migração");
+  - ou leva até ~1 dia (**estimado**) e cabe nos crates da tarefa.
+- **Gap nova só quando:**
+  - depende de hardware, root, outra gap ou decisão do usuário;
+  - é feature nova (o escopo é do usuário: "Todo pedido, feature ou correção");
+  - passa de ~1 dia;
+  - mexe na área de outra sessão em andamento ("Agentes em paralelo").
+- **Ideia não é gap.** Melhoria que ninguém pediu (como outro roteador faz, RFC opcional, extra
+  de operação) vai para a seção `## ideias` do arquivo de mudança e, no fold, para
+  `docs/ideias.md`: fora do backlog, sem prazo, ninguém a pega sozinho. Vira gap quando o
+  usuário ou a sessão principal a escolhe.
+- **Trava:** o `cargo xtask docs` (passo `docs` do CI) recusa gap nova `aberto` com estimativa
+  de até 4 h sem o motivo na Status: `aberto (depende: root na VM)`. Gap que nasce `feito`
+  (trabalho feito no PR, registrado) passa sempre.
+- **Saldo:** `cargo xtask docs pending` e o PR do fold mostram as gaps fechadas, as criadas e
+  quantas abertas sobram ("saldo: …"). Saldo positivo em rodada após rodada é sinal de que a
+  regra não está sendo seguida.
+- **PR grande demais?** Divida em PRs empilhados da mesma sessão ("Pode empilhar"), sem
+  registrar gap entre eles.
