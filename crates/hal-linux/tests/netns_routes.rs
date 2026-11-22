@@ -1,0 +1,453 @@
+//! G1.27 against a real kernel, in a throwaway network namespace (no root,
+//! nothing reaches the host; `cargo xtask netns` runs it):
+//!
+//! - equal-distance static routes become one multipath route, and losing
+//!   one path rewrites it with the rest (IPv4 and IPv6);
+//! - the drift check reads a multipath route back as its paths;
+//! - `route_get` (`RTM_GETROUTE`) answers like `ip route get`.
+//!
+//! Helpers outside `#[test]` fns may unwrap/panic too.
+#![cfg(target_os = "linux")]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::process::Command;
+use std::sync::{OnceLock, RwLock};
+
+use corerouter_hal::Hal;
+use corerouter_hal::drift;
+use corerouter_hal::route_get::{RouteKind, RouteQuery};
+use corerouter_hal_linux::LinuxHal;
+use corerouter_model::{
+    AddressEntry, Config, IfName, Interface, InterfaceKind, RouteEntry, RoutingTable,
+};
+
+const ENV: &str = "COREROUTER_NETNS_TESTS";
+
+/// True when the tests may touch the kernel; panics outside a fresh
+/// namespace (only `lo`), so a stray variable on the host touches nothing.
+/// `route_dumps()` counts for the whole process: the test that checks it
+/// takes this for writing, the others for reading (they run in parallel
+/// threads, and a dump of theirs in its window failed it under load).
+static DUMPS: RwLock<()> = RwLock::new(());
+
+fn in_netns() -> bool {
+    if std::env::var_os(ENV).is_none_or(|v| v != "1") {
+        eprintln!("skipped: set {ENV}=1 and run inside `unshare --user --map-root-user --net`");
+        return false;
+    }
+    static FRESH: OnceLock<Result<(), String>> = OnceLock::new();
+    let fresh = FRESH.get_or_init(|| {
+        let out = Command::new("ip")
+            .args(["-o", "link", "show"])
+            .output()
+            .map_err(|e| format!("cannot run `ip`: {e}"))?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let names: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.split(':').nth(1))
+            .map(str::trim)
+            .collect();
+        if names == ["lo"] {
+            Ok(())
+        } else {
+            Err(format!(
+                "{ENV}=1 but this namespace has {names:?}; refusing to touch it"
+            ))
+        }
+    });
+    if let Err(e) = fresh {
+        panic!("{e}");
+    }
+    true
+}
+
+fn ip(args: &[&str]) -> String {
+    let out = Command::new("ip").args(args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "ip {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn n(s: &str) -> IfName {
+    s.parse().unwrap()
+}
+
+/// Two dummy ports `<p>1`, `<p>2` with 10.<net>.0.2/24, 10.<net>.1.2/24
+/// and 2001:db8:<net>:0::2/64, 2001:db8:<net>:1::2/64.
+fn base(p: &str, net: u8) -> Config {
+    let mut c = Config::default();
+    for (i, port) in [format!("{p}1"), format!("{p}2")].iter().enumerate() {
+        ip(&["link", "add", port, "type", "dummy"]);
+        c.interfaces
+            .insert(n(port), Interface::new(n(port), InterfaceKind::Ethernet));
+        for a in [
+            format!("10.{net}.{i}.2/24"),
+            format!("2001:db8:{net}:{i}::2/64"),
+        ] {
+            let id = c.ip.next_address_id();
+            c.ip.addresses.push(AddressEntry {
+                id,
+                address: a.parse().unwrap(),
+                interface: n(port),
+                disabled: false,
+                comment: String::new(),
+                from_pool: None,
+            });
+        }
+    }
+    c
+}
+
+fn route(cfg: &mut Config, dst: &str, gw: &str) {
+    let id = cfg.ip.next_route_id();
+    cfg.ip.routes.push(RouteEntry {
+        id,
+        dst_address: dst.parse().unwrap(),
+        gateway: gw.parse().unwrap(),
+        distance: 1,
+        routing_table: RoutingTable::Main,
+        disabled: false,
+        comment: String::new(),
+        check_gateway: Default::default(),
+        bfd_profile: String::new(),
+    });
+}
+
+#[test]
+fn equal_distance_routes_are_one_multipath_route() {
+    if !in_netns() {
+        return;
+    }
+    let _dumps = DUMPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut hal = LinuxHal::new();
+    let base = base("m1p", 81);
+    hal.apply(&Config::default(), &base).unwrap();
+    let mut two = base.clone();
+    route(&mut two, "192.0.2.0/24", "10.81.0.1");
+    route(&mut two, "192.0.2.0/24", "10.81.1.1");
+    route(&mut two, "2001:db8:aa::/48", "2001:db8:81::1");
+    route(&mut two, "2001:db8:aa::/48", "2001:db8:81:1::1");
+    hal.apply(&base, &two).unwrap();
+
+    let v4 = ip(&["-4", "route", "show", "192.0.2.0/24"]);
+    assert!(
+        v4.contains("nexthop via 10.81.0.1 dev m1p1")
+            && v4.contains("nexthop via 10.81.1.1 dev m1p2"),
+        "{v4}"
+    );
+    let v6 = ip(&["-6", "route", "show", "2001:db8:aa::/48"]);
+    assert!(
+        v6.contains("2001:db8:81::1") && v6.contains("2001:db8:81:1::1"),
+        "{v6}"
+    );
+    // The drift check reads the group back as its paths: nothing drifted.
+    let have = hal.snapshot(&two).unwrap();
+    assert_eq!(
+        drift::diff(&drift::expected(&two), &have),
+        vec![],
+        "{have:?}"
+    );
+    // Applying again changes nothing.
+    hal.apply(&two, &two).unwrap();
+    hal.apply(&Config::default(), &two).unwrap();
+    assert_eq!(ip(&["-4", "route", "show", "192.0.2.0/24"]), v4);
+
+    // One path leaves: the other stays, as a plain route.
+    let mut one = base.clone();
+    route(&mut one, "192.0.2.0/24", "10.81.1.1");
+    route(&mut one, "2001:db8:aa::/48", "2001:db8:81:1::1");
+    hal.apply(&two, &one).unwrap();
+    let v4 = ip(&["-4", "route", "show", "192.0.2.0/24"]);
+    assert!(
+        v4.starts_with("192.0.2.0/24 via 10.81.1.1 dev m1p2"),
+        "{v4}"
+    );
+    let v6 = ip(&["-6", "route", "show", "2001:db8:aa::/48"]);
+    assert!(
+        v6.contains("via 2001:db8:81:1::1") && !v6.contains("2001:db8:81::1 "),
+        "{v6}"
+    );
+    // And back, then all gone.
+    hal.apply(&one, &two).unwrap();
+    assert!(ip(&["-4", "route", "show", "192.0.2.0/24"]).contains("nexthop"));
+    hal.apply(&two, &base).unwrap();
+    assert_eq!(ip(&["-4", "route", "show", "192.0.2.0/24"]), "");
+    assert_eq!(ip(&["-6", "route", "show", "2001:db8:aa::/48"]), "");
+}
+
+#[test]
+fn route_get_answers_like_ip_route_get() {
+    if !in_netns() {
+        return;
+    }
+    let _dumps = DUMPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut hal = LinuxHal::new();
+    let mut cfg = base("m2p", 82);
+    route(&mut cfg, "0.0.0.0/0", "10.82.0.1");
+    route(&mut cfg, "198.51.100.0/24", "10.82.0.1");
+    route(&mut cfg, "198.51.100.0/24", "10.82.1.1");
+    route(&mut cfg, "198.51.100.0/25", "10.82.1.1");
+    hal.apply(&Config::default(), &cfg).unwrap();
+    let get = |hal: &mut LinuxHal, dst: &str| {
+        hal.route_get(
+            &cfg,
+            &RouteQuery {
+                dst: dst.parse().unwrap(),
+                table: 254,
+                src: None,
+                policy: None,
+            },
+        )
+        .unwrap()
+    };
+    let r = get(&mut hal, "8.8.8.8");
+    assert_eq!(r.kind, RouteKind::Unicast);
+    assert_eq!(r.prefix, Some("0.0.0.0/0".parse().unwrap()));
+    assert_eq!(r.hops.len(), 1);
+    assert_eq!(r.hops[0].interface, n("m2p1"));
+    assert_eq!(r.src, Some("10.82.0.2".parse().unwrap()));
+    // The longer prefix wins.
+    let r = get(&mut hal, "198.51.100.7");
+    assert_eq!(r.prefix, Some("198.51.100.0/25".parse().unwrap()), "{r:?}");
+    // ECMP: the FIB entry lists both paths.
+    let r = get(&mut hal, "198.51.100.200");
+    assert_eq!(r.prefix, Some("198.51.100.0/24".parse().unwrap()));
+    assert_eq!(r.hops.len(), 2, "{r:?}");
+    // On link, local, unreachable.
+    let r = get(&mut hal, "10.82.1.77");
+    assert_eq!((r.kind, r.hops[0].gateway), (RouteKind::Unicast, None));
+    assert_eq!(get(&mut hal, "10.82.1.2").kind, RouteKind::Local);
+    assert_eq!(
+        get(&mut hal, "2001:db8:ffff::1").kind,
+        RouteKind::Unreachable
+    );
+}
+
+/// G1.5b: `RTM_GETROUTE` answers a discard route with an error of its own
+/// (even with `RTM_F_FIB_MATCH`), and `ip.route.lookup` says which.
+#[test]
+fn route_get_tells_the_discard_routes_apart() {
+    if !in_netns() {
+        return;
+    }
+    // Alone: the other tests count the discard routes of the namespace.
+    let _dumps = DUMPS.write().unwrap_or_else(|e| e.into_inner());
+    let mut hal = LinuxHal::new();
+    let mut cfg = base("g5b", 85);
+    route(&mut cfg, "100.65.0.0/16", "blackhole");
+    route(&mut cfg, "198.18.85.0/24", "unreachable");
+    route(&mut cfg, "2001:db8:dead:85::/64", "prohibit");
+    route(&mut cfg, "203.0.113.0/24", "10.85.0.1");
+    hal.apply(&Config::default(), &cfg).unwrap();
+    for (dst, kind) in [
+        ("100.65.0.1", RouteKind::Blackhole),
+        ("198.18.85.1", RouteKind::Unreachable),
+        ("2001:db8:dead:85::1", RouteKind::Prohibit),
+        ("203.0.113.1", RouteKind::Unicast),
+    ] {
+        let q = RouteQuery {
+            dst: dst.parse().unwrap(),
+            table: 254,
+            src: None,
+            policy: None,
+        };
+        assert_eq!(hal.route_get(&cfg, &q).unwrap().kind, kind, "{dst}");
+    }
+    hal.apply(&cfg, &Config::default()).unwrap();
+}
+
+#[test]
+fn a_route_of_someone_else_is_refused_not_replaced() {
+    if !in_netns() {
+        return;
+    }
+    let _dumps = DUMPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut hal = LinuxHal::new();
+    let base = base("f1p", 82);
+    hal.apply(&Config::default(), &base).unwrap();
+    // Added by hand: same prefix, metric and table as ours.
+    ip(&[
+        "route",
+        "add",
+        "100.82.0.0/24",
+        "via",
+        "10.82.0.1",
+        "metric",
+        "1",
+    ]);
+    let before = ip(&["-4", "route", "show", "100.82.0.0/24"]);
+    let mut ours = base.clone();
+    route(&mut ours, "100.82.1.0/24", "10.82.0.1");
+    route(&mut ours, "100.82.0.0/24", "10.82.1.1");
+    let err = hal.apply(&base, &ours).unwrap_err().to_string();
+    assert!(err.contains("refusing to replace"), "{err}");
+    // Untouched, and the route added before it in the same commit is
+    // rolled back (G0.31: the add is tried before the table is read).
+    assert_eq!(ip(&["-4", "route", "show", "100.82.0.0/24"]), before);
+    assert_eq!(ip(&["-4", "route", "show", "100.82.1.0/24"]), "");
+}
+
+/// G0.31i: changing the distance (metric) of one route, or removing it,
+/// deletes it without reading the kernel's routes; a path of an ECMP
+/// group still reads them, and its sibling stays.
+#[test]
+fn a_distance_change_reads_no_route_table() {
+    if !in_netns() {
+        return;
+    }
+    let _dumps = DUMPS.write().unwrap_or_else(|e| e.into_inner());
+    let mut hal = LinuxHal::new();
+    let base = base("dst", 82);
+    hal.apply(&Config::default(), &base).unwrap();
+    let mut many = base.clone();
+    for i in 0..500u32 {
+        route(
+            &mut many,
+            &format!("172.{}.{}.0/24", 16 + i / 256, i % 256),
+            "10.82.0.1",
+        );
+    }
+    route(&mut many, "198.18.0.0/24", "10.82.0.1");
+    route(&mut many, "198.18.0.0/24", "10.82.1.1");
+    hal.apply(&base, &many).unwrap();
+
+    let dumps = corerouter_hal_linux::route_dumps();
+    let mut far = many.clone();
+    far.ip.routes.update(0, |r| r.distance = 7);
+    hal.apply(&many, &far).unwrap();
+    assert_eq!(corerouter_hal_linux::route_dumps(), dumps);
+    let shown = ip(&["-4", "route", "show", "172.16.0.0/24"]);
+    assert!(
+        shown.contains("metric 7") && shown.lines().count() == 1,
+        "{shown}"
+    );
+    // And back, then removed: still no dump.
+    hal.apply(&far, &many).unwrap();
+    let mut fewer = many.clone();
+    fewer.ip.routes.remove(1);
+    hal.apply(&many, &fewer).unwrap();
+    assert_eq!(corerouter_hal_linux::route_dumps(), dumps);
+    assert_eq!(ip(&["-4", "route", "show", "172.16.1.0/24"]), "");
+
+    // A path of the ECMP group: its siblings are read, the other stays.
+    let last = fewer.ip.routes.len() - 1;
+    let mut split = fewer.clone();
+    split.ip.routes.update(last, |r| r.distance = 2);
+    hal.apply(&fewer, &split).unwrap();
+    assert!(corerouter_hal_linux::route_dumps() > dumps);
+    let v4 = ip(&["-4", "route", "show", "198.18.0.0/24"]);
+    assert!(
+        v4.contains("via 10.82.0.1 dev dst1 proto static metric 1")
+            && v4.contains("via 10.82.1.1 dev dst2 proto static metric 2"),
+        "{v4}"
+    );
+    hal.apply(&split, &base).unwrap();
+    assert_eq!(ip(&["-4", "route", "show", "198.18.0.0/24"]), "");
+}
+
+/// A route of `cfg` in the VRF `bhv` (table 1083): tests share one
+/// namespace, and a route without next hop has no link to tell whose it
+/// is, so these stay out of the main table the other tests read.
+fn in_vrf(cfg: &mut Config, dst: &str, gw: &str, distance: u8) {
+    route(cfg, dst, gw);
+    let last = cfg.ip.routes.len() - 1;
+    cfg.ip.routes.update(last, |r| {
+        r.distance = distance;
+        r.routing_table = RoutingTable::Vrf(n("bhv"));
+    });
+}
+
+/// G1.5a: routes without next hop reach the kernel as `RTN_BLACKHOLE`,
+/// `RTN_UNREACHABLE` and `RTN_PROHIBIT` (IPv4 and IPv6, proto static, the
+/// distance as metric), are read back without drift, and go away; a
+/// prefix changes from a gateway to a blackhole in one commit.
+#[test]
+fn discard_routes_are_kernel_route_types() {
+    if !in_netns() {
+        return;
+    }
+    let _dumps = DUMPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut hal = LinuxHal::new();
+    let mut base = base("bhp", 83);
+    base.interfaces.insert(
+        n("bhv"),
+        Interface::new(n("bhv"), InterfaceKind::Vrf { table: 1083 }),
+    );
+    if let Some(i) = base.interfaces.get_mut(&n("bhp1")) {
+        i.vrf = Some(n("bhv"));
+    }
+    hal.apply(&Config::default(), &base).unwrap();
+    let mut nulled = base.clone();
+    in_vrf(&mut nulled, "100.64.0.0/10", "blackhole", 1);
+    in_vrf(&mut nulled, "198.18.83.0/24", "unreachable", 5);
+    in_vrf(&mut nulled, "2001:db8:dead::/48", "prohibit", 1);
+    in_vrf(&mut nulled, "203.0.113.0/24", "10.83.0.1", 1);
+    hal.apply(&base, &nulled).unwrap();
+    let v4 = ip(&["-4", "route", "show", "table", "1083"]);
+    for want in [
+        "blackhole 100.64.0.0/10 proto static metric 1",
+        "unreachable 198.18.83.0/24 proto static metric 5",
+        "203.0.113.0/24 via 10.83.0.1 dev bhp1 proto static metric 1",
+    ] {
+        assert!(v4.contains(want), "{v4}");
+    }
+    let v6 = ip(&["-6", "route", "show", "table", "1083"]);
+    assert!(
+        v6.contains("prohibit 2001:db8:dead::/48") && v6.contains("proto static"),
+        "{v6}"
+    );
+    let have = hal.snapshot(&nulled).unwrap();
+    assert_eq!(have.discards.len(), 3, "{have:?}");
+    assert_eq!(
+        drift::diff(&drift::expected(&nulled), &have),
+        vec![],
+        "{have:?}"
+    );
+    // Applying again (a restart) adopts them.
+    hal.apply(&Config::default(), &nulled).unwrap();
+
+    // The unicast prefix becomes a blackhole in one commit, and back.
+    let mut swapped = nulled.clone();
+    let last = swapped.ip.routes.len() - 1;
+    swapped
+        .ip
+        .routes
+        .update(last, |r| r.gateway = "blackhole".parse().unwrap());
+    hal.apply(&nulled, &swapped).unwrap();
+    let shown = ip(&["-4", "route", "show", "table", "1083", "203.0.113.0/24"]);
+    assert!(shown.starts_with("blackhole 203.0.113.0/24"), "{shown}");
+    hal.apply(&swapped, &nulled).unwrap();
+    let shown = ip(&["-4", "route", "show", "table", "1083", "203.0.113.0/24"]);
+    assert!(shown.starts_with("203.0.113.0/24 via 10.83.0.1"), "{shown}");
+
+    // Removed by hand: the drift check sees it missing.
+    ip(&[
+        "route",
+        "del",
+        "blackhole",
+        "100.64.0.0/10",
+        "metric",
+        "1",
+        "table",
+        "1083",
+    ]);
+    let have = hal.snapshot(&nulled).unwrap();
+    let d = drift::diff(&drift::expected(&nulled), &have);
+    assert!(
+        d.iter()
+            .any(|x| x.item.contains("blackhole route 100.64.0.0/10")),
+        "{d:?}"
+    );
+
+    // Gone with the config, the VRF too.
+    hal.apply(&nulled, &base).unwrap();
+    assert_eq!(
+        ip(&["-4", "route", "show", "table", "1083", "proto", "static"]),
+        ""
+    );
+    hal.apply(&base, &Config::default()).unwrap();
+}

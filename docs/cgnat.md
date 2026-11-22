@@ -1,0 +1,856 @@
+# CGNAT (G2.3)
+
+NAT44 de operadora: cada assinante recebe um endereço público e uma faixa de portas própria, sem
+log por conexão. Determinístico por padrão (RFC 7422); por blocos sob demanda (PBA) como opção
+(G2.3c). O "Quem era?" responde IP público + porta + data/hora → assinante, que é o que o Marco
+Civil (Lei 12.965/2014, art. 13) cobra do provedor de conexão.
+
+Estado: **G2.3a–e** e **G2.7** (resposta quando as portas acabam, seção 1.9); este documento descreve
+o que entrou e o plano das partes seguintes.
+
+## 1. Como funciona
+
+### 1.1 A fórmula (uma só, para todos)
+
+`corerouter_model::cgnat::Layout` é a função de mapeamento. Fica no L0 (`crates/model`), é pura
+(sem I/O, sem relógio, compila em wasm) e é usada por todos:
+
+- o engine: comandos, "Quem era?", tabela de correspondência, planner;
+- o backend do kernel (`hal-linux`), que carrega os elementos dos mapas;
+- o caminho XDP (`dataplane-ebpf`, G2.5), que vai calcular o mesmo mapeamento.
+
+API estável:
+
+| Função | O que faz |
+|---|---|
+| `Layout::new(inside, outside, port_range, ports)` | monta a geometria, ou diz por que não fecha (`LayoutError::Capacity` traz quantos IPs públicos faltam) |
+| `forward(assinante) → Slot {public, first_port, last_port}` | ida (RFC 7422 §2, f1) |
+| `reverse(público, porta) → assinante` | volta (f2), sem estado |
+| `slot(i)`, `subscriber(i)`, `subscriber_index(ip)` | por índice |
+| `locate(público, porta) → (endereço, bloco)` | o bloco de uma porta (PBA usa os mesmos blocos) |
+| `entries()` | todos os pares, em ordem (o que vira elementos do mapa) |
+| `per_address()`, `capacity()`, `public_used()` | os números do planner |
+| `cgnat::plan(...)` | só a aritmética, para o planner sem listas de endereços |
+
+A geometria:
+
+1. Os assinantes são numerados na **ordem em que as faixas foram escritas** (`inside`): 0, 1, 2…
+2. Os IPs públicos (`outside`) são numerados do mesmo jeito.
+3. A faixa de portas (`port_range`, padrão 1024–65535: RFC 4787 REQ-3 tira as portas bem
+   conhecidas) é cortada em blocos de `ports_per_subscriber` portas. Cada IP tem
+   `blocos = ⌊faixa / portas⌋` blocos; a sobra do fim (por exemplo 1535 portas com 1000 por
+   assinante) não é usada.
+4. O assinante `i` fica com o IP `⌊i / blocos⌋` e o bloco `i mod blocos` dele.
+
+Exemplo: 100.64.0.0/22 (1024 assinantes) em 203.0.113.0/28 (16 IPs), 1000 portas cada → 64
+assinantes por IP, os 16 IPs usados. 100.64.0.65 → 203.0.113.1, portas 2024–3023.
+
+TCP, UDP e o identificador do ICMP (RFC 5508 §3.1) usam a mesma faixa. O kernel aplica a faixa
+de portas do `snat` aos ids do ICMP (`nf_nat_l4proto_unique_tuple`), o que foi **medido** no teste
+em netns. Outros protocolos (GRE, ESP) saem com o mesmo IP público, sem porta. Assim a regra do IP
+pareado (RFC 6888 REQ-2) vale para todos.
+
+Por que essa ordem? A RFC 7422 §2 lista vários algoritmos e deixa a escolha ao operador:
+sequencial, escalonado, round-robin, intercalado e aleatório com chave.
+
+- Escolhemos o sequencial **por assinante**: vizinhos de numeração ficam no mesmo IP público.
+  Assim um IP público responde por uma sequência contígua de assinantes, que é o que o setor de
+  abuso lê.
+- A RFC (§5) observa que a alocação sequencial facilita adivinhar o vizinho. Dentro da faixa, o
+  kernel escolhe a porta ao acaso, o que atende a RFC 6056 e a RFC 7857 §9.
+- O algoritmo vai junto em cada época do histórico, como a §3 pede. Um segundo algoritmo, se
+  vier, é um campo novo do pool, sem mudar os antigos.
+
+### 1.2 Exceções 1:1
+
+`ip.firewall.cgnat.exception.add {subscriber, public}` dá ao assinante um IP público só dele,
+fora de qualquer pool. Ele sai com as portas originais e recebe todo o tráfego de entrada desse
+IP (o "IP fixo" de cliente empresarial).
+
+O slot dele no pool **continua reservado e sem uso**. Assim, criar ou apagar uma exceção não
+muda o mapeamento de mais ninguém.
+
+### 1.3 EIM, EIF e hairpin (RFC 4787)
+
+São por pool:
+
+- **`endpoint_independent_mapping`** (padrão ligado), REQ-1: a mesma porta pública para todos os
+  destinos de uma porta UDP do assinante. Jogos, VoIP e WebRTC dependem disso.
+  - O Linux sozinho já reaproveita o mapeamento enquanto a conexão anterior vive
+    (`find_appropriate_src`).
+  - Nós o mantemos por 5 min mesmo depois que ela some: REQ-5 pede um timer de no mínimo 2 min
+    e recomenda 5.
+- **`endpoint_independent_filtering`** (padrão desligado), REQ-8: qualquer host da Internet
+  alcança um mapeamento vivo ("full cone").
+  - Desligado, só responde quem o assinante procurou.
+  - EIF exige EIM: a validação recusa EIF sem EIM.
+- **`hairpin`** (padrão ligado), REQ-9: um assinante alcança outro pelo IP:porta público, e quem
+  recebe vê o IP:porta público de quem mandou.
+
+Como é feito (RFC 4787 §4, sem módulo fora da árvore do kernel):
+
+1. Uma chain `filter` em `postrouting`, prioridade `srcnat + 10`, grava a conexão UDP nova em dois
+   mapas dinâmicos com timeout:
+   - `eim_<id>`: público.porta → assinante.porta;
+   - `eimr_<id>`: o inverso.
+2. Precisa ser `filter`: uma segunda chain `nat` não roda depois que a primeira fez a tradução. A
+   pesquisa verificou isso.
+3. No `postrouting`, `snat … map @eimr_<id>` vem antes da fórmula.
+4. No `prerouting`, `dnat … map @eim_<id>` atende o EIF e o hairpin. Sem EIF, essa regra só vale
+   para origem dentro do pool, ou seja, só o hairpin.
+
+### 1.4 O que o kernel recebe
+
+Tudo fica na tabela `ip corerouter_cgnat`, separada da `inet corerouter` do firewall, para uma
+nunca substituir a outra. Por pool, **um mapa e poucas regras**, nunca uma regra por assinante (o
+script RouterOS clássico tem duas por assinante: 76 mil linhas para um /21).
+
+| Objeto | O que guarda | Para quê |
+|---|---|---|
+| `d_<id>` | assinante → `público . porta_inicial-porta_final`, um elemento por assinante | **uma** regra `snat` para todos os protocolos |
+| `pub_<id>` | as faixas públicas (conjunto de intervalos) | o `forward` descarta pacote para o bloco público que nenhuma conexão reclama; sem isso, o bloco roteado ao CGN voltaria pela rota padrão |
+| `eim_<id>` / `eimr_<id>` | os mapeamentos UDP vivos (seção 1.3) | EIM, EIF e hairpin |
+| `x_1to1` / `x_1to1_in` | as exceções | antes de qualquer pool |
+
+A regra `snat` de cada pool vale para todos os protocolos:
+
+- TCP e UDP recebem a faixa nas portas, e o ICMP no id de consulta;
+- GRE, ESP e os demais saem só com o endereço, porque o kernel ignora a faixa de portas de quem
+  não tem porta.
+
+Assim o IP pareado (RFC 6888 REQ-2) vale para todos.
+
+Como chega ao kernel (G2.3b):
+
+- `hal-linux` fala **nfnetlink direto**, num lote atômico, sem o programa `nft`. A decisão e os
+  números estão em `docs/architecture.md` §1.2.1.
+- Quando só elementos mudam (portas por assinante, mais assinantes na faixa, o endereço de uma
+  exceção), o lote leva só os elementos que saíram e os que entraram. Os mapeamentos UDP vivos
+  sobrevivem.
+- Qualquer outra mudança troca a tabela inteira no mesmo lote.
+- Se o kernel recusar o lote incremental (alguém esvaziou a tabela), a tabela inteira vai em
+  seguida.
+
+`ip.firewall.cgnat.rules` mostra exatamente o que o kernel tem ("Ver regras geradas"): o texto e
+as mensagens saem da mesma descrição (`corerouter_firewall::program::Table`), e o `nft list table
+ip corerouter_cgnat` lê o mesmo.
+
+O `nft` recusaria a regra única: ele exige `meta l4proto {…}` para mapear portas; o kernel não.
+
+### 1.5 "Quem era?" ao longo do tempo
+
+A RFC 7422 §3 pede que o CGN **registre toda mudança** de faixas internas e externas, portas por
+assinante, algoritmo e portas reservadas, com data e hora. Também é a armadilha que Juniper e F5
+documentam: mudou o pool, o mapeamento antigo some, e a pergunta de ontem passa a ter outra
+resposta.
+
+O registro:
+
+- Cada commit que muda os pools ou as exceções em produção grava uma **época** no journal
+  próprio `journal-cgnat-history.log`. A época é a seção inteira, poucas centenas de bytes.
+- Rollback e desfazer do Safe Mode passam pelo mesmo commit e também entram no journal.
+- O journal fica guardado por `history_days` (padrão 365).
+- Ele fica fora das revisões da config, que guardam só 64.
+
+`ip.firewall.cgnat.who-was {public, port, time?}` procura a época em vigor em `time` e aplica a
+fórmula dela. A resposta traz:
+
+- o assinante e o pool (ou `exception`);
+- o slot inteiro;
+- desde e até quando aquele mapeamento valeu;
+- quando existe, quem tinha o IP do assinante por DHCP naquela hora: MAC, host-name e Option 82
+  circuit-id/remote-id, do histórico de concessões G4.2b.
+
+O login PPPoE entra quando houver BNG (G7.x).
+
+O tempo aceita Unix ou RFC 3339 com fuso (`2026-05-03T14:02:00-03:00`); sem fuso é UTC, e a
+resposta é sempre em UTC. Ofício judicial costuma vir em horário de Brasília: escreva o
+`-03:00`.
+
+### 1.6 Validação (antes do commit)
+
+`proto-cgnat::checks`, com selos na GUI.
+
+**Erro** (recusa o commit):
+- assinantes em dois pools;
+- dois pools com o mesmo IP público (dariam as mesmas portas);
+- público dentro de assinantes;
+- capacidade que não fecha: a mensagem diz quantos IPs faltam;
+- EIF sem EIM;
+- `out_interface` inexistente;
+- exceção num IP de pool, duplicada ou em laço;
+- limites de tamanho.
+
+**Aviso:**
+- portas abaixo de 1024 (RFC 4787 REQ-3);
+- assinantes fora de 100.64.0.0/10 (RFC 6598) e do espaço privado;
+- "público" em espaço privado;
+- menos de 300 portas por assinante;
+- IP do próprio roteador no pool (as conexões dele usam portas do pool).
+
+No modo blocos, mais assinantes que blocos é aviso ("oversubscribed"), não erro.
+
+**OK:** o selo de capacidade (assinantes, por IP, IPs usados e sobrando).
+
+`pool.set` responde `remapped`: quantos assinantes mudam de IP ou portas. Mudar
+`ports_per_subscriber` remapeia todo mundo.
+
+Depois de aplicar, o `hal-linux` faz duas coisas:
+
+- **derruba as conexões dos remapeados** pelo ctnetlink, como o VyOS faz com `conntrack -D`. Elas
+  ainda levam a tradução antiga; derrubadas, o "Quem era?" da época nova fica exato;
+- **esquece os mapeamentos UDP vivos** do pool, porque eles apontariam para portas que agora podem
+  ser de outro assinante. Cada um é reaprendido no próximo pacote.
+
+Aumentar a faixa de assinantes no fim não remapeia ninguém e não derruba nada.
+
+### 1.7 Modo blocos (PBA, G2.3c)
+
+`mode: blocks` dá a cada assinante, **sob demanda**, um bloco de `ports_per_subscriber` portas, com a
+mesma geometria da fórmula (`Layout::block`). A RFC 6888 §5 (REQ-13/14) e a RFC 7422 §1 tratam disso.
+
+**Primeiro pacote:**
+
+- Um assinante sem bloco tem o primeiro pacote segurado numa fila do netfilter, a número **7422**,
+  por uma regra `filter` em `postrouting` com prioridade `srcnat - 10`.
+- O serviço `cgnat` do daemon atende a fila: pede o bloco ao engine (`Session::cgnat_block_for`), que
+  o põe no mapa `d_<id>` do kernel, e solta o pacote.
+- O pacote segue para o NAT e já acha o elemento. Medido em netns.
+- Sem ninguém atendendo a fila, o pacote **cai**. Ele nunca sai com o IP privado: a regra não tem
+  `bypass`.
+- Sem bloco livre, ou com o assinante no máximo de blocos, o pacote cai também (RFC 6888 REQ-11a), e o
+  assinante recebe o ICMP *host unreachable* da REQ-11b (G2.7, seção 1.9), com o mesmo limite de taxa.
+
+**Pareado (REQ-2):** todos os blocos de um assinante ficam no mesmo IP público. O primeiro vai para o
+IP com menos blocos.
+
+**Cresce:** quando o bloco atual passa de 80 % de uso (o protocolo mais cheio), o assinante ganha
+outro, até `max_blocks`. As conexões novas vão para o novo; as velhas continuam no antigo.
+
+**Solta e segura:**
+
+- Um bloco sem conexão por `block_timeout` é liberado.
+- As portas do bloco liberado não vão para ninguém por **120 s** (RFC 6888 REQ-8), para um pacote
+  atrasado de uma conexão antiga não cair noutro assinante. A quarentena é **por faixa de portas** do IP
+  público (G2.7), não pelo número do bloco, e vem do journal: sobrevive a um reinício.
+- Quando a geometria do pool muda (outras portas, outros IPs), os blocos velhos são liberados na hora e
+  as conexões deles derrubadas, como num remapeamento determinístico; as portas deles também ficam 120 s
+  em quarentena, e nenhum bloco novo que as cubra é entregue antes disso (G2.7; antes, a mudança de
+  geometria pulava a quarentena).
+- No modo determinístico a REQ-8 vale pelas exceções da própria RFC: a porta é sempre do mesmo assinante
+  (exceção b), o conntrack segue o estado do TCP (exceção a) e, sem EIF, só quem o assinante procurou
+  responde (exceção c). Um remapeamento (`pool.set`) derruba as conexões e esquece os mapeamentos UDP.
+
+**Log por bloco:**
+
+- Cada alocação e liberação vira uma linha no log do roteador, tópico `cgnat`:
+  - `ALLOC 100.64.0.9 -> 203.0.113.1:1024-2023 pool pba (first packet)`;
+  - `RELEASE … (idle)`.
+- Para mandar ao syslog remoto (RFC 5424):
+  - `system.logging.action.add {name: "isp", remote: <ip>}`;
+  - `system.logging.add {topics: ["cgnat"], action: "isp"}`.
+- O mesmo vai no journal `journal-cgnat-blocks.log`, que o "Quem era?" lê e que reconstrói os blocos
+  no boot. No boot, os blocos são reinstalados no kernel antes de qualquer alocação nova.
+- O formato segue a RFC 6888 §4: assinante, IP externo, faixa de portas e data; sem destino
+  (REQ-12).
+
+**Quem era? em blocos:** o bloco que cobria aquela porta daquele IP naquela hora, pelo histórico de
+blocos (`ip.firewall.cgnat.block.history`).
+
+### 1.8 Alerta de portas esgotadas
+
+Vale para os dois modos (RFC 7422 §2.2).
+
+**O que conta:** a cada 10 s, o engine lê o conntrack e conta, por assinante, as portas públicas
+distintas em uso, por protocolo; vale o protocolo mais cheio.
+
+**Quando dispara:**
+
+- no modo determinístico, quando o assinante passa de `alert_percent` (padrão 90 %) do seu slot;
+- no modo blocos, quando ele já está no máximo de blocos.
+
+**O que fica registrado:**
+
+- Cada **travessia** do limite vira uma linha `warning` no log, tópico `cgnat`.
+- A travessia também entra em `ip.firewall.cgnat.alert.list`, com:
+  - portas usadas, % e pico;
+  - quantas vezes cruzou;
+  - primeira e última vez.
+
+O kernel não avisa quando uma conexão nova não acha porta livre: só conta em `insert_failed`. O alerta
+mostra o crescimento desse contador desde o início e, com a G2.7, quem foi recusado (seção 1.9):
+colunas `refused` e `icmp` por assinante, uma linha `no free port: …` no log por assinante que começa a
+ser recusado (no máximo uma por minuto).
+
+### 1.9 Sem portas: ICMP host unreachable (G2.7)
+
+A RFC 6888 REQ-11 diz o que fazer quando uma conexão nova não acha porta livre: (a) **MUST** descartar o
+pacote; (b) **SHOULD** mandar ao assinante um ICMP *destination unreachable* **código 1** (*host
+unreachable*). O código 1 é um erro "leve" (RFC 1122 §4.2.3.9): o TCP do assinante não desiste da
+conexão, e conecta quando uma porta se libera. O Linux sozinho cumpre só a (a), em silêncio.
+
+**Por que o kernel não avisa** (lido em `net/netfilter/nf_nat_core.c` e `nf_conntrack_core.c`):
+
+- a NAT nunca falha. `nf_nat_l4proto_unique_tuple` procura uma porta livre na faixa em até 128 + 64 + 32
+  + 16 tentativas contíguas a partir de pontos aleatórios; não achando, fica com uma tupla **já em uso**;
+- a conexão cai depois, no `__nf_conntrack_confirm`, que roda depois de todo gancho: conta
+  `insert_failed` e devolve `NF_DROP`;
+- por isso nenhuma regra nftables vê a falha (um `reject` não teria onde ficar), e nem XDP nem TC a veem
+  (a queda é dentro do netfilter; TC de saída nunca recebe o pacote).
+
+**Como fazemos:**
+
+1. O tick do engine (a cada 10 s, a mesma leitura do conntrack do alerta) põe no conjunto `full` da
+   tabela `ip corerouter_cgnat` os assinantes cuja faixa atual (o slot, ou o último bloco) está a
+   **80 %** ou mais no protocolo mais cheio. Como a busca do kernel desiste antes de varrer tudo, um
+   slot pode recusar antes de 100 %; abaixo de 80 % a chance é desprezível (**estimado**).
+2. Uma chain `filter` em `postrouting`, prioridade `srcnat + 5` (logo **depois** da NAT), manda à fila
+   só as conexões novas desses assinantes:
+   `ct state new ct original ip saddr @full queue num 7423-7426 bypass`.
+   Quem não está no conjunto nunca sai do kernel. `bypass`: sem ninguém atendendo, o kernel decide como
+   antes.
+3. Quatro threads do serviço `cgnat-icmp` do daemon (uma por fila; o kernel espalha as filas pelo hash
+   dos endereços) recebem cada pacote **com a conexão** (`NFQA_CFG_F_CONNTRACK`): a tupla de resposta
+   que a NAT escolheu. Uma consulta ao conntrack (`IPCTNL_MSG_CT_GET`; o kernel indexa as duas direções
+   de toda conexão) diz se ela já é de outra conexão:
+   - **livre**: o pacote segue intocado;
+   - **tomada**: o pacote é descartado ali (o que o `confirm` faria) e o assinante recebe o ICMP.
+4. O ICMP cita o pacote **como o assinante o mandou** (RFC 792; até 576 bytes no total, RFC 1812
+   §4.3.2.3): a fila o vê depois da NAT, então o IP e a porta (ou o id do ICMP) de origem voltam a ser
+   os privados, com os checksums ajustados (RFC 1624). Sai por um socket ICMP *raw*; o kernel põe como
+   origem o endereço do roteador do lado do assinante. Não se responde a erro ICMP nem a fragmento que
+   não é o primeiro (RFC 1812 §4.3.2.7).
+5. **Limite de taxa** (RFC 1812 §4.3.2.8): `icmp_rate` mensagens por segundo **por assinante** (padrão
+   2, também a rajada) e 1000 por segundo no roteador (o `icmp_msgs_per_sec` do Linux). O limitador
+   guarda no máximo 65 536 assinantes; uma tempestade de origens falsas não cresce a memória. Uma
+   tempestade de SYN de um assinante sem portas nunca vira amplificador: no máximo 2 ICMP/s para ele.
+6. No modo blocos, a fila 7422 (primeiro pacote sem bloco) também responde com o ICMP quando não há
+   bloco livre.
+
+**Comandos:** `ip.firewall.cgnat.set {icmp_unreachable?, icmp_rate?}`; `alert.list` traz `refused`,
+`icmp_sent`, `icmp_limited`, `full` (quantos estão sendo conferidos) e, por assinante, `refused`, `icmp`,
+`last_refused`. Na janela: aba Alerts (selos e coluna Refused, ⓘ "ICMP Unreachable").
+
+**Escolha do mecanismo (números na seção 6.7):**
+
+| Opção | Funciona? | Custo no caso normal | Observação |
+|---|---|---|---|
+| regra nftables com `reject` | não | — | a falha acontece no `confirm`, depois de todo gancho; `reject` nem vale em `postrouting` |
+| XDP / TC | não | — | a queda é dentro do netfilter; TC de saída não recebe o pacote; um programa num `kprobe`/tracepoint do `kfree_skb` exigiria root, BTF e ficaria fora do crate isolado de eBPF |
+| nfqueue de **todas** as conexões novas | sim | uma ida ao userspace por conexão nova (~255 mil/s hoje, seção 6.3) | inaceitável |
+| **nfqueue só de quem está perto do fim** (adotado) | sim | uma checagem `ct state new` por pacote; nada sai do kernel | 4 filas, uma thread cada, sem lock do `Session` |
+
+
+### 1.10 Capacidade (G2.7b)
+
+Quantas portas os assinantes usam de verdade, e quantas portas por assinante isso pede. Fica na aba
+**Capacity** da janela CGNAT.
+
+**De onde vêm os números:**
+
+- A cada 10 s o serviço `cgnat-scan` do daemon lê o conntrack **fora do lock do `Session`**, uma
+  conexão por vez, sem guardar a tabela.
+- Ele monta um vetor ordenado de entradas de 12 bytes (assinante, IP público, protocolo, porta) e só
+  então pega o lock para entregar o resultado.
+- Com o lock, o trabalho é O(assinantes): blocos, alertas, conjunto `full` (G2.7) e os picos.
+- Sem esse serviço (o laboratório), o tick do engine lê sozinho.
+
+**O que se guarda:**
+
+- por assinante, o **pico de cada dia** dos últimos 7 dias, no protocolo mais cheio: um anel de
+  20 bytes por assinante;
+- por pool, as recusas e os ICMP de cada hora das últimas 24 h, e a hora da última recusa de cada
+  assinante;
+- tudo vai ao journal `journal-cgnat-capacity.log` a cada 10 min e volta no boot;
+- teto de 262 144 assinantes guardados.
+
+**Comandos:**
+
+- `ip.firewall.cgnat.capacity.get {pool}`:
+  - os cartões: limite e assinantes por IP, pico p99 dos 7 dias e seu %, quem bateu no limite em
+    24 h com recusas e ICMP;
+  - a distribuição do pico por faixa: 0–25, 25–50, 50–75, 75–90, 90–100 e 100 %;
+  - a **sugestão**, com o motivo (detalhes abaixo).
+- `ip.firewall.cgnat.capacity.preview {pool, ports_per_subscriber}`, que não muda nada:
+  - quantos assinantes seriam **remapeados** (mudar as portas remapeia o pool inteiro);
+  - quantas **conexões vivas** o commit derrubaria;
+  - se cabe nos IPs públicos e o comando que aplicaria.
+
+**A sugestão:**
+
+- o p99 mais 25 %, arredondado para cima em múltiplos de 64, nunca abaixo de 320;
+- se mais de 1 % dos assinantes vistos ficou sem porta em 24 h, pelo menos 1,5 × o valor de hoje;
+- traz o ganho (ou a perda) em assinantes por IP público e os IPs necessários;
+- no modo blocos não há sugestão: lá quem cresce é `max_blocks`.
+
+**Aplicar com Safe Mode:** o botão só aparece habilitado depois da prévia do mesmo valor. Ele liga o
+Safe Mode (`config.safe-mode.enter`) e roda `ip.firewall.cgnat.pool.set`. Sem confirmação, tudo volta.
+O "Quem era?" guarda a mudança com a hora (seção 1.5).
+
+### 1.11 Log de NAT em IPFIX (G4.4j)
+
+O que o CGNAT faz também sai em IPFIX (RFC 8158), para um coletor externo guardar o ano que o Marco
+Civil pede. A janela IP › Firewall › CGNAT tem a aba **Logging**; os coletores e os interruptores são
+os do `/ip traffic-flow` (um exportador só, um socket por coletor; `docs/traffic-flow.md`).
+
+| Evento | `natEvent` | Quando | Campos |
+|---|---|---|---|
+| Bloco alocado / liberado (§4.6.10) | 16 / 17 | cada bloco do modo blocos | assinante, IP público, `portRangeStart/End/StepSize/NumPorts`, `natPoolId`, `vlanId` e `userName` (login PPPoE/IPoE, quando há sessão) |
+| Pool sem bloco livre (§4.6.5) | 3 | o alocador não acha bloco | `natPoolId` |
+| Assinante sem porta livre (§4.6.7.3) | 13, `natQuotaExceededEvent` 3 | a fila de exaustão do G2.7 recusou, ou o assinante tem `max_blocks` | assinante, `maxEntriesPerUser` (portas), `natPoolId` |
+| Assinante acima do alerta (§4.6.8.3) | 18, `natThresholdEvent` 4 | o alerta de portas (seção 1.8) cruzou | assinante, `addressPortMappingPerUserHighThreshold` (o `alert_percent`), `natPoolId` |
+| Sessão NAT44 criada / encerrada (§4.6.1) | 4 / 5 (ou 1/2 legado) | cada conexão, se ligado | origem antes e depois do NAT; destino só com `nat_events_destination` |
+
+- **Padrões:** blocos e limites ligados (`nat_port_blocks`, `nat_limits`), sessões desligadas
+  (`nat_events=no`, como no RouterOS). Os limites saem no máximo uma vez por minuto por pool ou
+  assinante (RFC 8158 §5.2).
+- **Só NAT:** com `flows=no` e sem sessões, o exportador nem lê a tabela de conexões do kernel.
+- **Fila própria:** os eventos vão do alocador ao exportador por uma fila do engine (262 144
+  eventos, descarte contado em `ip.traffic-flow.stats` → `nat_log_dropped`), não pelo log do
+  roteador, cuja janela recente tem 1024 linhas: uma tempestade de blocos perdia quase tudo.
+- **Identidade:** o login e a VLAN vêm do serviço PPPoE/IPoE pelo índice por endereço (O(1)),
+  fora do lock da sessão.
+- **Durabilidade:** o primeiro pacote do assinante só segue depois que a linha do bloco está no
+  journal (`fdatasync`). Desde o G4.4j os primeiros pacotes que esperam na fila 7422 são servidos
+  em lote: um lock e um `fdatasync` por lote, não por bloco.
+- **Determinístico:** não há bloco a registrar; a fórmula e o histórico das pools (seção 1.5) são o
+  registro (RFC 7422). Os limites (13, 18) valem nos dois modos.
+
+### 1.12 O conntrack comporta os pools? (G2.3h)
+
+Cada conexão traduzida é uma entrada do conntrack do kernel. Com a tabela cheia, o kernel descarta
+conexões novas ("nf_conntrack: table full, dropping packet"), sobre portas que o pool ainda tem.
+O padrão do kernel numa máquina com mais de 4 GB é 262 144 entradas: no notebook do dev.595, um
+pool de 1280 assinantes precisava de 384 000.
+
+- **A conta:** assinantes de todos os pools ligados × `connections_per_subscriber` (`ip.firewall.cgnat.set`,
+  padrão 300, **estimado**; a tabela de dimensionamento do 6WIND vai de 100 a 1500 por CPE),
+  contra o `nf_conntrack_max` configurado em System › Tuning ou, sem ele, o do kernel.
+- **Onde aparece:** `pool.add`/`set` (`warnings`), `pool.preview` (check `conntrack`), `pool.list`
+  (selo `conntrack` em cada pool ligado), `capacity.get` e `ip.firewall.cgnat.get` (objeto
+  `conntrack`), `system.health.check` (item "CGNAT conntrack", aviso) e a aba Capacity.
+- **A sugestão:** o primeiro perfil do Tuning (balanced, depois throughput) cujo
+  `nf_conntrack_max` comporta a conta nesta máquina; a aba Capacity abre System › Tuning ›
+  Profiles com ele escolhido. Sem perfil que caiba, `max_entries` = a conta arredondada a
+  65 536 (`ip.firewall.connection.tracking.set`), se a RAM aguenta (o Tuning limita a tabela a um
+  quarto dela); senão, o aviso diz que a RAM não comporta.
+- **Custo:** a soma dos assinantes é O(pools) e uma leitura do `nf_conntrack_max`; a saúde faz
+  isso a cada avaliação, sem crescer com os assinantes.
+
+## 2. Comandos
+
+| Comando | O que faz |
+|---|---|
+| `ip.firewall.cgnat.pool.add/set/remove/list` | pools; `list` traz os números e os selos |
+| `ip.firewall.cgnat.exception.add/set/remove/list` | 1:1 |
+| `ip.firewall.cgnat.set/get` | `history_days`; `get` resume pools e histórico |
+| `ip.firewall.cgnat.lookup {subscriber}` | ida: o slot do assinante agora |
+| `ip.firewall.cgnat.who-was {public, port, time?}` | volta, no tempo |
+| `ip.firewall.cgnat.mapping.list {pool, offset?, count?, subscriber?, public?}` | tabela de correspondência por página (≤ 5000 linhas) |
+| `ip.firewall.cgnat.history.list` | as épocas (RFC 7422 §3) |
+| `ip.firewall.cgnat.rules {pool?}` | o nftables gerado |
+| `ip.firewall.cgnat.block.list {pool?, subscriber?}` | blocos ativos (modo blocos), o atual de cada assinante e há quanto tempo está ocioso |
+| `ip.firewall.cgnat.block.history {subscriber?, public?, port?, from?, to?}` | o log de blocos (alocação e liberação) |
+| `ip.firewall.cgnat.alert.list` / `alert.clear` | assinantes no limite de portas e o `insert_failed` do kernel; recusados e ICMP enviados (G2.7) |
+| `ip.firewall.cgnat.capacity.get {pool}` / `capacity.preview {pool, ports_per_subscriber}` | uso real (pico p99 de 7 dias, distribuição, quem bateu no limite em 24 h), sugestão de portas por assinante e a prévia do que mudar derruba (G2.7b) |
+| `ip.firewall.cgnat.set {history_days?, icmp_unreachable?, icmp_rate?, connections_per_subscriber?}` | retenção do histórico; ICMP quando as portas acabam e o limite por assinante (G2.7); conexões por assinante para a conta do conntrack (G2.3h) |
+| `ip.traffic-flow.set {nat_port_blocks?, nat_limits?, nat_events?, flows?}` / `ip.traffic-flow.target.*` | o log de NAT em IPFIX (aba Logging, seção 1.11; G4.4j) |
+| `tool.ip-calc.cgnat.plan {inside, outside, ports_per_subscriber?, port_range?, mode?, preview?}` | o planner (Tools › IP Calculator): números, checagens, sugestões, prévia e os parâmetros do `pool.add`; aceita quantidades (`"4096"`) |
+| `tool.ip-calc.cgnat.export {…, format: csv \| text \| routeros \| nft}` | a tabela do plano em CSV, texto imprimível, script RouterOS ou o nftables |
+
+Exemplo:
+
+```sh
+cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run ip.firewall.cgnat.pool.add \
+  '{"name":"cgnat1","inside":"100.64.0.0/22","outside":"203.0.113.0/28","ports_per_subscriber":1000}'
+cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run ip.firewall.cgnat.who-was \
+  '{"public":"203.0.113.1","port":2500,"time":"2026-10-23T14:02:00-03:00"}'
+```
+
+## 3. Testes
+
+- **Mapeamento (model, proptest):**
+  - ida e volta em toda porta de borda;
+  - nenhum bloco repetido;
+  - nada fora da faixa e da sobra;
+  - a ordem escrita é a ordem do mapa;
+  - texto hostil nas faixas.
+- **Validação (`proto-cgnat`):** cada erro e aviso da seção 1.6.
+- **Comandos (`crates/engine/tests/cgnat.rs`):**
+  - sucesso, validação de cada parâmetro e rollback;
+  - "Quem era?" antes e depois de mudar o pool;
+  - modo transacional;
+  - o histórico atravessando um reinício.
+- **Parâmetros lixo:** o `command_sweep` cobre.
+- **Blocos (`crates/engine/tests/cgnat_blocks.rs`, no lab):**
+  - os assinantes "online" do lab recebem blocos pareados, espalhados pelos IPs;
+  - os pesados ganham um segundo bloco no mesmo IP;
+  - o ocioso solta o bloco, com log, e não recebe o mesmo de volta antes de 120 s;
+  - os blocos sobrevivem a um reinício;
+  - pool esgotado recusa; pool mudado solta;
+  - alertas: uma linha por travessia.
+- **Kernel (`crates/hal-linux/tests/netns_cgnat.rs`, netns sem root):**
+  - assinantes num namespace saem pelo NAT deste até um servidor num terceiro;
+  - UDP, TCP e ICMP saem no IP e na faixa da fórmula, e a volta da fórmula sobre o que o servidor
+    viu dá o assinante;
+  - a exceção 1:1 mantém a porta;
+  - EIM: a mesma porta pública para dois destinos;
+  - EIF: um estranho alcança o mapeamento;
+  - hairpin: quem recebe vê o IP público de quem mandou;
+  - tirar os pools apaga a tabela;
+  - modo blocos: sem ouvinte da fila, o primeiro pacote cai; com ouvinte, sai no bloco alocado; o
+    bloco sobrevive à troca da tabela;
+  - esgotamento (G2.3e, RFC 6888 REQ-3/11): com 64 portas, 80 fluxos dão exatamente 64, todos no slot
+    do assinante (nunca uma porta do vizinho), e o kernel conta as recusas;
+  - remapear mata as conexões antigas mesmo com um ping no meio (o bug do #178);
+  - sem portas (G2.7, RFC 6888 REQ-11): 10 fluxos além das 64 portas dão 10 recusas e exatamente 5
+    ICMP código 1 (a rajada do limite), cada um citando o IP e a porta **privados** do assinante; um
+    vizinho no conjunto `full` com portas livres sai normalmente, e quem não está nele nunca chega à fila.
+- **G2.7 sem kernel:** o ICMP montado (checksums de IP, UDP e TCP conferidos contra um cálculo novo,
+  citação limitada a 576 bytes, sem resposta a erro nem a fragmento), o limitador (proptest: nunca mais
+  que a taxa mais a rajada; memória limitada), o codec da fila com a conexão e a consulta de tupla, e no
+  engine (`cgnat_blocks.rs`): recusas chegando aos alertas e ao log, uma linha por minuto por
+  assinante, `icmp_unreachable=no` esvaziando o conjunto; quarentena de 120 s por faixa depois de mudar
+  a geometria.
+- **Bateria de propriedades (`crates/engine/tests/cgnat_battery.rs`, G2.3e):**
+  - para formas aleatórias de pool, o que o planner diz que cabe é o que o pool criado com os
+    parâmetros dele faz;
+  - a prévia é a tabela do pool;
+  - todo assinante volta pelo "Quem era?" a partir do próprio slot (primeira, última e porta do
+    meio);
+  - entrada hostil no planner, na exportação e no "Quem era?" vira erro de parâmetro, nunca panic.
+- **Capacidade (G2.7b):**
+  - `crates/engine/tests/cgnat_capacity.rs`: picos, p99, faixas, sugestão (1536 com recusas acima de
+    1 %), prévia (1024 remapeados, conexões contadas, "não cabe" sem mudar nada) e os números que
+    voltam depois de um reinício;
+  - proptest do anel de 7 dias e do journal hostil;
+  - teste da UI: cartões, distribuição, Prévia e Aplicar com Safe Mode;
+  - screenshots claro e escuro.
+- **Fast path (G2.4):** veja `docs/fastpath.md` §3.
+- **Desempenho:** seção 6 (benches `netns_cgnat`, `netns_cgnat_pps`, `cgnat_who_was`).
+
+## 4. Plano das próximas partes
+
+| Parte | O que entra |
+|---|---|
+| G2.3b (feito) | nftables por nfnetlink, sem o binário `nft`; diferença de elementos; uma regra para todos os protocolos; remapeados derrubados e mapeamentos UDP esquecidos; números em `docs/architecture.md` §1.2.1 |
+| G2.2a (feito) | IP › Firewall › Connections (ctnetlink: lista, filtros, assinantes com mais conexões, kill, timeouts, uso da tabela, coluna Via) |
+| G2.3c (feito) | Modo blocos (fila 7422 + alocador pareado, cresce, solta com quarentena de 120 s), log por bloco (log do roteador e syslog), "Quem era?" pelo histórico de blocos, alerta de portas |
+| G2.3d (feito) | Janela IP › Firewall › CGNAT: pools, exceções, Quem era?, mapeamento, histórico, alertas; ⓘ em cada campo |
+| G6.9a (feito) | Tools › IP Calculator: Subnet, IPv6/PD, CGNAT planner (criar pool, exportar, ver regras, script RouterOS); comandos `tool.ip-calc.*` |
+| G2.4a (feito) | Fast path (flowtable em software, offload em hardware mlx5) e a janela Fast path |
+| G2.3e (feito) | Bateria final de bugs e desempenho e o relatório (seção 6) |
+| G2.7 (feito) | Sem portas: ICMP *host unreachable* (RFC 6888 REQ-11b) com limite de taxa, fila só dos quase cheios; REQ-8 por faixa de portas (seção 1.9) |
+| G4.4j (feito) | Log de NAT em IPFIX (RFC 8158): blocos com pool, VLAN e login, limites, aba Logging; SCTP e TLS; alocação em lote com um `fdatasync` por lote (seção 1.11) |
+| G2.7b (feito) | Aba Capacity: pico p99 por assinante em 7 dias, quem bateu no limite, distribuição, sugestão de `ports_per_subscriber` com prévia e Safe Mode; leitura do conntrack fora do lock (seção 1.10) |
+
+## 5. Pesquisa
+
+### MikroTik RouterOS v7
+
+Fonte: [NAT](https://help.mikrotik.com/docs/spaces/ROS/pages/3211299/NAT) (seção CGNAT).
+
+- A receita oficial cita a RFC 7422 e é um **script que gera um `src-nat` por assinante**, com
+  `to-addresses` e `to-ports`, organizado em chains de jump. Não usa `netmap`.
+- A comunidade faz o mesmo com `netmap` por /29, com geradores como o
+  [made4it](https://www.made4it.com.br/cgnat/). São ~6 mil regras por /21, todas geradas por
+  script.
+- Não há PBA nem log por bloco; os pedidos no fórum são antigos
+  ([bulk port allocation](https://forum.mikrotik.com/t/feature-request-bulk-port-allocation-for-cgnat/155965),
+  [sticky NAT](https://forum.mikrotik.com/t/cgnat-src-port-reuse-to-different-destinations-sticky-nat/151471)).
+- `endpoint-independent-nat` existe só para UDP e precisa de um par de regras srcnat/dstnat.
+- "Quem era?" no MikroTik: abrir o script e fazer a conta à mão.
+
+### Outros
+
+- **VyOS** ([CGNAT](https://docs.vyos.io/en/latest/configuration/nat/cgnat.html)):
+  - comandos `nat cgnat pool external … per-user-limit port` (padrão 2000) e
+    `show nat cgnat allocation`;
+  - por baixo, mapas de intervalo do nftables, uma regra por protocolo, verificação de capacidade
+    e `conntrack -D` ao mudar. É o desenho mais próximo do nosso.
+- **Juniper** (`deterministic-port-block-allocation`, PBA):
+  - `block-size`, `max-blocks-per-address`, `active-block-timeout`, `interim-logging-interval`;
+  - logs `JSERVICES_NAT_PORT_BLOCK_ALLOC/RELEASE/ACTIVE`;
+  - comandos de ida e volta `show services nat deterministic-nat internal-host / nat-port-block`;
+  - a documentação manda arquivar o mapeamento antigo, porque mudar a config remapeia.
+- **Cisco IOS-XE**:
+  - `ip nat settings pap`, `bpa set-size … step-size …`;
+  - log só por NetFlow v9 (IEs 361/363/364 para o bloco).
+- **A10** (`fixed-nat`): `ports-per-user`, `usable-nat-ports` e um `dynamic-pool-size` para quando
+  o bloco fixo acaba.
+- **F5** (LSN):
+  - modos `napt`, `deterministic` e `pba`;
+  - `dnatutil` faz a volta com a hora;
+  - bugs públicos ensinam: volta errada com faixas maiores que /16 e estado intercalado entre
+    núcleos (por isso a nossa fórmula é uma só, testada por proptest).
+- **Jool** (`pool4`): limite de iterações na busca de porta livre, para um pool cheio não queimar
+  CPU.
+
+### RFCs
+
+Toda a cadeia, com errata:
+
+- [RFC 7422](https://www.rfc-editor.org/rfc/rfc7422):
+  - §2: f1 e f2, e a MAY de usar a faixa para os ids de ICMP;
+  - §2.2: alarmes de utilização;
+  - §3: registrar mudanças;
+  - errata 4211, editorial;
+- [RFC 6888](https://www.rfc-editor.org/rfc/rfc6888), BCP 127, atualiza a 4787:
+  - REQ-2: IP pareado;
+  - REQ-3: pools não contíguos;
+  - REQ-4: limite de portas por assinante;
+  - REQ-7: EIF recomendado;
+  - REQ-8: porta liberada segura por 120 s;
+  - REQ-11: sem mapeamento, descarta e SHOULD mandar ICMP *code 1*;
+  - REQ-12: não registrar destinos;
+  - §5: blocos;
+- [RFC 7857](https://www.rfc-editor.org/rfc/rfc7857):
+  - EIM/EIF por protocolo;
+  - porta aleatória (§9);
+  - RST (§2.2);
+- [RFC 4787](https://www.rfc-editor.org/rfc/rfc4787):
+  - REQ-1: EIM;
+  - REQ-3: portas abaixo de 1024;
+  - REQ-5: timer UDP ≥ 2 min, 5 min recomendado;
+  - REQ-8: EIF/ADF;
+  - REQ-9: hairpin com o endereço externo;
+- [RFC 5382](https://www.rfc-editor.org/rfc/rfc5382) (TCP: ocioso ≥ 2 h 4 min, transitório ≥ 4
+  min);
+- [RFC 5508](https://www.rfc-editor.org/rfc/rfc5508) (ICMP: id traduzido, timer ≥ 60 s);
+- [RFC 6598](https://www.rfc-editor.org/rfc/rfc6598) (100.64.0.0/10, §4);
+- [RFC 8512](https://www.rfc-editor.org/rfc/rfc8512) (nomes do YANG de NAT; não tem tipo
+  "determinístico").
+
+Kernel:
+
+- `nf_nat_core.c`:
+  - `get_unique_tuple` tenta a porta original, depois reaproveita o mapeamento da mesma origem e
+    só então sorteia na faixa;
+  - sem tupla livre, a conexão cai em silêncio e conta em `insert_failed`. Por isso o alerta de
+    portas esgotadas (G2.3c) não pode depender de o kernel avisar;
+- `nf_nat_proto.c`: faixa aplicada ao id do ICMP;
+- [`nf_flowtable`](https://docs.kernel.org/networking/nf_flowtable.html) (G2.4).
+
+### Sem portas (G2.7)
+
+Como cada um responde quando o assinante esgota as portas:
+
+- **MikroTik RouterOS v7** ([NAT](https://help.mikrotik.com/docs/spaces/ROS/pages/3211299/NAT)): é o
+  netfilter do Linux; o pacote cai em silêncio. Não há opção de ICMP, contador por assinante nem
+  alerta; o operador descobre pela reclamação ("um site não abre").
+- **VyOS** ([CGNAT](https://docs.vyos.io/en/latest/configuration/nat/cgnat.html)): nftables, o mesmo
+  silêncio; `show nat cgnat allocation` mostra a faixa, não as recusas.
+- **Juniper MX/SRX**: log `RT_SRC_NAT_OUTOF_PORT` e contador "port-block exceeded" por SNMP, sem dizer
+  o assinante ([relato de operador na NANOG, 2024](https://lists.nanog.org/archives/list/nanog@lists.nanog.org/thread/5D2M5GXMCODNBN3L6X22EINQXDWT43YM/));
+  o Junos 24.4R1 acrescentou aviso de limiar de blocos por assinante
+  ([Feature Explorer](https://apps.juniper.net/feature-explorer/feature/8747)). Não achamos
+  documentação pública de ICMP na recusa.
+- **A10 Thunder CGN**: traps `axLsnIpAllPortExhausted` e `axLsnTrafficNatPortUnavailable`
+  ([MIB](https://mibs.observium.org/mib/A10-AX-CGN-TRAPS-V1/)), por pool e por IP público; ICMP na
+  recusa não documentado publicamente.
+- **Cisco IOS-XE**: nada público sobre a resposta ao assinante; contadores em `show ip nat statistics`.
+- **RFCs:** RFC 6888 REQ-11 (a: MUST descartar; b: SHOULD ICMP código 1, preferido ao 13 por ser erro
+  leve na RFC 1122) e REQ-8 (120 s, com as exceções a/b/c); a 6888 atualiza a RFC 4787 e não tem
+  "Updated by"; sem errata registrada para a 6888. A RFC 5382 (atualizada pela 7857) não fala de ICMP
+  na falta de mapeamento: só do RST ao abandonar conexões (§5) e do ICMP *port unreachable* ao SYN não
+  pedido (REQ-4). RFC 1812 §4.3.2.3 (citar até 576 bytes), §4.3.2.7 (sem erro sobre erro nem sobre
+  fragmento não inicial) e §4.3.2.8 (limitar a taxa); RFC 1624 (checksum incremental); RFC 7422 §2.2
+  (alarmes de utilização).
+- **Kernel:** `nf_nat_core.c` (`nf_nat_l4proto_unique_tuple`, `NF_NAT_MAX_ATTEMPTS` 128 e rodadas pela
+  metade; `nf_nat_used_tuple_harder` despeja TIME_WAIT nas últimas 32 tentativas),
+  `nf_conntrack_core.c` (`nf_ct_resolve_clash` → `insert_failed`), `nfnetlink_queue.c`
+  (`NFQA_CFG_F_CONNTRACK`, `NFQA_CFG_F_FAIL_OPEN`), `nft_queue.c` (filas por hash, `bypass`).
+
+**O que fizemos melhor:** o ICMP da REQ-11b (nenhum dos pesquisados documenta) sem custo para quem tem
+porta; o assinante recusado aparece pelo nome (IP), com contagem e ICMP, no alerta e no log; a
+quarentena da REQ-8 por faixa, que também cobre a mudança de geometria.
+
+**Ficou de fora:** ICMPv6 (o CGNAT é NAT44; NAT64 não existe ainda); responder já na primeira recusa de
+um assinante que encheu entre duas leituras de 10 s (o conjunto `full` é atualizado a cada leitura; o
+TCP repete o SYN em 1 s, 3 s…, e as repetições já recebem o ICMP).
+
+### O que adotamos e o que melhoramos
+
+- **Adotado:**
+  - um objeto de primeira classe compilado em mapas: o do VyOS, mas com uma regra para os três
+    protocolos em G2.3b;
+  - verificação de capacidade no commit, dizendo quantos IPs faltam;
+  - ida e volta como comandos;
+  - as defaults da RFC.
+- **Melhor que os outros:**
+  - "Quem era?" **no tempo**, com o histórico de definições que a RFC 7422 §3 pede;
+  - o MAC e o Option 82 do DHCP na mesma resposta;
+  - `remapped` antes de aplicar;
+  - exceções que não remapeiam ninguém;
+  - prévia do nftables;
+  - tudo transacional, com Safe Mode e rollback.
+- **Fica para depois (vira gap):**
+  - PCP (REQ-9);
+  - login PPPoE no "Quem era?" (com o BNG);
+  - testes em hardware real (seção 6).
+
+## 6. Desempenho
+
+Tudo **medido** em 2026-10-23, build release, num namespace sem root, Ryzen AI MAX+ 395 (32 threads),
+kernel 7.0. A máquina estava com carga 8–16 (CIs de outras sessões): os números comparam
+configurações entre si, num núcleo. Não são o teto de um servidor.
+
+### 6.1 Carga da tabela (G2.3b)
+
+| Operação | netlink | `nft -f` |
+|---|---|---|
+| 64 Ki assinantes | 66 ms | 303 ms |
+| um assinante a mais | 0,155 ms | 2,40 ms |
+
+Tabela completa em `docs/architecture.md` §1.2.1 (bench `netns_cgnat`).
+
+### 6.2 Pacotes por segundo pelo NAT (bench `netns_cgnat_pps`)
+
+Um gerador `AF_PACKET` em Rust escreve quadros UDP de 64 bytes de 255 assinantes (um fluxo
+cada) numa veth. Eles atravessam o CGNAT e saem por outra veth, e os `tx_packets` dela contam.
+Antes de medir, cada fluxo recebe uma resposta (escrita do outro lado a partir da tupla do
+conntrack): UDP só fica `established` depois de uma resposta, e só aí entra no flowtable.
+
+| Caminho | pps (mediana) |
+|---|---|
+| só roteamento (sem conntrack) | ~830 mil |
+| CGNAT (conntrack + mapa da fórmula) | ~650 mil |
+| CGNAT + fast path em software (G2.4) | ~1,04 milhão (254 de 255 fluxos no flowtable) |
+
+O fast path devolve o custo do NAT e do conntrack: com ele o CGNAT fica no nível do
+roteamento puro (o limite passa a ser a veth num núcleo).
+
+### 6.3 Conexões novas por segundo
+
+Cada quadro é uma conexão nunca vista (outra porta de origem de um dos 255 assinantes). Entre as
+rodadas, fora do tempo, as conexões novas são apagadas: cada rodada começa com ~20 conexões por
+assinante, como num roteador.
+
+| Caminho | conexões novas/s |
+|---|---|
+| só conntrack, sem NAT | ~551 mil |
+| CGNAT, EIM desligado | ~274 mil |
+| CGNAT (EIM ligado, o padrão) | ~255 mil |
+
+- O NAT custa cerca de metade da criação da conexão: a escolha de uma porta livre no slot do
+  assinante (`nf_nat`).
+- O EIM (o `update` no mapa dinâmico) custa pouco, ~7 %.
+- **Slot quase cheio:** sem apagar entre as rodadas, as conexões se acumulam até perto das 1000
+  portas de cada assinante, e a taxa cai para **~13 mil/s**, ~20× mais lenta. Com quase todas as
+  portas ocupadas, o kernel tenta várias antes de achar uma livre (ou desistir).
+- **Consequência operacional:** o alerta de portas (padrão 90 %) avisa antes desse ponto.
+  Assinantes que vivem perto do limite pedem mais portas por assinante (o planner mostra quantas
+  cabem).
+
+### 6.4 "Quem era?" (bench `cgnat_who_was`, engine)
+
+| Pool | Histórico | Latência |
+|---|---|---|
+| 64 Ki assinantes | 1 época | 1,4 µs |
+| 64 Ki assinantes | 365 épocas (uma mudança por dia, um ano) | 3,0 µs |
+
+É a busca da época em vigor mais o `Layout::reverse`: não depende do tráfego nem de log, porque não
+há log por conexão (RFC 7422 §2).
+
+### 6.5 Memória por conexão (**estimado**)
+
+O `struct nf_conn` com as extensões de NAT, contabilidade e timestamp ocupa ~320–400 bytes no slab
+`nf_conntrack` (fonte do kernel 6.x/7.x). O tamanho medido exige ler `/proc/slabinfo` como root, e
+fica no G2.3f: `sudo grep nf_conntrack /proc/slabinfo` (coluna `objsize`).
+
+Para 1 milhão de conexões, ~400 MB. Os mapas do CGNAT são ~200 B por assinante (**estimado**): 13 MB
+para 64 Ki assinantes.
+
+### 6.7 Sem portas (G2.7, bench `netns_cgnat_pps`, grupo `netns_cgnat_exhaustion`)
+
+**Medido** em 2026-10-27, build release, namespace sem root, a mesma máquina, com carga 15–40 de outras
+sessões.
+
+**Custo no caso normal** (ninguém sem portas). As três tabelas medidas em turnos alternados, nove
+rodadas, mediana, para a carga pesar igual em todas:
+
+| Tabela | conexões novas/s | pps estabelecidos |
+|---|---|---|
+| sem a chain `exhausted` (antes) | 280 557 | 746 648 |
+| com a chain, conjunto `full` vazio | 285 774 | 756 634 |
+| com a chain, 4096 **outros** assinantes no conjunto | 261 922 | 759 061 |
+
+- A chain vazia não tem custo mensurável: a diferença fica dentro do ruído das rodadas. Os pacotes
+  estabelecidos param no primeiro teste (`ct state new`); com o fast path (G2.4) eles nem passam pela
+  chain.
+- Com milhares no conjunto, a consulta ao hash custa no máximo ~7 % das conexões novas, só enquanto
+  houver tanta gente perto do limite. É um sinal de pool subdimensionado (aba Capacity, G2.7b).
+
+**Quando as portas acabam:**
+
+| Medida | Valor |
+|---|---|
+| do frame recusado ao ICMP de volta no assinante | 125 µs (média de 20 amostras; veth, NAT, fila, consulta ao conntrack, socket ICMP) |
+| tempestade de um assinante para um destino (uma fila só: o kernel escolhe a fila pelo hash dos endereços) | 188 mil frames recusados/s atendidos, sem perda (1,72 milhão examinados de 1,72 milhão enviados) |
+| tempestade de oito assinantes (quatro filas) | 174 mil/s: o mesmo teto |
+| ICMP numa tempestade de 20 mil recusas em 0,39 s | 14 enviados, 19 986 segurados pelo limite |
+
+- Uma thread dá conta de ~190 mil recusas/s (≤ 5,3 µs por pacote: a consulta ao conntrack é uma ida e
+  volta de netlink). O teto medido é o gerador: um núcleo que escreve na veth e faz no softirq dele a
+  NAT e o enfileiramento. Por isso quatro filas não aumentaram o número aqui.
+- As quatro filas, com uma thread cada, ficam para quando vários núcleos recebem (RSS numa placa de
+  verdade, G2.3f). Ociosas, as threads só esperam no `poll`.
+- Estouro do socket da fila (`ENOBUFS`) numa tempestade não é erro: com `F_FAIL_OPEN` o pacote segue e o
+  `confirm` o recusa como antes, sem ICMP. Conta em `overrun`, e o buffer de recepção é de 4 MB.
+- O limitador e as contagens ficam atrás de um `Mutex` compartilhado, uma vez por recusa, sem E/S
+  dentro: a 188 mil/s não apareceu disputa.
+
+### 6.8 Capacidade com 64 Ki assinantes (G2.7b, bench `cgnat_capacity`, engine)
+
+**Medido** em 2026-10-27, build release, a mesma máquina (carga 4–9): 65 536 assinantes, 20 conexões
+cada, 1,3 milhão de conexões.
+
+| Etapa | Tempo | Onde |
+|---|---|---|
+| montar o uso (vetor ordenado de 12 bytes) | 51 ms | fora do lock |
+| o mesmo com um conjunto por assinante e protocolo (o método antes do G2.7b) | 75 ms | antes, **dentro** do lock, depois de ler a tabela inteira |
+| entregar ao engine (blocos, alertas, `full`, picos) | 5,6 ms | com o lock |
+| `ip.firewall.cgnat.capacity.get` do pool de 64 Ki | 4,1 ms | consulta |
+
+**Memória:**
+
+- os picos de 7 dias ocupam 2,8 MiB para 64 Ki assinantes;
+- o uso de uma leitura ocupa 15 MiB para 1,3 milhão de conexões, só enquanto é montado;
+- antes, a leitura guardava a tabela inteira como `Conn` (~100 bytes cada, **estimado**).
+
+**Paralelismo:**
+
+- montar o uso custa 51 ms a cada 10 s, 0,5 % de um núcleo, numa thread própria e fora do lock;
+- dividir por assinante entre threads não pagaria a coordenação;
+- o lock do `Session` fica 5,6 ms com 64 Ki assinantes, em vez de cobrir a leitura do conntrack
+  (~1 s para um milhão de conexões, **estimado** no G2.2).
+
+### 6.9 Tempestade de blocos e o log de NAT (G4.4j, bench `cgnat_pba_storm` e `netns_nat_ipfix`)
+
+AMD Ryzen AI MAX+ 395, kernel 7.0, 2026-10-27, **medido**.
+
+- **Alocação no engine** (release, 10 000 assinantes num /17 sobre 4096 IPs públicos, storage em
+  memória): 11 µs por bloco antes, 4,4 µs depois (−60 %, 229 mil blocos/s). O alocador ordenava os
+  4096 endereços a cada bloco para achar o menos usado; agora acha o mínimo numa passada.
+- **Journal:** cada bloco fazia `open` + `write` + `fdatasync` sob o lock da sessão (~1,2 ms neste
+  NVMe). Em netns, com o daemon de teste (sem otimização), a tempestade de 20 000 primeiros pacotes
+  passou de 632 para 3 411 blocos/s com o lote, e de 313 para 147 µs de CPU por bloco.
+- **Release, ponta a ponta** (`netns_nat_ipfix`): 20 000 blocos chegaram aos coletores SCTP e TLS,
+  24 µs de CPU do daemon por bloco, nenhum descarte (`nat_log_dropped` 0). Drenar a fila do engine
+  custa 14 ns por registro (bench `drain_10k_records`).
+- **Fila do kernel:** a fila 7422 tinha o tamanho padrão de 1024 pacotes (o `MAXLEN` de 4096 só
+  ia para as filas com flags); 2 000 primeiros pacotes de uma vez perderam metade. Agora toda fila
+  pede 4096. O que passa disso cai e o cliente tenta de novo (o teste manda em rodadas).
+
+### 6.6 O que veth mede e o que só hardware mostra
+
+- **A veth mede** o custo relativo no kernel: NAT × roteamento × fast path, criação de conexão,
+  efeito do slot cheio e o tempo de aplicar a tabela.
+- **A veth não mede:**
+  - vazão por porta com RSS em vários núcleos;
+  - custo de interrupção e DMA;
+  - limite da tabela de CT de uma placa;
+  - offload em hardware (veth recusa `flags offload`);
+  - comportamento com milhões de conexões vivas e a memória real.
+
+Isso é o G2.3f (CGNAT em servidor real) e o G2.4b (ConnectX em switchdev).

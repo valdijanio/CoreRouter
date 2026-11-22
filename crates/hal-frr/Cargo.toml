@@ -1,0 +1,63 @@
+[package]
+name = "corerouter-hal-frr"
+description = "Platform: FRRouting driver — renders the proto-* crates, applies the diff over the daemons' vty sockets, reads state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+corerouter-model.workspace = true
+corerouter-hal.workspace = true
+corerouter-proto-bgp.workspace = true
+corerouter-proto-ospf.workspace = true
+corerouter-proto-mpls.workspace = true
+# G3.6b: the bfd block (profiles, peers).
+corerouter-proto-bfd.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+ipnet.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+corerouter-proto-bgp.workspace = true
+# G3.4d, the lab VM test: the iperf3 UDP datagrams count the loss of a
+# cut, and the simplified TI-LFA is checked against ospfd's.
+corerouter-proto-iperf.workspace = true
+corerouter-netsim.workspace = true
+# G3.4i, the lab VM test: R1's loopback reaches the kernel's lo through
+# LinuxHal, as in the daemon.
+corerouter-hal-linux.workspace = true
+
+[[bench]]
+name = "frr_conf"
+harness = false
+
+[[bench]]
+name = "filter_diff"
+harness = false
+
+[[bench]]
+name = "frr_rib"
+harness = false
+
+[[bench]]
+name = "frr_ospf"
+harness = false
+
+[[bench]]
+name = "frr_sr"
+harness = false
+
+# G3.4n: the FRR poll's cost on our side at scale.
+[[bench]]
+name = "frr_ospf_poll"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,2453 @@
+# Imagem do sistema (G1.6a, G1.6b, G1.6c, G1.6e, G1.6k, G1.6m)
+
+A imagem que vai no disco do roteador: kernel LTS, rootfs squashfs só de leitura, `/config`
+gravável, `corerouter-init` como PID 1 e `corerouter-daemon` como único serviço. Construída
+pelo Buildroot a partir de `os/` (uma árvore `BR2_EXTERNAL`), testada no QEMU sem root.
+
+```sh
+cargo xtask os check                 # confere a configuração (sem rede; também roda no `cargo xtask ci`)
+cargo xtask os build                 # baixa e confere o Buildroot fixado, compila e grava <out>/build/images/disk.img
+cargo xtask os out-dir               # a pasta <out> deste checkout (seção "Onde fica o build")
+cargo xtask os boot-test             # boota no QEMU (KVM do usuário ou TCG) e faz ping no canal de controle TLS
+cargo xtask os boot-test --tcg       # sem KVM (emulação; ~3× mais lento)
+cargo xtask os boot-test --efi       # o mesmo, pelo firmware UEFI (OVMF) e o disco inteiro
+cargo xtask os boot-test --append corerouter.shell=ttyS0 --timeout 600   # com shell de manutenção na serial
+cargo xtask os ab-test               # G1.6b: os 4 cenários A/B no QEMU (UEFI, sem root)
+cargo xtask os install-test          # G1.6c: instalador (CD, USB, interativo), qcow2 e OVA no QEMU
+cargo xtask os install-test --firmware seabios   # G1.6g: o mesmo por BIOS, pelo GRUB
+cargo xtask os ab-test --firmware seabios        # G1.6g: o A/B por BIOS, cruzado, cortes e controladoras
+cargo xtask os frr-test              # G1.6k: dois roteadores da imagem com OSPF, SR, LDP e BFD entre eles
+cargo xtask os wifi-test             # G1.30: a imagem como estação Wi-Fi contra um AP de teste (mac80211_hwsim + hostapd); --only ap: a imagem como AP (G1.30a)
+cargo xtask os package --out b.crpkg --version 0.1.1 --build 1800000000  # outro pacote deste build
+cargo xtask os build --only crpkg    # G1.6e: só o pacote de atualização (sem disk.img, ISO, qcow2, OVA)
+cargo xtask os push --to 127.0.0.1:7990   # G1.6e: --only crpkg, envia pela rede, espera o slot novo confirmar
+cargo xtask os release-key init           # processo: a chave de release (uma vez, cifrada com senha; docs/release.md)
+cargo xtask os release --tag v0.1.0       # processo: imagem da tag assinada pela chave de release, no rascunho da Release
+```
+
+`<out>` é a pasta do build deste checkout, fora do repositório (seção "Onde fica o build").
+A/B e atualização: seção "A/B e atualização segura (G1.6b)" abaixo. Instalador, imagens de VM e
+FRR: seção "Instalador, imagens de VM e FRR (G1.6c)" no fim.
+
+## O que entra na imagem
+
+| Parte | O quê | Onde |
+|---|---|---|
+| Buildroot | 2025.02.19, ramo **LTS** (correções de segurança até março de 2028); tarball conferido pelo SHA-256 do `.sign` assinado | `os/buildroot.lock` |
+| Toolchain | Bootlin x86-64 glibc stable 2024.05-1 (gcc 13.3, glibc 2.39), pronta e com hash no Buildroot | `os/configs/corerouter_x86_64_defconfig` |
+| Kernel | Linux **6.18.59** LTS (suporte projetado até dez/2028), `x86_64_defconfig` + fragmento; SHA-256 do `sha256sums.asc` assinado do kernel.org, conferido pelo Buildroot e de novo pelo xtask | `os/board/x86_64/linux.fragment`, `os/patches/linux/linux.hash` |
+| Init | `corerouter-init` (Rust, este workspace) | `apps/corerouter-init` |
+| Roteador | `corerouter-daemon --backend linux --config-dir /config --control 7979 --listen 0.0.0.0:8729 --web-files /usr/share/corerouter/web --web-factory-on` | `os/package/corerouter` |
+| GUI web | a GUI em WASM (trunk release + wasm-opt; `.wasm` e JS guardados como `.gz`), servida em `https://<roteador>/` pelo `ip.service www-ssl` (G1.6o, "Acesso web de fábrica" abaixo) | `/usr/share/corerouter/web` |
+| Espaço de usuário | `nft` sem JSON e sem CLI interativa (só diagnóstico no shell de manutenção: o hal-linux fala nfnetlink, G2.8), glibc, busybox (só para o shell de manutenção) | defconfig |
+| Roteamento | FRR **10.7.1** com libyang 3.13.6 (a versão validada na VM do laboratório; receita do Buildroot `master` portada, G1.6k): `mgmtd`, `zebra`, `staticd`, `bgpd`, `ospfd`, `ospf6d`, `ldpd`, `bfdd`, iniciados pelo `corerouter-init`; sem `vtysh`, scripts nem bash (G1.6c) | defconfig, `post-build.sh`, `os/buildroot-patches/` |
+
+O que o roteador precisa no kernel é `=y`; só os drivers de placa que precisam do `/` são módulo
+(`ice`, `i915`: seção "Firmware das placas e drivers em módulo (G1.6j)"). Som não entra
+(`# CONFIG_SOUND is not set`, G1.6zd). eBPF/XDP com BTF e JIT sempre
+ligado, AF_XDP, nftables completo (NAT, conntrack, flowtable, fib, socket, synproxy), **VRF**
+(`CONFIG_NET_VRF=y`, que destrava o `ip.vrf.add`, G1.14), MPLS (roteamento e túnel), bonding,
+802.1Q, bridge com VLAN filtering, PPP/PPPoE, L2TP, WireGuard, VXLAN, GRE, filas (HTB, fq,
+fq_codel, cake) e as placas ixgbe/ixgbevf, i40e/iavf (`I40EVF`), mlx5, virtio, e1000/e1000e/igb/igc
+e r8169. O `cargo xtask os build` confere que **todo** `=y` do fragmento sobreviveu ao
+`olddefconfig` (um símbolo cuja dependência falta some sem aviso) e falha se algum sumiu.
+
+### Disco
+
+GPT com GUIDs fixos (imagem reprodutível):
+
+| Partição | Tamanho | Conteúdo |
+|---|---|---|
+| `efi` | 128 MiB | vfat; `EFI/BOOT/BOOTX64.EFI` é o kernel do slot A (EFI stub), `EFI/COREROUTER/B.EFI` o do B, `A.HDR`/`B.HDR` os cabeçalhos assinados; sem bootloader (G1.6b: era 32 MiB, não cabiam dois kernels) |
+| `rootfs-a` | 256 MiB | squashfs zstd + a árvore do dm-verity logo depois (`rootfs.img`), tipo "Linux root x86-64" do Discoverable Partitions Spec |
+| `rootfs-b` | 256 MiB | o slot B, gravado pela primeira atualização |
+| `config` | 64 MiB no `disk.img`; o resto do disco depois de instalado (G1.6v) | ext4 vazio, rótulo `config`; vira `/config` |
+
+A linha de comando básica está **dentro do kernel** (`CONFIG_CMDLINE`): `console=tty0
+console=ttyS0,115200 root=PARTUUID=<rootfs-a> rootfstype=squashfs ro
+init=/usr/sbin/corerouter-init panic=10 quiet`. É a do **caminho de fallback** (o primeiro
+boot de uma imagem gravada, ou NVRAM apagada); cada slot boota pela sua entrada `Boot####` da
+UEFI, que acrescenta o dm-verity, os parâmetros de Tuning › Boot e `corerouter.slot` (G1.6b). O `cargo xtask os check` confere que o
+PARTUUID bate com o `rootfs-a` do `genimage.cfg` e que o `init=` é o binário que o pacote
+instala. `panic=10`: um kernel panic reinicia o roteador em 10 s, em vez de ficar parado.
+
+**Disco regravado e entradas velhas na NVRAM (G1.6zm).** A entrada `Boot####` acha o ESP pelo
+GUID da partição (`HD(…)`, UEFI 2.10 §10.3.5.1) e leva na linha de comando o hash raiz e o
+tamanho da árvore de verity da imagem que a escreveu. Todo `disk.img` tem o mesmo GUID de ESP,
+então, ao gravar outra versão no mesmo disco (ou pendrive) e manter a NVRAM, a entrada velha
+casava com o disco novo. O kernel parava em `verity: metadata block … is corrupted` e
+`Unable to mount root fs`. Visto num notebook Lenovo e reproduzido no `ab-test --scenario
+reflash`.
+
+Agora:
+
+- o primeiro boot de uma cópia (fora de um boot de teste) dá ao ESP um GUID só dele
+  (`gpt::renew_guid`, chamado pelo `corerouter-init`, linha `boot partition: GUID … of its
+  own`), antes de o daemon escrever as entradas;
+- o instalador grava o ESP já com um GUID aleatório.
+
+Uma entrada de outra imagem então aponta para uma partição que não existe. O firmware passa
+para a próxima opção e chega ao caminho de mídia removível (`\EFI\BOOT\BOOTX64.EFI`, a linha
+embutida). Esse boot dá ao ESP outro GUID e reescreve as entradas (`provision` trata como velha
+a entrada que aponta para outro ESP). Um roteador atualizado migra sozinho no primeiro boot da
+versão nova. As PARTUUIDs dos slots continuam as da imagem, porque a linha embutida aponta para o
+`rootfs-a`.
+
+Num firmware que guardou entradas de uma versão anterior à G1.6zm, a entrada ainda casa (o GUID
+dela é o da imagem). Uma vez só, escolha o pendrive ou disco no menu de boot do firmware (F12
+etc.), não "CoreRouter A", ou apague as entradas "CoreRouter" no setup. O passo seguinte é o hash na
+linha de comando assinada do próprio kernel (UKI, gap G1.6f), o que tira da NVRAM o que pode
+envelhecer.
+
+### `corerouter-init` (PID 1 em Rust)
+
+Faz só o que um appliance precisa, em ~450 linhas sem `unsafe` (rustix, signal-hook,
+netlink-sys, já no `Cargo.lock`):
+
+1. monta `/proc`, `/sys`, `/dev` (devtmpfs), `/dev/pts`, `/dev/shm`, `/run`, `/tmp`, `/var`
+   (tmpfs com teto), `/sys/fs/cgroup` (cgroup2), `/sys/fs/bpf` (os mapas XDP do G2.5) e
+   `tracefs`; a raiz continua squashfs só de leitura;
+2. lê `corerouter.*` da linha de comando do kernel (valores hostis recusados e cortados);
+3. sobe o `lo` com uma mensagem `RTM_NEWLINK` (sem binário `ip`): o canal de controle escuta em
+   `127.0.0.1`;
+4. monta `/config` da partição de rótulo `config` (espera até 5 s pelo probe assíncrono). Sem
+   partição ou com falha de montagem, monta tmpfs e avisa em letras grandes que a
+   configuração não sobrevive ao reboot: o roteador sobe e pode ser consertado pela rede;
+   em seguida dá às portas os nomes do RouterOS (`eth0` → `ether1`…, G1.6m, abaixo);
+5. inicia o daemon com ambiente limpo, saída em `/var/log/corerouter-daemon.log` (copiado e
+   truncado acima de 8 MiB: um daemon falante nem enche o `/var` nem trava na serial de
+   115200 baud), e o reinicia se cair: 0,5 s dobrando até 30 s, zerando depois de 60 s de pé.
+   Nunca desiste: roteador sem plano de controle é pior que um tentando de novo. Ao cair, as
+   últimas 20 linhas do log vão para a console;
+6. colhe todo filho que termina (inclusive órfãos), como todo PID 1 tem de fazer: `wait4(-1)`.
+   Até a G1.6m era `waitpid(None)` do rustix, que é `wait4(0)`, só o grupo de processos do
+   próprio init; o shell de manutenção (sessão própria) virava zumbi e nunca voltava;
+7. avisa quando o daemon responde `ping` em `127.0.0.1:7979` pela primeira vez (`ready:` com o
+   tempo desde o início do kernel) e, 10 s depois, a memória em uso (`idle:`);
+8. desliga limpo pelos sinais que o busybox `reboot`/`poweroff`/`halt` mandam ao PID 1
+   (SIGTERM/SIGUSR2/SIGUSR1) e por Ctrl-Alt-Del (SIGINT): SIGTERM ao daemon, 10 s para salvar,
+   SIGKILL, `sync`, desmonta `/config` (ou remonta só de leitura), `reboot(2)`;
+   o botão de energia ACPI (o "Shutdown" do hipervisor, `virsh shutdown`, o botão do servidor)
+   chega como SIGUSR2 pelo `CONFIG_ACPI_TINY_POWER_BUTTON` do kernel e desliga do mesmo jeito
+   (G1.6q).
+   Pela rede, `system.reboot {confirm: true}` e `system.shutdown {confirm: true}` (como o
+   `/system reboot|shutdown` do RouterOS; no terminal `/system reboot confirm=yes`) pedem o mesmo
+   ao PID 1: o serviço `power` do daemon manda SIGTERM ou SIGUSR2 ao init, e o SIGTERM que o init
+   devolve ao daemon grava o checkpoint da config (G0.27). Recusados sem `force` em Safe Mode
+   (o boot desfaria as mudanças) ou com mudanças de transação pendentes; fora da imagem (PID 1
+   que não é o `corerouter-init`) ficam desligados com o motivo (G1.6qa).
+
+**Sem shell por padrão.** `corerouter.shell=ttyS0` na linha de comando abre um `sh` do busybox
+naquela console (aberto de novo 1 s depois de sair: `exit`, Ctrl-D), para laboratório e
+recuperação. Como a linha de comando está
+gravada no kernel, ligar o shell num roteador em campo exige outra imagem ou acesso ao
+firmware: é acesso físico, como o console serial de um Juniper.
+
+## Pesquisa
+
+Fontes: [Buildroot, download e LTS](https://buildroot.org/download.html),
+[manual do Buildroot](https://buildroot.org/downloads/manual/manual.html) (BR2_EXTERNAL,
+`BR2_PER_PACKAGE_DIRECTORIES`, `BR2_REPRODUCIBLE`), [kernel.org releases](https://www.kernel.org/category/releases.html),
+[MikroTik: Upgrading and installation](https://help.mikrotik.com/docs/spaces/ROS/pages/328142/Upgrading+and+installation),
+[VyOS: Update VyOS](https://docs.vyos.io/en/latest/installation/update.html),
+[Talos](https://docs.siderolabs.com/talos), [Flatcar: update strategies](https://www.flatcar.org/docs/latest/setup/releases/update-strategies/),
+[Junos: instalação e upgrade de software](https://www.juniper.net/documentation/us/en/software/junos/software-installation-and-upgrade/),
+[RAUC](https://rauc.readthedocs.io/en/latest/basic.html), [Discoverable Partitions
+Specification](https://uapi-group.org/specifications/specs/discoverable_partitions_specification/).
+
+### Como os outros fazem imagem e atualização
+
+| Sistema | Imagem | Atualização | Volta automática |
+|---|---|---|---|
+| **MikroTik RouterOS v7** | Pacotes `.npk` assinados pela MikroTik (o `routeros` principal e extras); x86/CHR instalado por ISO/imagem | `/system package update` (canal, Download, Download&Install); RouterBOOT atualizado à parte | Sem A/B automático; falha séria = Netinstall |
+| **VyOS** | ISO com squashfs + overlay gravável por imagem; várias imagens lado a lado no GRUB | `add system image <url>` copia a config para a nova; LTS assinado com PGP | Escolher a imagem anterior no GRUB (manual) |
+| **Juniper Junos** | Partições de boot primária e alternativa (snapshot) | `request system software add … validate` testa a config na versão nova antes; `request system snapshot` | Boot pela alternativa se a primária falhar |
+| **Talos** | squashfs só de leitura, `machined` (Go) é o PID 1, **sem shell nem SSH**, só API | Imagem inteira A/B | Volta ao slot anterior se o boot não se confirmar |
+| **Flatcar** | `/usr` A/B (USR-A/USR-B) só de leitura com dm-verity | `update_engine` baixa e grava o slot inativo, assinatura conferida | Atributos de prioridade/tentativas na GPT: boot ruim volta ao anterior |
+
+O que tiramos daí:
+
+- **Imagem inteira, só de leitura, sem gerenciador de pacotes** (Talos, Flatcar): o que roda é
+  exatamente o que foi testado; nenhum "pacote extra" muda a imagem em campo. O MikroTik mostra
+  o custo de pacotes separados: versões de pacote e de RouterBOOT descasadas.
+- **Configuração fora da imagem** (`/config`, como o `/config` do VyOS): a imagem troca, a
+  configuração fica. Diferente do VyOS, uma configuração só (não uma cópia por imagem); a
+  migração de formato entre versões é do daemon (G0.6).
+- **Validar antes de trocar** (Junos `validate`): no G1.6b, o slot novo sobe a config atual em
+  modo de teste antes de virar o padrão.
+- **A/B com contador de tentativas e confirmação** (Flatcar, Talos): é o G1.6b. O G1.6a já
+  reserva o `rootfs-b` para não precisar reparticionar depois.
+- **Sem shell, só API** (Talos, MikroTik): o roteador é operado por comandos (`Session::execute`,
+  CLI, MCP, GUI); o shell só existe com flag de boot.
+
+### Buildroot × alternativas
+
+| Opção | Por que sim | Por que não | Veredito |
+|---|---|---|---|
+| **Buildroot LTS** | Imagem pequena com só o que pedimos; `BR2_EXTERNAL` mantém tudo nosso em `os/`; reprodutível (`BR2_REPRODUCIBLE`); um `make`; ramo LTS de 3 anos | Sem pacotes em campo (é o objetivo); recompila tudo ao mudar a toolchain | **Adotado** |
+| Yocto/OpenEmbedded | Camadas, SDK, atualização por pacote | Curva grande, builds de horas, muito mais do que precisamos | Não |
+| Alpine/Debian "imutável" | Pacotes prontos | Distro de uso geral: superfície maior, atualização por pacote não atômica | Só desenvolvimento |
+| `mkosi`/imagem própria sem Buildroot | Simples | Teríamos de manter toolchain, glibc e nftables à mão | Não |
+
+### Init: Rust × busybox init × systemd
+
+| Opção | Prós | Contras |
+|---|---|---|
+| **`corerouter-init` em Rust** (adotado) | Só faz o que o appliance precisa; mesmas regras do projeto (sem panic, entrada hostil); mede o próprio boot; um binário a menos de terceiros no caminho do boot; base para o boot de teste do G1.6b (confirmar o slot quando o daemon responde) | Código nosso no PID 1: um erro derruba o boot. Mitigado: nada de `unwrap`, toda falha registra e segue, testes da parte pura, `panic=10` reinicia |
+| busybox `init` + `inittab` | Maduro, minúsculo | Respawn sem backoff, sem prontidão, scripts de shell no boot (o que queremos tirar) |
+| systemd | Paralelismo, watchdog, journald | Grande para um appliance; o supervisor de serviços já é o do daemon (G0.10) |
+
+### RAUC × atualizador próprio em Rust (decisão para o G1.6b)
+
+O RAUC é maduro (A/B, bundles squashfs assinados obrigatoriamente, formato verity para
+streaming por HTTP, integração com GRUB/barebox/U-Boot, `mark-good`/`mark-bad`). Para o
+CoreRouter a recomendação é **um atualizador próprio em Rust no G1.6b**, porque:
+
+- a atualização tem de ser **um comando** (`system.package.update`), com journal, Safe Mode e
+  confirmação pela GUI/MCP; o RAUC é um serviço D-Bus em C que teríamos de orquestrar;
+- o boot sem bootloader (EFI stub; A/B por `BootNext`/`BootOrder` da UEFI ou por um UKI por
+  slot) não é um dos bootloaders que o RAUC já integra;
+- o formato que precisamos é pequeno: squashfs + árvore dm-verity + manifesto assinado com
+  ed25519 (crate puro em Rust), conferidos antes de gravar o slot inativo.
+
+Fica a ressalva para rever com dados: se o atualizador próprio passar de ~1.500 linhas ou
+precisar de streaming delta, o RAUC volta a ser a opção (o formato de bundle verity dele é bom).
+
+### O que ficou de fora e por quê
+
+- **A/B, dm-verity, assinatura, atualização**: G1.6b.
+- **Instalador, qcow2/OVA, FRR na imagem**: G1.6c. **Firmware**: G1.6j.
+- **Secure Boot**: o kernel é o próprio `BOOTX64.EFI`; assinar o EFI stub (ou um UKI) entra
+  junto com a assinatura da imagem no G1.6b.
+- **musl/estático**: a toolchain glibc do Bootlin serve ao daemon e ao `nft`; o daemon liga
+  contra a mesma glibc da imagem (sem baixar outro alvo do Rust).
+
+## Onde fica o build
+
+Tudo o que o `cargo xtask os` constrói fica numa pasta por checkout, `<out>`
+(`xtask/src/os/out.rs`): a árvore do Buildroot extraída, o `O=` dele (`build/`, com as
+imagens em `build/images/`), o `ccache`, os targets do cargo (`cargo-target` do daemon e do init,
+`web-target` da GUI web, `cli-target` da CLI do `push`), a GUI web e as pastas dos testes no QEMU.
+Os downloads continuam em `os/dl/`. A **chave de assinatura** de desenvolvimento não fica mais aqui
+(G1.6qm, "A chave" abaixo).
+
+A pasta, na primeira regra que valer:
+
+1. `$COREROUTER_OS_OUT`, se definida (relativa ao checkout);
+2. `os/out` do checkout, se ele já tem uma chave em `os/out/keys/` (um checkout que construiu
+   antes desta mudança continua com a mesma chave até migrar; o build avisa a cada vez);
+3. `/srv/build/os-out/<pasta do checkout>-<8 hex do hash do caminho>` quando o disco de builds
+   `/srv/build` existe: fora do `/home` e do repositório, e uma pasta por checkout (duas
+   worktrees nunca dividem um build);
+4. `os/out`.
+
+`cargo xtask os out-dir` imprime a pasta. Dois `os build` (ou `push`) na mesma pasta não rodam
+juntos: o segundo para na hora com "another `cargo xtask os build` is using …" (um `flock` em
+`<out>/.build.lock`, solto quando o processo morre).
+
+**Por que fora do repositório.** Em 2026-10-29 o `/home` encheu e apagar o `os/out` para abrir
+espaço levou junto o ccache e os targets do cargo: o build seguinte foi completo e frio. No
+disco de builds (929 GB livres) nada disso precisa ser apagado por falta de espaço.
+
+**A chave.** Os pacotes `.crpkg` são assinados pela chave privada de
+`~/.config/corerouter/dev-image-key/` (`dev-image-key.pk8`, `0600`; `$XDG_CONFIG_HOME` se
+definido, `$COREROUTER_DEV_KEY_DIR` para mudar), e o roteador só aceita pacotes da chave pública
+que a imagem instalada dele traz. É **uma chave por usuário**, a mesma para todo checkout e toda
+pasta de build (G1.6qm): o pacote de qualquer worktree atualiza o notebook de teste e as VMs, e
+apagar um `os-out` para abrir espaço não leva a chave junto. Até 2026-11-21 ela ficava em
+`<out>/keys/`. Uma limpeza de disco apagou a pasta que tinha a chave do notebook, e ele passou a
+recusar todo pacote novo ("signed by key …, which this image does not trust"); só regravar o
+disco dele resolveu. Migração: o primeiro build depois da mudança copia para lá a chave do
+`<out>/keys/` dele (ou do `os/out/keys/` antigo do checkout), e o original fica. Uma pasta de
+build com outra chave ganha um aviso a cada build, porque os roteadores atualizados por ela
+recusam a chave compartilhada. `--key <pkcs8>` (`$COREROUTER_IMAGE_KEY`) continua passando por
+cima. **Faça backup** dessa pasta junto com a da chave de release.
+
+Essa é a chave de **desenvolvimento**. A de **release**, que assina as versões publicadas, é
+outra: cifrada com senha, fora do repositório e do `/srv/build`
+(`~/.config/corerouter/release-key/`), com a pública em `os/keys/release/` (no git). A imagem
+de desenvolvimento confia nas duas (a VM de teste segue aceitando `os push` e também aceita uma
+release); a imagem de release (`cargo xtask os release`, num `<out>-release` próprio) confia só
+na de release. As chaves que o build põe na imagem são montadas em `<out>/trust/`. Detalhes,
+backup e troca de chave em [release.md](release.md).
+
+### Migrar o `os/out` de um checkout para o disco de builds
+
+Com nenhum `os build`/`push` rodando nesse checkout:
+
+```sh
+cd /home/oem/code/CoreRouter        # o checkout a migrar
+mv os/out os/out.old                # nada se perde: só sai do caminho (mesmo disco, instantâneo)
+NEW=$(cargo xtask os out-dir)       # agora /srv/build/os-out/CoreRouter-<hash>
+mkdir -p "$NEW"
+cp -a os/out.old/keys "$NEW/"       # a MESMA chave: obrigatório
+cmp os/out.old/keys/dev-image-key.pk8 "$NEW/keys/dev-image-key.pk8" && echo chave ok
+cp -a os/out.old/ccache os/out.old/web-tools "$NEW/"   # opcional: o build seguinte sai com ccache quente
+cargo xtask os push --to 127.0.0.1:7990                # primeiro build no lugar novo (completo, ~10 min)
+rm -rf os/out.old                   # só depois de a VM aceitar e confirmar o pacote
+```
+
+O `build/` e o `cargo-target` antigos não valem a cópia: o Buildroot grava caminhos absolutos
+no `O=` (não é relocável) e o cargo refaz o que tem caminho da pasta antiga. O ccache sim: o
+wrapper da toolchain usa caminhos relativos (`BR2_CCACHE_USE_BASEDIR`), e os acertos valem na
+pasta nova. Para desfazer: `rm -rf "$NEW"` e `mv os/out.old os/out`.
+
+## Build reprodutível
+
+- O Buildroot é fixado por versão **e** SHA-256 (`os/buildroot.lock`), baixado uma vez para
+  `os/dl/` (no `.gitignore`) e extraído em `<out>/`. Todo pacote é conferido
+  pelo hash (`BR2_DOWNLOAD_FORCE_CHECK_HASHES`); o kernel, pelo `linux.hash` nosso.
+- G1.6k: `os/buildroot-patches/*.patch` (em ordem de nome) é aplicado à árvore extraída. Só
+  receitas de `package/` (o `os check` recusa outro caminho), cada versão nova com o hash
+  dela no `.hash` do pacote. Um carimbo com o SHA-256 dos patches fica na árvore; patch
+  mudou, a árvore é extraída de novo do tarball (nunca um patch por cima de outro). Ao trocar a
+  versão de um pacote, faça um build limpo (`rm -rf "$(cargo xtask os out-dir)/build"`): o `target/` do Buildroot não
+  apaga os arquivos da versão anterior (a `libyang.so.2` ficou no build incremental).
+- `BR2_REPRODUCIBLE`: `SOURCE_DATE_EPOCH` fixo, datas e ordem dos arquivos do squashfs fixas.
+  GUIDs, volume id do vfat e UUID/hash seed do ext4 fixos no `genimage.cfg`.
+- O Rust: `cargo build --release --locked --offline` com o cargo do `rust-toolchain.toml`,
+  `--remap-path-prefix` para não gravar caminhos desta máquina, e ligado pelo gcc da toolchain
+  do Buildroot contra a glibc da imagem (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER`,
+  `CC_x86_64_unknown_linux_gnu`). Como o alvo tem o mesmo nome do host, os build scripts também
+  são ligados por esse gcc: a glibc da toolchain (2.39) não pode ser mais nova que a do host
+  (hoje 2.39 nos dois).
+- Duas fontes de diferença apareceram na medição e foram corrigidas:
+  - **BTF do kernel.** O `pahole -j` do kbuild do 6.18 gera o BTF em paralelo sem a opção
+    `reproducible_build`, e a ordem dos tipos dependia do escalonamento das threads.
+    `os/patches/linux/0001-kbuild-btf-reproducible-build.patch` liga a opção (pahole ≥ 1.26;
+    o do Buildroot é o 1.27).
+  - **ext4 do `/config`.** O `mke2fs` e o `e2fsck` que o genimage roda gravavam a hora real no
+    superbloco. O `post-image.sh` exporta `E2FSPROGS_FAKE_TIME` e `E2FSCK_TIME` com o
+    `SOURCE_DATE_EPOCH`.
+- O commit entra no daemon (`corerouter-buildinfo`, mostrado em `server.info`): commits diferentes
+  dão binários diferentes, como deve ser. Do mesmo commit, o binário sai igual.
+
+## Desempenho e paralelismo
+
+### Build
+
+- **Por pacote** o Buildroot já usa `-j$(nproc+1)` (`BR2_JLEVEL=0`); o kernel é o pacote mais
+  longo e paraleliza bem.
+- **Entre pacotes**: `BR2_PER_PACKAGE_DIRECTORIES=y` deixa usar `make -jN` no topo, com
+  pacotes independentes compilando (e, principalmente, rodando o `configure`, que é serial)
+  ao mesmo tempo. Desde o processo "build rápido" é o **padrão**: `make all -jN -l<núcleos>`
+  com N = núcleos/4, no máximo um por 4 GiB de `MemAvailable`, no mínimo 2 (32 núcleos e
+  37 GiB livres: `-j8 -l32`). O `-l` não deixa começar outro pacote com a carga da máquina já
+  acima do número de núcleos (os CIs de outras sessões). Cada pacote continua com o próprio
+  `-j` (`BR2_JLEVEL`); pacote que não aceita build paralelo usa `$(MAKE1)` na receita dele e o
+  Buildroot respeita isso também com `-j` no topo. `--top-jobs N` fixa o N (`--top-jobs 1`
+  volta ao serial) e `--jobs N` o `BR2_JLEVEL`.
+- **Cache de download**: `os/dl/` fica entre builds; nada é baixado de novo.
+- **Cache de compilação**: `BR2_CCACHE` em `<out>/ccache` (C/C++ do Buildroot e do kernel; a
+  variável `BR2_CCACHE_DIR` que o xtask passa vence o caminho do defconfig).
+  O Rust tem o próprio cache incremental em `<out>/cargo-target`, fora da pasta do pacote
+  e do `O=` do Buildroot: nem o `corerouter-dirclean` de cada build nem um build limpo jogam
+  fora as dependências (frio, o Rust era 154 s de um build limpo de 447 s, **medido**).
+  A GUI web (trunk, `wasm32`) compila em outro target, `<out>/web-target`: no mesmo
+  `cargo-target`, os build scripts e macros do host de um (ligados pelo gcc do Buildroot) e do
+  outro (pelo `cc` do host) se invalidavam, e todo `os build` recompilava a GUI inteira e todas
+  as dependências do daemon (processo "build rápido", **medido** na seção de números).
+
+### Boot
+
+- Nada de módulos, udev, scripts ou serviços em série: o init monta, sobe o `lo`, monta
+  `/config` e dispara o daemon. O paralelismo do boot é o do kernel (probe assíncrono das
+  placas) e o do próprio daemon (threads por serviço, G0.10). Um segundo serviço no init
+  não ajudaria: o único trabalho depois do kernel é o daemon ficar pronto.
+- `quiet`: o kernel não escreve centenas de linhas na serial de 115200 baud (~11 KB/s) antes
+  do init.
+- squashfs zstd com `SQUASHFS_COMPILE_DECOMP_MULTI_PERCPU` (descompressão em paralelo, um
+  descompressor por CPU) e `SQUASHFS_FILE_DIRECT`.
+
+### Endereço de rede no teste
+
+A imagem sobe sem endereço em nenhuma porta: nada roda DHCP sem configuração. Com `-kernel`, o
+boot-test acrescenta à linha de comando o `ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off` do
+próprio kernel (`CONFIG_IP_PNP`), o endereço da rede de usuário do QEMU. O `eth0` é o nome do
+kernel, que vale antes do init: o init renomeia a porta (`ether1`) baixando-a e subindo de novo
+(o kernel não renomeia uma porta ativa); o endereço fica, a rota padrão do `ip=` cai. Assim o
+encaminhamento de porta chega ao `0.0.0.0:8729` do daemon. Com `--efi` vale a linha de
+comando gravada no kernel: o teste confere a prontidão pelo loopback e pula o ping TLS. A
+configuração padrão de primeiro boot (cliente DHCP na primeira porta, como o CHR do RouterOS)
+é a gap G1.6d. Com ela, o `--efi` também passa a fazer o ping.
+
+## Números
+
+Todos **medidos** em 2026-10-27, AMD Ryzen AI Max+ 395 (32 threads), 62 GiB, NVMe, Linux Mint
+22.3, com outras sessões de agente usando a máquina ao mesmo tempo (os tempos variam por isso).
+
+### Build
+
+| Situação | Tempo de parede | Observação |
+|---|---|---|
+| Primeiro build, tudo frio (downloads de ~360 MB, ccache vazio, sem `-j` de topo) | 15 min 02 s | CPU somada 85 min (paralelismo médio ~5,7×) |
+| Build limpo (`os/out/build` apagado), ccache quente, **sem** `-j` de topo | 447 s | Rust frio 154 s (38%), kernel 64 s, ferramentas de host o resto |
+| Build limpo, ccache quente, **`--top-jobs 33`** | 207–219 s (3 rodadas) | **2,1×** do paralelismo entre pacotes (`BR2_PER_PACKAGE_DIRECTORIES`) |
+| Mudou o fragmento do kernel (`linux-reconfigure`) | 169 s | |
+| Sem mudança (quente) | 24–26 s | cargo sem trabalho, rootfs e disco regravados |
+
+Desde a medição do build limpo, o cache do Rust fica em `<out>/cargo-target`, fora do `O=`: um
+build limpo do Buildroot não recompila mais o Rust (o build seguinte levou 165 s sem `-j` de
+topo, com o cargo frio numa pasta nova).
+
+### Build rápido: pasta própria, `-j` de topo, GUI e CLI em targets próprios (2026-10-29)
+
+**Medido** em 2026-10-29 na mesma máquina, build release, com 5–6 outras sessões compilando ao
+mesmo tempo (carga de 20 a 90; os tempos variam por isso). Cada lado numa cópia própria do out
+em `/srv/build`, com o ccache do checkout principal e os downloads em cache.
+
+| Situação | Antes | Depois |
+|---|---|---|
+| Build completo, out vazio só com o ccache (`os build`) | 1063 s (`make all` 838 s, serial) | 1010 s (`make all` 800 s, `-j6 -l32` automático) |
+| Incremental: uma linha no daemon, `os build --only crpkg` | **889 s** (GUI 331 s + `make all` 497 s; 126 crates da GUI e 97 do daemon recompilados) | **213 s** (GUI 60 s, 0 crates; `make all` 139 s, só o daemon) |
+| CLI do `push`, target novo | 223 s (release, LTO thin, 1 codegen unit) | 66 s (sem LTO, 16 unidades, incremental) |
+| CLI do `push`, depois de uma linha no engine | 144 s | 3,2 s |
+| CLI do `push`, só o daemon mudou | 0,2 s | 0,1 s |
+| Envio do `ab-test --scenario push` (CLI nova, TLS, QEMU) | — | 53,1 MiB em 0,64 s (83 MiB/s); B confirmado em 18,3 s |
+
+- **O ganho grande foi o target separado da GUI**, que não estava nos três itens do pedido. No
+  mesmo `cargo-target`, o trunk e o cargo da imagem se invalidavam um ao outro a cada build.
+  Num `os push` comum, isso eram 216–331 s de GUI mais a recompilação de todas as dependências
+  do daemon.
+- **O `-j` de topo quase não muda o build completo** (−4 %). O caminho crítico é uma corrente
+  serial: `host-protobuf` (309 s de C++) → `host-protobuf-c` → FRR → o kernel do instalador. O
+  paralelismo médio entre pacotes foi 2,1× (1714 s somados em 802 s; `build-time.log`). Os
+  pacotes de host não acertam o ccache quando o `O=` muda de caminho (só o wrapper da toolchain
+  do alvo usa caminho relativo). Por isso o primeiro build numa pasta nova é sempre o mais
+  lento; os seguintes, na mesma pasta, acertam. Com caches quentes, o `--top-jobs` dava 2,1×
+  (447 → 207 s, tabela acima).
+- **Memória:** com `-j6` a `MemAvailable` da máquina chegou a 3,5 GB no pior momento (as
+  outras sessões incluídas). Daí o teto de um job de topo por 4 GiB livres no início.
+- **O que sobra no incremental:** 57 s de `wasm-bindgen` + `wasm-opt` da GUI, que o trunk
+  refaz mesmo sem nada recompilado, e ~100 s do cargo release do daemon com LTO. Os dois estão
+  na gap G1.6r.
+
+**Reprodutível:** dois builds limpos do mesmo commit, um terceiro com outro nível de `-j` e um
+quarto com o cache do cargo em outra pasta deram o **mesmo** `bzImage` (`40e26533…`), o mesmo
+`rootfs.squashfs` (`f8580cbe…`), a mesma ESP e o mesmo daemon. O `disk.img` ficou igual entre
+builds depois da correção do ext4.
+
+### Tamanho
+
+| Peça | Tamanho |
+|---|---|
+| `rootfs.squashfs` (zstd) | **14,4 MiB** (38 MiB descomprimido) |
+| └ `corerouter-daemon` (sem símbolos) | 27 MiB |
+| └ glibc e bibliotecas (`/lib`, `/usr/lib`) | 9,2 MiB |
+| └ busybox / `corerouter-init` / `nft` | 0,7 MiB / 0,5 MiB / 24 KiB (+ libnftables) |
+| `bzImage` (com BTF, tudo `=y`) | 19,1 MiB |
+| `disk.img` | 609 MiB, quase todo partições vazias (rootfs-b e folga); 33 MiB com `zstd` |
+
+### Boot (QEMU, 2 vCPUs, 1 GiB, virtio)
+
+| Modo | Kernel → daemon responde `ping` | Partida do QEMU → `ready` | Memória ociosa |
+|---|---|---|---|
+| KVM, `-kernel` (10 rodadas) | 0,69–1,20 s (mediana 0,74 s) | 0,98–1,87 s | 47–58 MiB |
+| KVM, UEFI (OVMF → EFI stub, disco inteiro) | 0,73 s | 3,74 s (o firmware leva ~3 s) | 49 MiB |
+| TCG (sem KVM) | 2,89 s | 3,78 s | 48 MiB |
+
+Dentro desse tempo: o init leva 7–23 ms (montagens, `lo`, `/config`), e o daemon, 52–126 ms
+da partida até o primeiro `pong`. O resto é o kernel até o PID 1 (~0,6 s, probe das placas e
+dos discos). O ping TLS do host, pelo encaminhamento de porta do QEMU, respondeu em 14–17 ms.
+
+## A/B e atualização segura (G1.6b)
+
+```sh
+corerouter-cli run system.package.check '{"path":"/tmp/x.crpkg"}'     # assinatura e hashes, sem gravar
+corerouter-cli run system.package.update '{"path":"/tmp/x.crpkg"}'    # grava o outro slot, reinicia em teste
+corerouter-cli run system.package.print                               # slots, teste em curso, último resultado
+corerouter-cli run system.package.confirm                             # confirmação manual (confirm=manual)
+corerouter-cli run system.package.downgrade                           # boota o slot anterior (mais antigo) em teste
+corerouter-cli run system.tuning.boot.apply                           # G1.26h: parâmetros de boot no slot inativo
+```
+
+Na GUI: **System › Packages** (slots, teste com prazo, Install and reboot, Downgrade, Check,
+Scrub) e **System › Tuning › Boot** (o que cada slot carrega, "Apply on slot X and reboot").
+
+### Como funciona
+
+- **O bootloader é o gerenciador de boot da UEFI.** Cada slot tem um `Boot####` ("CoreRouter A"
+  / "CoreRouter B") que aponta para o kernel do slot na ESP; os *options* da entrada são a linha
+  de comando (UCS-2), acrescentada à embutida no kernel. `BootOrder` tem o slot confirmado
+  primeiro e o outro em segundo.
+- **O boot de teste é o `BootNext`.** O firmware boota a entrada uma vez e apaga a variável
+  antes (UEFI 2.10 §3.1.2): qualquer falha do teste — pânico do kernel, parâmetro que não boota,
+  daemon que nunca responde, queda de energia, alguém desligando a caixa — termina no slot do
+  `BootOrder`, o anterior. É um contador de boot de **uma** tentativa, sem bootloader nosso nem
+  variável a decrementar (como o Flatcar com `tries=1`). Um firmware que não apaga o
+  `BootNext` é detectado: o init apaga e o próximo boot volta (ou, se ele nem bootou o
+  `BootNext`, o resultado diz "this box cannot run a trial boot").
+- **dm-verity sem initramfs.** A entrada do slot traz `root=/dev/dm-0 dm-mod.waitfor=PARTUUID=…
+  dm-mod.create="vroot,,,ro,0 <setores> verity 1 PARTUUID=… PARTUUID=… 4096 4096 <blocos>
+  <blocos> sha256 <raiz> <sal>"` (dm-init, `CONFIG_DM_INIT`): o kernel monta a raiz pelo dm-verity
+  com o hash raiz do manifesto assinado. Dado e árvore na mesma partição; a árvore é a do
+  `veritysetup format --no-superblock` (formato 1, conferido byte a byte num teste quando o host
+  tem o `veritysetup`). Um hash raiz errado impede o boot (testado: "metadata block … is
+  corrupted", pânico, volta). A verificação é **sob demanda** (cada bloco ao ser lido), não no
+  boot.
+- **`panic=10` é a última palavra** da linha do slot: nenhum parâmetro do operador desliga o
+  reinício depois de um pânico.
+- **Confirmação.** `confirm=auto` (padrão): o daemon do slot novo confirma quando está de pé há
+  10 s e toda interface que tinha endereço e rodava antes da atualização roda de novo (gerência
+  alcançável). `confirm=manual`: um operador confirma pela GUI/CLI/MCP dentro do prazo (como o
+  `commit confirmed` do Junos ou o `auto-abort-timer` do IOS-XE). Confirmar = reescrever o
+  `BootOrder` com o slot novo primeiro (uma escrita atômica de variável).
+- **Prazo.** O `corerouter-init` sabe que é um teste (estado em `/config/package/state.json` +
+  slot em uso pela `corerouter.slot=` + `BootOrder`) e reinicia se não houver confirmação em
+  `timeout` s (30–3600, padrão 300) contados do início do boot.
+- **A configuração volta junto.** Antes de trocar de slot, o `/config` (com o
+  `format_version`) vai para `/config/package/config-<slot>/`. No boot de volta depois de
+  um teste que falhou, o init restaura a cópia **antes** do daemon ler a config; um downgrade
+  boota a cópia que aquele slot rodou por último (se ele lê o formato).
+- **O snapshot cabe no `/config` (G1.6u).** O que o armazenamento só troca por rename
+  (`running.json`, `running.json.prev`, `rev-*.json`, `state-*.json`) entra por **hard link**
+  (custo zero; o snapshot guarda o conteúdo antigo depois do próximo save); o resto (o journal,
+  que cresce no lugar, chaves) é copiado; `graphs/` (histórico de tráfego) e `log/` (log em disco, G4.6g) ficam fora do snapshot
+  e o restore não o apaga. Antes de gravar o slot, a atualização confere se o `/config` tem o
+  que a cópia precisa mais 1 MiB e recusa com os números e os maiores itens; uma cópia que falha
+  mesmo assim é apagada. Na VM de teste (`/config` de 56 MB, uma revisão de 10,7 MB no
+  histórico) o snapshot passou de 13,8 MB para ~1 kB. `system.package.print` traz
+  `config_space` (livre, o que o próximo snapshot precisa, o que ocupa), o `own_bytes` de cada
+  snapshot e as cópias parciais (`partials`). `system.package.snapshot.remove {name?, all?,
+  dry_run?}` apaga snapshots e cópias parciais de longe (sem nome: só as parciais; nunca o de
+  um teste em andamento), e a saúde do disco do `/config` diz qual apagar.
+- **O slot em uso nunca é escrito**, e o slot alvo sai do `BootOrder` e perde o cabeçalho
+  antes de ser gravado: meio gravado, ele não é volta de ninguém. A ordem dos passos está no
+  topo de `crates/sysupdate/src/ab.rs`.
+- **Pacote assinado.** `.crpkg` = cabeçalho (magic, manifesto JSON, id da chave, assinatura
+  Ed25519) + kernel + rootfs (squashfs + árvore). O cabeçalho vem primeiro: a assinatura é
+  conferida antes de gravar um byte; o payload é gravado e hasheado no caminho (SHA-256 de cada
+  parte, no manifesto) e o rootfs é relido do disco (sem o cache de páginas) com a árvore
+  recalculada. A imagem só leva a **chave pública** (`/etc/corerouter/image-keys/<id>.pub`); a
+  privada fica fora do repositório (`cargo xtask os build --key <pkcs8>` ou
+  `$COREROUTER_IMAGE_KEY`; sem elas, uma chave de desenvolvimento gerada uma vez em
+  `~/.config/corerouter/dev-image-key/`, fora do repositório; seção "Onde fica o build"). Imagem de desenvolvimento:
+  essa chave e as de release de `os/keys/release/`; imagem de release: só as de release
+  ([release.md](release.md)). Atualizar para um build mais antigo é recusado
+  ("use system.package.downgrade").
+- **Parâmetros carregados:** `console=`, `ip=`, `corerouter.shell=` e `corerouter.color=`
+  (G1.6zg) da linha em uso que não
+  estão na embutida passam para o slot gravado (como o `linux_append` de OEM do Flatcar): uma
+  console serial noutra porta continua depois de atualizar.
+- **Fora da imagem** (PC de desenvolvimento com `--backend linux`, navegador) o serviço não
+  liga e diz por quê: só roda quando o PID 1 é o `corerouter-init`, para nunca escrever as
+  variáveis de boot ou os discos de um host. Com `--backend virtual --config-dir` há um
+  **laboratório**: slots em arquivos esparsos, variáveis numa pasta, o reboot do firmware
+  simulado (mesmo código do roteador).
+
+### O teste em QEMU (`cargo xtask os ab-test`)
+
+QEMU como usuário, OVMF com NVRAM própria, disco em qcow2 sobre o `disk.img`. O primeiro boot de
+cada cenário é o de fábrica (`-kernel` com `ip=` e `corerouter.shell=ttyS0`): o roteador cria as
+suas entradas de boot (carregando esses parâmetros). Daí em diante, só o firmware decide. O teste
+fala com o daemon pela console serial (`corerouter-init run <comando>`, o cliente do canal de
+controle que o shell de manutenção usa) e cada reboot é um QEMU novo (`-no-reboot`).
+
+| Cenário | O que prova |
+|---|---|
+| `update` | A boota pela entrada com dm-verity; pacote B (mesma imagem, versão e build novos) conferido, gravado; boot de teste de B, confirmação automática, B padrão, A intacto; parâmetro de Tuning na linha de B e não na de A; segundo boot em B sem teste |
+| `no-confirm` | B com um daemon que nunca responde (squashfs refeito pelo teste): o init reinicia no prazo (30 s), o firmware boota A, a config volta, `failed` em B |
+| `bad-signature` | pacote assinado por uma chave gerada na hora e jogada fora: recusado; pacote da chave certa com um byte do payload trocado: recusado ("signed hashes"); B continua vazio, nenhum teste armado |
+| `cross` (G1.6g) | O mesmo disco: atualização confirmada na UEFI, boot na BIOS no mesmo slot, atualização confirmada na BIOS, volta à UEFI na NVRAM antiga com a entrada do outro slot regravada |
+| `cut` (G1.6g, só `--firmware seabios`) | QEMU morto no meio da atualização e nos instantes em que o GRUB apaga `next=`: o boot seguinte sobe num slot com dm-verity |
+| `controllers` (G1.6g, só `--firmware seabios`) | Disco atrás de `virtio-blk`, `virtio-scsi`, `lsi53c895a`, `pvscsi` e IDE, placa `pc` |
+| `bad-param` | `system.tuning.boot.apply` com `drill=true` (um `init=` que não existe, depois de `intel_idle.max_cstate=1`): o kernel de B entra em pânico, `panic=10`, o firmware boota A; a linha de A não mudou |
+
+### Pesquisa
+
+Fontes: [MikroTik: Packages](https://help.mikrotik.com/docs/spaces/ROS/pages/40992872/Upgrading+and+installation)
+e [upgrade](https://manual.mikrotik.com/docs/getting-started/installation-and-upgrade/upgrade/),
+[Junos `request system software add`](https://juniper.net/documentation/en_US/junos13.1/topics/reference/command-summary/request-system-software-add.html)
+e [`rollback`](https://juniper.net/documentation/en_US/junos13.2/topics/reference/command-summary/request-system-software-rollback.html),
+[IOS-XE install mode](https://www.cisco.com/c/en/us/td/docs/routers/C8000V/Configuration/c8000v-installation-configuration-guide/m_installing-the-software-using-install-commands.html),
+[VyOS: update](https://docs.vyos.io/en/latest/installation/update.html) e
+[image](https://docs.vyos.io/en/1.5/installation/image.html), [Flatcar: manual rollbacks](https://www.flatcar.org/docs/latest/diagnostics/manual-rollbacks/),
+[Talos: upgrading](https://docs.siderolabs.com/talos/v1.11/configure-your-talos-cluster/lifecycle-management/upgrading-talos),
+[RAUC reference](https://rauc.readthedocs.io/en/latest/reference.html), [SWUpdate](https://swupdate.org/),
+[Mender state scripts](https://github.com/mendersoftware/mender-docs/blob/2.3.x/04.Artifacts/50.State-scripts/docs.md),
+[UEFI 2.10 §3 Boot Manager](https://uefi.org/specs/UEFI/2.10/03_Boot_Manager.html),
+[efivarfs](https://www.kernel.org/doc/html/latest/filesystems/efivarfs.html),
+[dm-verity](https://www.kernel.org/doc/html/latest/admin-guide/device-mapper/verity.html),
+[dm-init](https://www.kernel.org/doc/html/latest/admin-guide/device-mapper/dm-init.html).
+
+| Sistema | Instalar | Volta automática | O que tiramos |
+|---|---|---|---|
+| **MikroTik RouterOS v7** | `/system package update` (canais stable/long-term/testing/development; `install` baixa, instala e reinicia); `/system package downgrade` com os `.npk` antigos enviados | Nenhuma: boot ruim = Netinstall | Nomes (`update`, `downgrade`, canal); o `install` que reinicia |
+| **Junos** | `request system software add … validate` (valida a config contra a versão nova), raiz dupla nos SRX | `request system software rollback` (manual) | Validar antes de trocar; manter a versão anterior inteira |
+| **Cisco IOS-XE** | `install add`/`activate` com `auto-abort-timer` (30–1200 min, padrão 120) e `install commit` | Sem commit no prazo, volta à versão confirmada | Prazo obrigatório de confirmação; manual × automático |
+| **VyOS** | `add system image <url>`; cópia da config por imagem; GPG nas LTS | Escolher no GRUB (manual) | Config versionada com a imagem |
+| **Flatcar** | `update_engine` grava USR-B; GPT `priority/tries/successful` | GRUB volta se não marcar `successful` (~2 min de pé) | `tries=1`; marca de sucesso depois de um tempo de pé |
+| **Talos** | imagem inteira A/B por API | volta ao anterior se não bootar | Só API; imagem inteira |
+| **RAUC / SWUpdate / Mender** | bundle assinado (RAUC: verity + CMS; manifesto com hash raiz), streaming por HTTP | contador do bootloader (U-Boot/barebox/GRUB), `mark-good` | Manifesto assinado com o hash raiz; streaming; marcar bom depois do health check |
+
+**Adotado:** imagem inteira A/B, pacote com manifesto assinado (como o bundle verity do RAUC),
+gravação em fluxo com hash, contador de uma tentativa (Flatcar), confirmação com prazo
+(IOS-XE/Junos), confirmação automática por saúde depois de um tempo de pé (Flatcar, RAUC
+`mark-good`), config que volta com a imagem (VyOS), nomes do MikroTik.
+
+**Melhor que os outros (o que o motor permite):** a atualização é um **comando** (journal,
+GUI, CLI, MCP); a confirmação automática olha a **gerência** (as interfaces que tinham endereço
+voltaram), não só "o processo subiu"; a config volta **sozinha** num teste que falha; o Tuning ›
+Boot usa o mesmo caminho (parâmetro que não boota volta sozinho); `drill` testa a volta numa
+caixa real (firmware que ignora `BootNext` é detectado); Scrub relê o slot de reserva.
+
+**RAUC × atualizador próprio (decisão do G1.6a revista com números).** O G1.6a pôs a régua:
+passou de ~1.500 linhas, reavaliar. **Passou:** `crates/sysupdate` tem 2.230 linhas de código
+(sem testes, comentários e linhas em branco; **medido**), das quais ~250 são o laboratório
+virtual e ~150 o status para a GUI, que existiriam com o RAUC também. Reavaliado:
+
+- o RAUC tem um backend `efi` (BootOrder/BootNext via `efibootmgr`) e o bundle verity com
+  manifesto assinado: substituiria `package`, `verity`, `efi` e metade do `ab` (~1.300 linhas);
+- não substituiria: o comando com journal/GUI/MCP, o serviço do daemon, o prazo do teste e a
+  decisão de boot no init (o RAUC espera um watchdog ou um `mark-good` externo), a cópia da
+  config com o `format_version`, o laboratório;
+- traria para a imagem (hoje 15 MiB, sem D-Bus nem OpenSSL) o `rauc` em C com GLib, D-Bus,
+  OpenSSL (CMS), `efibootmgr` e `squashfs-tools`: **estimado** +6–8 MiB no squashfs e um
+  segundo processo com root no caminho da atualização;
+- o nosso grava 34 MiB em 36–53 ms e relê/confere em 12–17 ms (**medido**); o RAUC não seria
+  mais rápido nisso (mesmo `sha256`/dm-verity).
+
+Fica o atualizador próprio. Revê-se quando precisarmos de **streaming delta por HTTP** (o índice
+de blocos do RAUC é bom nisso): gap G1.6e.
+
+### Desempenho e paralelismo
+
+- **Gravação em fluxo contínuo:** uma thread lê e hasheia (SHA-256 com SHA-NI do `ring`),
+  outra grava, com 4 buffers de 1 MiB em voo (fila limitada). Medido no bench
+  `package_copy/64MiB_to_file`: **1,30 GiB/s em pipeline × 1,21 GiB/s sequencial** (+8%);
+  o gargalo é o disco/cache de páginas, não o hash (2,0 GiB/s num núcleo).
+- **Verificação:** a releitura recalcula a árvore do dm-verity. O nível 0 (um hash por bloco de
+  4 KiB, quase todo o trabalho) é dividido entre threads por faixas contíguas de blocos de
+  hash, cada thread escrevendo a sua parte (sem lock). Medido (`verity_tree`): 16 MiB em
+  **7,7 ms** com 1, 4 ou 8 threads (iguais: abaixo de 64 MiB não divide); 256 MiB (um slot
+  cheio) **126 ms com 1 thread, 33 ms com 4, 18 ms com 8** (7,1×).
+- **Gravar e verificar ao mesmo tempo?** O hash de trânsito já acontece durante a gravação; a
+  releitura tem de vir depois do `fsync` e do `fadvise(DONTNEED)` (senão confere o cache, não o
+  disco). Com a imagem de hoje a releitura custa 12–17 ms: não vale a complexidade.
+- **Lock do `Session`:** os comandos só põem um trabalho na fila (um por vez, "busy" senão); o
+  serviço `package` faz a E/S sem o lock e o pega só para entregar progresso (no máximo 10/s) e
+  o resultado. O estado lido a cada 2 s custa algumas leituras de arquivos pequenos e duas
+  conferências de assinatura.
+- **O custo do dm-verity no boot** é sob demanda e ficou abaixo do ruído: o kernel → daemon
+  pronto foi 0,72 s sem verity e 0,70–0,73 s com (**medido**).
+
+### Números
+
+**Medidos** em 2026-10-27, AMD Ryzen AI Max+ 395, KVM, 2 vCPUs, 1 GiB, virtio, build de
+desenvolvimento do mesmo commit; o host tinha outras sessões rodando.
+
+| O quê | Valor |
+|---|---|
+| Pacote (`corerouter.crpkg`) | **34,1 MiB** (kernel 19,1 + squashfs 14,9 + árvore verity 124 KiB) |
+| Selar a imagem (`corerouter-image seal`: árvore, manifesto, assinatura, pacote) | 59–63 ms |
+| `system.package.check` (assinatura + SHA-256 de 34 MiB) | 20–23 ms |
+| Gravar o slot B (kernel + rootfs, hash no caminho, `fsync`) | 36–53 ms |
+| Reler o slot B e recalcular a árvore | 12–17 ms |
+| Cópia da config | 6–7 ms |
+| `system.package.update` inteiro | 115–143 ms |
+| Kernel → daemon pronto, fallback sem verity / slot A com verity / teste de B | 0,72 s / 0,70 s / 0,72–0,73 s |
+| Partida do QEMU (OVMF) → teste de B confirmado | 14,5 s (10 s são a carência de propósito) |
+| Teste sem confirmação (prazo 30 s) → reboot | 32,0 s |
+| Parâmetro que não boota → reset (`panic=10`) | 11,6 s |
+| `cargo xtask os ab-test` (4 cenários, 13 boots) | 94,5 s |
+| Build da imagem com A/B (rebuild incremental) | 91–156 s |
+
+### O que ficou de fora e por quê
+
+- **Envio do pacote pela GUI e download pelo canal** (o `install` do MikroTik baixa sozinho):
+  o envio pelo canal de controle e o download de um endereço HTTP(S) entraram na G1.6e (seção
+  "Pacote pela rede" abaixo); o canal com índice de versões (`check-for-updates`), ainda não.
+- **Watchdog de hardware no boot de teste e Secure Boot (UKI assinado):** um kernel que trava
+  antes do init (sem pânico) só volta com um reset; a raiz é conferida pelo hash raiz que está
+  na NVRAM, e o kernel na ESP não é assinado. Gap G1.6f.
+- **Instalador e imagens de VM** criando as entradas de boot na instalação: G1.6c (até lá, o
+  primeiro boot de uma imagem gravada sobe sem verity, pelo fallback, e cria as entradas).
+
+## Sistema na RAM e disco do sistema removido (G1.6zn)
+
+Num notebook bootando de pendrive, tirar o pendrive com o roteador ligado enchia o console de
+`SQUASHFS error`, `EXT4-fs (sda4) … I/O error` e `FAT-fs (sda1) … bread failed`: a raiz é lida
+do disco conforme é usada, e nada dizia o que tinha acontecido.
+
+**Sistema na RAM** (`system.boot.set {to_ram: yes}`, desligado por padrão; System › Packages,
+"Run the system from RAM"). Vale do boot seguinte:
+
+1. o serviço `package` do daemon grava a escolha em `/config/package/boot.json` (arquivo próprio,
+   não o `running.json`: os commits vão antes para o journal, G0.22, e o PID 1 lê poucos bytes);
+2. no boot, o `corerouter-init` monta o `/config`, lê a opção e, ligada, lê o dispositivo
+   dm-verity inteiro (`/dev/dm-0`, o tamanho vem da tabela da linha de comando) para um arquivo
+   num tmpfs em `/mnt`. Ler pelo dm-verity confere cada bloco contra o hash raiz assinado, a
+   mesma conferência do boot pelo disco; um bloco que não bate é EIO e o boot fica no disco;
+3. monta o arquivo (loop, squashfs), faz dele a raiz com `pivot_root(".", ".")` (o
+   `switch_root` da ISO live só funciona a partir de um initramfs), solta a raiz velha com
+   `umount -l` e executa o `corerouter-init` de novo de lá (`--ram-root <bytes> <ms>`), que
+   segue o boot normal (monta o `/config` de novo).
+
+Sem `MemAvailable` para a raiz mais 256 MiB de sobra (`RAM_LEFT_KIB`), sem verity (boot pelo
+caminho reserva) ou com qualquer falha antes da troca, o boot segue do disco com uma linha que diz
+por quê, e a saúde mostra `system.disk` em aviso. `system.boot.print` e `system.package.print`
+(`root`) dizem de onde veio a raiz deste boot.
+
+**Disco do sistema removido** (com ou sem a opção). Uma thread do init dorme nas mensagens de
+dispositivo do kernel (uevent, sem polling) e, quando some o disco do `/config` ou o de baixo do
+`dm-0`:
+
+- baixa o `console_loglevel` para 1 (só `KERN_EMERG`): os erros do kernel continuam no log do
+  kernel e no do roteador, mas não enterram a linha (ext4 imprime em `KERN_CRIT`, squashfs e FAT em
+  `KERN_ERR`, acima do nível 4 do `quiet`);
+- desmonta (lazy) o `/config` e a ESP, para não pedir mais nada ao disco;
+- escreve uma linha no console e no log do roteador e a grava em
+  `/run/corerouter/system-disk-removed`: "system disk sda removed: the router keeps running from
+  RAM, but configuration changes are no longer saved; reboot with the disk in place" (ou "the
+  system runs from that disk and may stop at any moment" sem a opção).
+
+Com o arquivo presente, o armazenamento da config recusa toda gravação com essa linha, e o engine
+recusa o commit **antes** de aplicar (aplicado e perdido no reboot, ninguém saberia); o Safe Mode,
+que não grava, continua mudando o roteador. O serviço `package` para de ler a ESP e o `/config`,
+recusa as tarefas de slot com a mesma linha e a saúde mostra `system.disk` em erro.
+
+Teste: `cargo xtask os ab-test --scenario to-ram` (o disco instalado vira um pendrive
+`usb-storage` no xHCI; `device_del` pelo monitor do QEMU tira o pendrive a quente).
+
+| Medida (QEMU KVM, OVMF, 2 vCPUs, 1 GiB, pendrive usb-storage sobre qcow2) | Valor |
+|---|---|
+| Cópia da raiz (86 MiB) pelo dm-verity | 78–83 ms (**medido**; o qcow2 está no cache do host) |
+| Kernel → daemon pronto, raiz no disco / na RAM | 1,88–1,96 s / 1,90–1,94 s (**medido**) |
+| `MemAvailable`, raiz no disco / na RAM | 875 / 744 MiB (**medido**; 86 MiB do arquivo em `Shmem`) |
+| Linhas do kernel no console depois do aviso | 0 (antes dele, ~9 em 7 ms: o journal do ext4 em voo) |
+| Cópia num pendrive USB 2 (~30 MB/s) / USB 3 (~150 MB/s) | ~3 s / ~0,6 s (**estimado**) |
+
+## Firmware das placas e drivers em módulo (G1.6j)
+
+Pegadinha que decidiu o desenho: **um driver embutido (`=y`) sonda antes de o `/` existir.** As
+`do_initcalls` rodam antes de `prepare_namespace` (`init/main.c`, kernel 6.18.59). O `ice` pede o
+pacote DDP na sonda (`ice_main.c:4521`), recebe `-ENOENT` e entra em **Safe Mode** para sempre,
+mesmo com o arquivo no squashfs: uma fila (`ice_common.c:3249`), sem RSS, sem XDP
+(`ice_xdp_safe_mode`, `ice_main.c:3041`), sem checksum nem TSO por hardware (`ice_main.c:3554`).
+
+| Peça | O que faz | Onde |
+|---|---|---|
+| `ice` como módulo | a sonda roda depois do `/`, com o arquivo à vista | `linux.fragment`, `REQUIRED_MODULES` |
+| Carga automática | o PID 1 lê `modules.dep`/`modules.alias`, olha as placas PCI/USB sem driver e carrega o que casa, no boot e a cada dispositivo novo (mensagens do kernel, inclusive do barramento `auxiliary`). Só módulos em `kernel/drivers/net/` e, depois deles, em `kernel/drivers/gpu/drm/` (a tela, G1.6zd). Numa thread: uma sonda travada não para o boot, que espera no máximo 20 s e só pelos drivers de rede; a porta que chega depois recebe o nome pelo hot-plug | `apps/corerouter-init/src/modules.rs` |
+| Firmware | os arquivos que os drivers de rede e de tela declaram (`firmware=` no modinfo, como o VyOS), de um commit fixo do `linux-firmware`, com o SHA-256 de cada um, sem comprimir (o squashfs comprime) | `os/package/corerouter-firmware/firmware.lock` |
+| Licenças | só entra o que o `WHENCE` diz que pode ser redistribuído; o resto vira linha `skip`. Os textos e as entradas do `WHENCE` vão em `/usr/share/licenses/firmware/` | `cargo xtask os firmware-lock`, `xtask/src/os/firmware.rs` |
+| Conferência | depois de cada build: hash de cada arquivo na imagem, links, licenças, e todo `firmware=` dos drivers de rede e de tela presente ou em `skip`, senão o build falha | `firmware::verify` |
+
+```sh
+cargo xtask os firmware-lock --tag 20261019   # refaz a trava (precisa de um build pronto)
+```
+
+`corerouter.modules=off` na linha de comando do kernel desliga a carga automática: só fica o que é
+embutido, e uma E810 fica sem driver. Serve para quem não quer que um dispositivo USB plugado
+carregue um driver.
+
+**Os drivers e o firmware andam junto com o slot:** módulos e arquivos estão no rootfs (dm-verity)
+e o kernel no mesmo pacote `.crpkg`; o rollback volta os três. Por isso nada de firmware no
+`/config` (sem verity, e não voltaria no rollback) nem pacote de firmware separado.
+
+**O live da ISO** carrega módulos desde a G1.6za, os do kernel dele ("Módulos do kernel da ISO",
+abaixo). O instalador de console que roda no initramfs não carrega nenhum. A `ice` continua `=y` no
+`installer.fragment` e fica em Safe Mode, o que basta para mostrar a porta: o live trata isso como
+"completa depois de instalar".
+
+**Como o `boot-test` prova isso sem E810.** O QEMU não emula a `ice`, mas emula a `i82551`, cuja
+revisão faz o `e100` recusar abrir a porta sem `e100/d102e_ucode.bin`. O teste liga essa placa
+desde o boot (driver em módulo, varredura de boot), pluga uma `pcnet` depois (driver em módulo,
+mensagens de dispositivo) e sobe a `ether2` pelo canal de controle. Contraprova (**medido**,
+imagem sem firmware, mesma placa): `Direct firmware load for e100/d102e_ucode.bin failed with
+error -2` e o comando volta com erro; na imagem nova, `NIC Link is Up`. O caminho da própria E810
+só se confirma em placa real: a mensagem de pacote DDP carregado, mais de uma fila, XDP ligando,
+e o tempo da sonda.
+
+**Números (medido, 2026-11-08, build release da imagem, KVM nesta máquina):**
+
+| O quê | Valor |
+|---|---|
+| Firmware na trava | 41 arquivos + 1 link, 1 506 937 B crus, 5 textos de licença, nenhum `skip` |
+| `rootfs.squashfs` | 37 281 792 B (36 597 760 B numa build anterior de outro commit, sem firmware; não é comparação estrita) |
+| `corerouter.crpkg` | 57 357 909 B |
+| `linux-firmware` inteiro, para comparar | 1 408 384 541 B crus, 619 114 496 B em squashfs: não cabe no slot de 256 MiB |
+| Carregar `e100` no boot | ~91–100 ms; `ready` em 0,98–1,09 s depois do kernel |
+| Placa nova, driver já carregado | 112 ms até a porta ter nome |
+| Placa nova, driver em módulo (`pcnet32`) | 157 ms até a porta ter nome (50 ms na carga) |
+| Reprodutível | `linux-dirclean` e rebuild: rootfs, bzImage, todos os `.ko`, `disk.img`, instalador, ISO, qcow2 e crpkg com o mesmo hash |
+
+### Tela: `i915` em módulo, sem som (G1.6zd)
+
+O primeiro boot num notebook real (Lenovo LOQ 15IRH8, Raptor Lake-P, kernel 6.18.59 com `quiet`,
+que deixa passar só as mensagens de erro) mostrou na tela, antes do setup:
+
+- `i915 … GuC firmware i915/adlp_guc_70.bin: fetch failed -ENOENT`, `GuC initialization failed`,
+  `Enabling uc failed (-5)`, `Failed to initialize GPU, declaring it wedged!`;
+- `snd_hda_intel … Cannot probe codecs, giving up`;
+- `ACPI BIOS Error … _UPC … AE_ALREADY_EXISTS`, um defeito da tabela ACPI do fabricante, que
+  nenhuma config do kernel tira.
+
+**i915.** É a mesma pegadinha do `ice`: o driver era `=y`, sondava a ~0,4 s, antes do `/`, e a
+imagem nem tinha `lib/firmware/i915`. Da geração Alder Lake-P em diante o i915 liga a submissão
+pelo GuC por padrão (`uc_expand_default_options`, `drivers/gpu/drm/i915/gt/uc/intel_uc.c:26-53`);
+sem o arquivo, `intel_uc.c:578` e `gt/intel_gt.c:215` falham e o GT fica "wedged"
+(`gt/intel_gt_pm.c:273`). A tela continuava (só o modeset), mas com quatro linhas de erro e a
+GPU sem gerência de energia. O que entrou:
+
+| Peça | O que faz | Onde |
+|---|---|---|
+| `i915` como módulo | a sonda roda depois do `/`, com o firmware à vista; até lá o console fica no `simpledrm` (G1.6zc) | `linux.fragment`, `REQUIRED_MODULES` |
+| Segunda passada do PID 1 | depois dos drivers de rede, carrega o driver de tela que casa com a placa (`kernel/drivers/gpu/drm/`). O boot não espera por ela: a espera de 20 s vale só para as portas | `modules.rs` (`Pass::Ports`, `Pass::Screen`) |
+| Firmware do i915 | os 46 arquivos que o driver declara (GuC, HuC, DMC, GSC), 11 257 968 B crus, licença `LICENSE.i915` (redistribuível) | `firmware.lock` |
+| Trava | `os check` e o build reprovam um i915 embutido, um kernel com `CONFIG_SOUND` e uma `firmware.lock` sem `i915/` | `xtask/src/os.rs`, `firmware.rs` |
+
+O que foi descartado, com o motivo:
+
+- **`i915.enable_guc=0` na linha de comando:** o parâmetro é `i915_param_named_unsafe`
+  (`i915_params.c:95`), e mexer nele marca o kernel como alterado pelo usuário (`TAINT_USER`,
+  `kernel/params.c:108-111`), com um aviso a mais no log.
+- **Tirar o i915 e ficar só no `simpledrm`:** funciona para o console, mas um monitor ligado
+  depois do boot não acende (o `simpledrm` só usa o que o firmware deixou) e a GPU fica sem
+  gerência de energia. Fica como alternativa se o módulo der problema em hardware real.
+
+**Som.** O `x86_64_defconfig` liga `CONFIG_SOUND` (34 símbolos `SND*`, HDA embutido). Um roteador
+não toca som: `# CONFIG_SOUND is not set` no fragmento.
+
+**O instalador de console do initramfs** não carrega módulos: fica no `simpledrm`, agora sem
+linhas de erro do i915. O live da ISO carrega o `i915` do `LIVEMODS.IMG`, como os de rede.
+
+**Como foi conferido sem placa Intel.** O QEMU não emula GPU Intel. Para provar o caminho (driver
+de tela em módulo, carregado na segunda passada, tomando o console do `simpledrm`), um build de
+laboratório ligou `CONFIG_DRM_BOCHS=m` (a VGA padrão do QEMU): em UEFI, o log tem
+`driver bochs loaded in 23 ms` depois da linha da varredura, e a tela segue com o aviso do
+primeiro boot, no disco e na ISO (`docs/changes/G1.6zd-screenshots/`). O `bochs` não ficou na
+imagem. No notebook (LOQ 15IRH8, ISO live, **medido** em 2026-11-11) o log do sistema traz
+`driver i915 loaded in 1040 ms`, o GuC 70.49.4, o HuC e o DMC carregados e o `fbcon` passando
+para o `i915drmfb`, sem as linhas de erro.
+
+**Última linha do console no reboot.** O PID 1 chama `tcdrain` no console (até 1 s, numa thread
+`console-drain`, para uma serial com o fluxo segurado não travar o desligamento) antes de mandar
+o SIGHUP aos serviços e antes do `reboot(2)`. Quando o shell de manutenção (líder da sessão do
+`ttyS0`) sai, o kernel desfaz o terminal de controle e descarta o que ainda estava na fila da
+UART (`drivers/tty/tty_jobctrl.c:265-275` → `tty_ldisc.c:700` → `serial/serial_core.c:685`,
+6.18.59); o `reboot(2)` também não espera a UART. Sem a espera, a linha com o motivo do reboot
+podia sair cortada.
+
+### Sensores: o que é embutido e o que é módulo (G1.6zf)
+
+Num notebook real (Lenovo LOQ 15IRH8) o `system.health.print` trouxe só a zona ACPI (`acpitz`,
+27,8 °C) e a bateria: nada da CPU nem do NVMe. O kernel tinha `HWMON=y` e nenhum driver de CPU,
+disco ou placa-mãe. O coletor (`crates/hal-linux/src/resource.rs`) já lia qualquer chip de
+`/sys/class/hwmon`; faltava o kernel.
+
+| Sensor | Símbolo | Como entra | Por quê |
+|---|---|---|---|
+| CPU Intel | `SENSORS_CORETEMP=y` | embutido | só se liga pelo CPUID (`X86_FEATURE_DTHERM`, `drivers/hwmon/coretemp.c:776-797`); em AMD e em VM sai em silêncio |
+| CPU AMD/Hygon | `SENSORS_K10TEMP=y` | embutido | driver PCI da função 3 do nó (`k10temp.c:539-581`) |
+| Disco NVMe | `NVME_HWMON=y` | embutido | parte do `nvme-core` (`drivers/nvme/host/core.c:3742`); VyOS, OpenWrt e Debian ligam `=y` |
+| Disco SATA | `SENSORS_DRIVETEMP=y` | embutido | interface de classe SCSI, só aceita disco SATA com SCT ou SMART (`drivetemp.c:333-372`) |
+| Chipset Intel | `INTEL_PCH_THERMAL=y` | embutido | PCI: PCH até Comet Lake, Lewisburg, Wellsburg |
+| Porta Realtek 2,5G | `REALTEK_PHY_HWMON=y` | embutido | no `probe` do PHY das RTL8125/8126 (as portas dos mini-PCs) |
+| Chip da placa-mãe (ventoinhas, tensões) | `SENSORS_NCT6775`, `SENSORS_NCT6683`, `SENSORS_IT87`, `SENSORS_F71882FG`, `SENSORS_W83627EHF` `=m` | módulo, carregado pelo PID 1 | ver abaixo |
+
+**Por que o chip da placa-mãe é módulo.** O Super-I/O não é enumerado por nada: cada driver
+escreve a chave de desbloqueio nas portas 0x2e e 0x4e e lê quem responde
+(`nct6775-platform.c:1502-1629`, `it87.c:2695-2760`). Embutido, isso rodaria em toda máquina e
+em toda VM, sem como desligar. Debian e VyOS deixam em módulo (o VyOS só sonda quando o operador
+pede os sensores); o OpenWrt embute os de CPU e traz os de placa-mãe em pacotes. O PID 1
+(`apps/corerouter-init/src/modules.rs`, `load_sensors`) carrega os cinco pelo nome, por último,
+depois das portas e da tela, sem o boot esperar:
+
+- **nunca em máquina virtual** (bit `hypervisor` do `/proc/cpuinfo`): não há chip para achar;
+- **`corerouter.sensors=off`** na linha de comando desliga a procura (a placa em que ela
+  atrapalhar); `corerouter.sensors=on` força, também em VM. No roteador instalado o operador
+  muda isso como os outros parâmetros de boot: `system.tuning.boot.set` (System › Tuning ›
+  Boot, seção Hardware) e `system.tuning.boot.apply`, que testa no outro slot (G1.26h);
+- driver cujo chip não existe sai sozinho (`ENODEV`), sem linha no log; uma linha só resume:
+  `sensors: motherboard sensor chip: nct6775 (41 ms)` ou `sensors: no motherboard sensor chip
+  answered`;
+- chip que existe mas cujas portas o firmware usa por ACPI (`EBUSY`, o padrão
+  `acpi_enforce_resources=strict`, comum em placas ASUS e Gigabyte): o driver fica de fora e o
+  console diz por quê. O `acpi_enforce_resources=lax` não é usado: a documentação do it87
+  (`Documentation/hwmon/it87.rst:204-213`) avisa de corrida com o ACPI e de reboot inesperado.
+
+**Entrada que a placa não liga.** O chip tem mais entradas do que a placa usa: um pino de
+temperatura aberto marca qualquer coisa (88 °C, 127 °C), e os limites dele são os alarmes que o
+firmware programou, não os do hardware. Por isso as leituras do chip da placa-mãe vêm marcadas
+(`board: true` no `system.health.print`), sem `max` nem `crit`, e não entram na temperatura do
+roteador (barra superior, gráfico, verificação `temperature`) enquanto houver outro sensor.
+
+**Nomes.** Dois discos NVMe eram dois chips `nvme` com os mesmos rótulos, e as linhas colidiam
+(`nvme-composite` duas vezes). O coletor agora junta ao nome o que distingue o chip: `nvme0`,
+`drivetemp sda`, `ixgbe ether3`; o que sobrar igual ganha o número de ordem (`k10temp 2`).
+
+**Decisão com números** (**medido**, kernel 6.18.59 compilado fora da imagem com o `.config`
+dela, mesmo compilador; o `bzImage` da base bate byte a byte com o da imagem):
+
+| Variante | `bzImage` | Módulos novos |
+|---|---|---|
+| base (G1.6ze) | 18 371 584 B | — |
+| tudo embutido (os 11 acima, mais `JC42`, `SPD5118`, `ACPI_POWER`) | +118 784 B | — |
+| tudo módulo | +4 096 B (só o `NVME_HWMON`, que é `bool`) | 15, 276 665 B de `text+data+bss` |
+| **adotada**: enumerados embutidos, Super-I/O em módulo | +16 384 B | 7, 212 866 B de `text+data+bss` |
+
+O tamanho não decide (0,6 % do `bzImage` no pior caso): decide a sonda cega do Super-I/O. O que
+se liga a um dispositivo enumerado fica embutido, sem código novo no PID 1 e valendo também no
+instalador de console; o que sonda portas fica em módulo. Na imagem (**medido**): `bzImage`
+18 371 584 → 18 392 064 B (+20 KiB), `rootfs.squashfs` +116 KiB, `live-modules.img` +96 KiB,
+ISO +256 KiB. `X86_PKG_TEMP_THERMAL`, que o defconfig deixava em módulo e ninguém carregava
+(mostra o mesmo sensor de pacote do coretemp), saiu.
+
+**Travas.** `os check`: os quatro sensores de CPU e disco `=y`, os cinco Super-I/O `=m`
+(embutido é reprovado) e a lista do PID 1 igual à do kernel; o build confere os módulos no
+`.config` e na carga do live; o `boot-test` liga um disco NVMe na VM e exige a temperatura dele
+no `system.health.print`, pedido como o operador pede (`admin` por TLS).
+
+### Temperatura dos pentes de memória (G4.8g)
+
+System › Health passa a mostrar a temperatura de cada pente que tem sensor: o hub do SPD dos
+pentes DDR5 (`spd5118`) e o sensor JC42.4 dos DDR3/DDR4 de servidor (`jc42`). Lido no fonte
+(6.18.59):
+
+- **Quem lista os pentes.** O driver do SMBus (`i2c-i801` da Intel, embutido; `i2c-piix4` da
+  AMD) chama `i2c_register_spd` (`drivers/i2c/i2c-smbus.c`), que lê os dispositivos de memória
+  do SMBIOS (tipo 17) e, para DDR5/LPDDR5, instancia um `spd5118` em `0x50 + n`; para DDR4,
+  um `ee1004` (só a EEPROM, sem temperatura); tipos misturados ou desconhecidos (o QEMU diz
+  `RAM`) não instanciam nada. É um dispositivo enumerado: o `spd5118` fica **embutido**, como os
+  outros sensores enumerados (G1.6zf).
+- **O `spd5118` não grava no probe** a não ser que o hub esteja numa página diferente de 0
+  (`spd5118_i2c_init`): só aí escreve o registrador de página, e uma falha vira `ENODEV`
+  calado. Com o "SPD Write Disable" que o firmware Intel costuma ligar (`SMBHSTCFG_SPD_WD`,
+  `i2c-i801.c`), a temperatura (registradores voláteis da página 0) continua legível; o que
+  quebra é ler a EEPROM pelo `nvmem` (ninguém aqui lê) e o resume de suspensão (um roteador não
+  suspende). Os patches da Canonical para não instanciar sob o Write Disable deixaram em
+  `i2c-smbus.c` as duas funções, mas o i801 do 6.18.59 chama a que instancia sempre.
+- **O `jc42` sonda às cegas**: lê os endereços `0x18`–`0x1f` de todo adaptador de classe HWMON
+  (`jc42_detect`, só leituras de identificação). Fica em **módulo**, carregado pelo PID 1 junto
+  com os Super-I/O (`SENSOR_MODULES`): só em máquina real e sem `corerouter.sensors=off`; o PID 1
+  só o diz achado quando um cliente se liga a ele (`/sys/bus/i2c/drivers/jc42/<bus>-<end>`).
+- **O SMBus da AMD** (`i2c-piix4`) em **módulo**, carregado antes dos sensores e só quando há uma
+  função PCI de classe `0x0c05` da AMD, ATI ou ServerWorks: embutido, ele se ligaria ao PIIX4
+  virtual do VMware e escreveria `SMBus Host Controller not enabled!` a cada boot.
+
+**Nomes e limites.** O sensor de um pente vira `spd5118 dimmN`/`jc42 dimmN`, N pelo endereço
+(o slot na ordem do SMBIOS), e sai sem o `max`: o limite alto do chip é um alarme que o
+firmware (ou o valor de fábrica, 55 °C em muitos) programa, não um limite da peça, e acenderia a
+verificação `temperature` à toa; o `crit` fica.
+
+**Custo** (**medido**, kernel compilado fora da imagem sobre o da G1.6zy): `bzImage` +0 B
+(arredondado a página), `text` +8 229 B, `data` +4 096 B; `jc42` 7 024 B e `i2c-piix4`
+17 446 B de `text+data+bss` em módulo.
+
+**Conferido no QEMU** (q35 com o i801, e `pc` com o PIIX4 e `corerouter.sensors=on`): nenhuma
+linha de erro no boot com os drivers novos; nenhum pente listado (o SMBIOS do QEMU diz `RAM`).
+
+**Não conferido** (sem emulação): um pente DDR5 de verdade (o notebook Lenovo 83EU da sessão
+principal), um RDIMM DDR4 com JC42.4, SMBus com multiplexador (placas AMD com várias portas:
+`i2c_register_spd` só roda na porta 0), e o SPD Write Disable ligado.
+
+### Cobertura de hardware: núcleos, disco de boot, hipervisores, diagnóstico (G1.6zi)
+
+O `.config` vinha do `x86_64_defconfig` mais o que o roteador usa. O primeiro boot num notebook
+real e a leitura do `.config` mostraram o que falta para **dar boot, enxergar o disco e usar
+todos os núcleos** em hardware comum, e para um defeito deixar rastro. Tudo abaixo é embutido
+(não há initramfs: o kernel monta a raiz sozinho) e vale também para o kernel da ISO.
+
+| Grupo | Símbolos | O que acontecia sem eles |
+|---|---|---|
+| Núcleos | `MAXSMP` (`NR_CPUS=8192`) | `CPU topo: CPU limit of 64 reached. Ignoring further CPUs`: um servidor de 128 threads usava 64 |
+| Interrupções | `IRQ_REMAP` | Numa máquina real o x2APIC depende do remapeamento de interrupções (`arch/x86/kernel/apic/apic.c:1823-1859`); sem ele as CPUs de APIC id ≥ 255 não sobem (`smpboot: CPU 299 has invalid APIC ID 12b. Aborting bringup`) |
+| Disco de boot | `MMC`, `MMC_BLOCK`, `MMC_SDHCI`, `MMC_SDHCI_PCI`, `MMC_SDHCI_ACPI` | eMMC soldado de mini-PC e appliance x86 (Atom, Celeron, N-series): o instalador não via disco nenhum |
+| | `VMD` | Com o Intel VMD ligado no firmware (padrão de fábrica de muitos notebooks e servidores Intel) o NVMe fica atrás dele e não existe para o kernel |
+| | `SCSI_SMARTPQI`, `SCSI_MPI3MR` | HPE Smart Array Gen10 em diante; Broadcom MPI3 (HBA/RAID SAS4, Dell PERC 12) |
+| | `USB_UAS` | Gaveta USB 3 caía no modo lento (não impede o boot) |
+| Hipervisores | `HYPERV`, `HYPERV_VMBUS`, `HYPERV_STORAGE`, `HYPERV_NET`, `HYPERV_KEYBOARD`, `HYPERV_UTILS` | Hyper-V Geração 2 e Azure só têm dispositivos VMBus: sem disco, sem rede, sem teclado |
+| | `XEN`, `XEN_PVHVM_GUEST`, `XEN_BLKDEV_FRONTEND`, `XEN_NETDEV_FRONTEND` | Xen HVM (XCP-ng, XenServer) com disco e placa paravirtuais: o kernel não achava a raiz |
+| | `PARAVIRT_SPINLOCKS`, `VMGENID` | vCPU disputada; VM clonada ou voltando de snapshot repetia o estado do gerador aleatório |
+| Diagnóstico | `SOFTLOCKUP_DETECTOR`, `HARDLOCKUP_DETECTOR` (modo vizinho), `DETECT_HUNG_TASK` | Um travamento do kernel não deixava linha no log |
+| | `PSTORE`, `EFI_VARS_PSTORE` (ligado por padrão desde a G1.6zx), `ACPI_APEI` (ERST) | O motivo de um pânico se perdia no reboot (`panic=10`) |
+| | `PCIEAER`, `PCIE_DPC`, `ACPI_APEI_GHES`, `EDAC` (AMD64, SKX, I10NM, SBRIDGE, IE31200) | Erro de PCIe e de memória ECC sem registro; não dava para saber qual pente trocar |
+
+**Decisões, com o motivo.**
+
+- **8192 CPUs (`MAXSMP`), não 512.** O `cpumask` tem três degraus em compilação
+  (`include/linux/cpumask.h:66-76`): até 64 CPUs as operações são de uma palavra; acima disso o
+  limite é o `nr_cpu_ids` lido em execução, igual para 512 e 8192. A diferença do `MAXSMP` é só
+  alocar as máscaras (`CPUMASK_OFFSTACK`) em vez de pô-las na pilha, em caminhos de controle
+  (afinidade, não pacote). **Medido** numa VM de 2 GiB: `NR_CPUS=512` custa 0 de RAM e 0 no
+  `bzImage` contra 64; `MAXSMP` custa 1 624 KiB de RAM e 16 KiB no `bzImage` contra 512, igual
+  com 2 ou 16 CPUs (o custo é fixo, não por CPU). 512 deixaria de fora os servidores de 2
+  soquetes com mais de 256 núcleos; 8192 é o que Debian, Ubuntu e RHEL usam (VyOS e Alpine:
+  256; OpenWrt: 64). Não medido: efeito no encaminhamento (não há instrumento aqui que resolva
+  uma diferença dessa ordem; o caminho de pacote não usa `cpumask`).
+- **`IRQ_REMAP` sem mudar o DMA.** `INTEL_IOMMU_DEFAULT_ON` segue desligado (a trava o proíbe):
+  o remapeamento de interrupção é montado à parte (`drivers/iommu/intel/irq_remapping.c`) e a
+  tradução de DMA na Intel só liga com `intel_iommu=on`. Na AMD o DMA já passava pelo IOMMU
+  (`IOMMU_DEFAULT_DMA_LAZY`), antes e depois. Saída de emergência num firmware com a tabela
+  errada: `intremap=off`.
+- **Hyper-V sem `PCI_HYPERV`.** Com ele a função virtual da rede acelerada do Azure aparece
+  como mais uma placa, que o `netvsc` escraviza; o PID 1 a nomearia `etherN` e o daemon a
+  gerenciaria. Sem ele a VM usa só a placa sintética, que é correta. Fica para um teste no
+  Azure (G1.6zw).
+- **Xen sem PV clássico, sem balão.** `XEN_PV` traz o `PARAVIRT_XXL` (chamadas indiretas pelo
+  kernel todo); o balão devolve a memória do roteador ao host. Os dois frontends entram juntos:
+  com eles o kernel desliga o disco e a placa emulados
+  (`arch/x86/xen/platform-pci-unplug.c:144-170`).
+- **Detector de travamento no modo vizinho** (`HARDLOCKUP_DETECTOR_PREFER_BUDDY`): cada CPU
+  confere a vizinha no temporizador que já existe. Não ocupa um contador do PMU por CPU nem gera
+  NMI periódica, e funciona em VM. Não pega o caso de todas as CPUs travadas, que é papel do
+  watchdog de hardware (G1.6f). **Só avisa**: `softlockup_panic`, `hardlockup_panic` e
+  `hung_task_panic` ficam em 0 (uma VM com a vCPU parada pelo host daria reinício em falso).
+- **pstore: ERST sim, variável EFI só a pedido.** `ACPI_APEI` traz o ERST, o armazenamento que
+  o firmware de servidor tem para isso. O meio EFI fica compilado e desligado
+  (`EFI_VARS_PSTORE_DEFAULT_DISABLE`; liga com `efi_pstore.pstore_disable=0`): cada pânico grava
+  variáveis na mesma NVRAM em que o atualizador A/B grava `Boot####`, e ninguém as apaga ainda.
+  Mostrar o registro no log do roteador e apagá-lo é a G1.6zx (que ligou o meio EFI por padrão:
+  seção seguinte).
+- **EDAC só onde o driver fica calado sem ECC.** `igen6` (SoCs cliente) e `pnd2` (Apollo Lake)
+  escrevem uma linha de nível erro numa máquina sem ECC (`igen6_edac.c:1107`, `pnd2_edac.c:1555`),
+  que apareceria em todo boot `quiet` de um mini-PC. A G1.6zy os trouxe como módulo, junto com
+  `MEMORY_FAILURE` e `RAS_CEC` (seção "Erros de memória").
+
+**Custo** (**medido**, kernel 6.18.59 compilado à parte com o `.config` da imagem; base = depois
+da G1.6zf, `bzImage` 18 387 968 B, `text` 40 850 668, `data` 8 949 430):
+
+| Grupo sozinho | `bzImage` | `text` | `data` |
+|---|---|---|---|
+| `NR_CPUS=512` | +0 B | +33 009 | +21 412 |
+| `MAXSMP`, sobre 512 | +16 384 B | +395 681 | +887 936 |
+| `IRQ_REMAP` | +20 480 B | +31 809 | +8 452 |
+| Disco de boot | +368 640 B | +725 381 | +181 784 |
+| Hipervisores (com o que ficou de fora: `PCI_HYPERV`, balão e ferramentas do Xen) | +364 544 B | +749 200 | +173 072 |
+| Diagnóstico (com o que ficou de fora: `igen6`, `pnd2`, `MEMORY_FAILURE`) | +241 664 B | +435 816 | +119 304 |
+
+Na imagem (**medido**, antes = G1.6zf): `bzImage` 18 392 064 → 19 305 472 B (+892 KiB);
+`BOOTX64.EFI` da ISO 19 645 440 → 20 419 584 B (+756 KiB); ISO 139 997 184 → 141 873 152 B
+(+1,79 MiB); `corerouter.crpkg` +928 KiB; `rootfs.squashfs` +36 KiB. RAM (VM de 1 GiB, 2 CPUs):
+`MemTotal` 981 292 → 978 124 KiB (−3,1 MiB). Boot, kernel → daemon pronto, rodadas alternadas
+com a máquina carregada: antes 1,04 / 1,41 / 1,06 s, depois 1,12 / 1,05 s; o trecho do kernel
+até o init, 0,71–0,77 s antes e 0,71–0,76 s depois. Com 128 CPUs o boot leva 2,26 s e com 300,
+5,52 s (subir cada CPU custa).
+
+**Conferido no QEMU** (o que ele emula):
+
+- `boot-test --smp 128`: `128 of 128 in use` (o kernel anterior parava em 64);
+- `boot-test --smp 300`, com IOMMU e sem o destino estendido de MSI que só VM tem:
+  `DMAR-IR: Enabled IRQ remapping in x2apic mode`, `300 of 300 in use`. Com `NR_CPUS` alto e sem
+  `IRQ_REMAP` a mesma máquina sobe 256 CPUs e escreve `CPU 299 has invalid APIC ID 12b`. O DMA
+  continua sem tradução (nenhuma linha `DMAR: IOMMU enabled`);
+- cartão SD numa controladora SDHCI (`sdhci-pci`): a ISO live o lista (`mmcblk0`, `SD/eMMC`),
+  instala nele e o SeaBIOS dá boot por ele (`/config: /dev/mmcblk0p4`). O OVMF do teste não tem
+  driver de SD (`BdsDxe: failed to load Boot0003 "CoreRouter A" … Not Found`); nele o segundo
+  boot recebe o kernel da imagem e confere que a raiz e o `/config` são achados no cartão;
+- convidado Xen HVM (a emulação de Xen do QEMU sobre KVM, disco `xen-disk` e placa
+  `xen-net-device`): `Hypervisor detected: Xen HVM`, raiz e `/config` em `xvda`, porta `ether1`
+  pelo `netfront`, daemon pronto. O kernel anterior, na mesma VM, não acha o disco;
+- Hyper-V emulado (`-cpu …,hv-*`, `vmbus-bridge`): `Hypervisor detected: Microsoft Hyper-V`,
+  `hv_vmbus: Vmbus version:4.0`, relógio `hyperv_clocksource_tsc_page`, roteador pronto. O QEMU
+  não emula o disco nem a placa do VMBus;
+- pânico com um ERST emulado (`acpi-erst`): depois do reboot, três registros `dmesg-erst-*` em
+  `/sys/fs/pstore`; `efi_pstore.pstore_disable` em `Y`;
+- `watchdog` e `soft_watchdog` em 1, `softlockup_panic`, `hardlockup_panic` e
+  `hung_task_panic` em 0.
+
+**Não conferido** (não há emulação): eMMC de verdade e as áreas de boot dele, NVMe atrás de
+VMD, HPE Smart Array (`smartpqi`), Broadcom MPI3, Hyper-V e Azure reais (disco e rede do VMBus),
+XCP-ng real, um travamento de CPU de verdade, AER/APEI/EDAC com erro real.
+
+**O instalador e o eMMC.** Todo eMMC tem duas áreas de boot (`mmcblk0boot0`, `mmcblk0boot1`),
+que o kernel mostra como discos. `corerouter_sysupdate::disks::whole_disk` as tira da lista de
+destinos; o disco é o `mmcblk0`. Nada no instalador nem no A/B monta nome de partição: tudo é por
+rótulo de partição (`PARTLABEL`, `PARTUUID`), então `mmcblk0p3` e `xvda3` funcionam como `sda3`.
+
+**Travas.** `os check`: cada símbolo adotado `=y` no fragmento (`HARDWARE_COVERAGE`), e
+`XEN_PV`, `XEN_BALLOON` e `INTEL_IOMMU_DEFAULT_ON` desligados; o build: os mesmos no `.config`
+da imagem e no da ISO, e `NR_CPUS=8192` (o `MAXSMP` cai em silêncio sem `DEBUG_KERNEL`); o
+`boot-test` confere que o roteador usa todas as CPUs da VM, e `boot-test --smp N` dá N CPUs à
+máquina (acima de 255, com IOMMU e sem o atalho que só VM tem); o `install-test` instala num
+cartão SD numa controladora SDHCI e dá boot por ele.
+
+### Registro de pânico e de travamento no boot seguinte (G1.6zx)
+
+No notebook, um slot B que "não subiu" voltou para o A sem deixar rastro: o kernel do B entrou em
+pânico, o `panic=10` reiniciou e o fim do log se perdeu. Agora o pânico fica registrado e o boot
+seguinte diz o que foi, em que boot e em que slot.
+
+**Como funciona.**
+
+1. **Kernel.** No pânico (e no oops) o kernel entrega o fim do log ao pstore
+   (`fs/pstore/platform.c`, `pstore_dump`), que grava no ERST do firmware de servidor ou, numa
+   máquina UEFI, em variáveis UEFI (`efi_pstore`). O meio EFI passou a ligar por padrão
+   (`# CONFIG_EFI_VARS_PSTORE_DEFAULT_DISABLE is not set`): é ele que pega o pânico de um kernel
+   que nem chegou ao PID 1, o caso do notebook.
+2. **PID 1** monta `/sys/fs/pstore` (só se o kernel tem o pstore: o do instalador não tem) e,
+   numa máquina real, liga `kernel.softlockup_panic` e `kernel.hardlockup_panic` (abaixo).
+3. **Daemon, serviço `crash-log`** (`apps/corerouter-daemon/src/service/crash_log.rs`), uma vez
+   no boot: lê os registros (até 256 arquivos de 64 KiB), junta as partes de cada dump (a parte 1
+   é o texto mais novo), grava cada dump em `/config/crash/<hora>-<motivo>-<id>.json` (arquivo
+   temporário, `fsync`, `rename`, `fsync` da pasta), **só então** apaga o registro (apagar o
+   arquivo do pstore apaga a variável) e guarda os 8 mais novos. Gravar falhou: o registro fica no
+   firmware e o problema vai para o log.
+4. **Log do roteador**: uma linha `system,critical` e o rastro em `system,error` (até 24 linhas a
+   partir da que diz o que houve), como a RouterOS faz com "kernel failure in previous boot", mas
+   com a causa: `previous boot ended in a kernel panic (boot started 2026-11-12 03:36:01 UTC,
+   slot b (1.4.0), 41 s after start, at 2026-11-12 03:36:42 UTC, kernel 6.18.59, efi_pstore
+   record): Kernel panic - not syncing: …`.
+5. **`system.crash.print`** (`{lines?, limit?}`) lista os dumps guardados com o texto inteiro, a
+   hora, o tempo desde o boot, o slot e a versão, e o estado do armazenamento (`backend`,
+   `efi.free`). Verificação de saúde `kernel.crash`: aviso enquanto dura o boot que veio depois
+   de um pânico; `kernel.crash-store`: aviso quando a NVRAM está curta (abaixo).
+
+**O slot do dump.** O texto não basta: o dump de 10 KiB comprimidos guarda os ~26 KB finais do
+log, e num pânico a 0,8 s do boot ele já não chega à linha `Command line:` (**medido**: a parte
+16, a mais velha, começa em 0,042 s). O slot sai então do estado do A/B
+(`corerouter_engine::crash_log::attribute`): um dump gravado antes da volta de um teste que falhou
+(`last.result = rolled-back`) é do slot testado, com a versão dele; qualquer outro é do slot que
+roda agora (um pânico reinicia no mesmo slot). Quando o texto chega à linha de comando, o
+`corerouter.slot=` dela vale.
+
+**O custo na NVRAM e a política** (**medido**, OVMF 2024.02 do Ubuntu, kernel 6.18.59 compilado
+fora da imagem com o `.config` dela, `kmsg_bytes` 10240, `echo c > /proc/sysrq-trigger`):
+
+| Medida | Valor |
+|---|---|
+| NVRAM do OVMF (`statfs` do efivarfs) | 256 KiB, 235 KiB livres |
+| Um pânico | 16 variáveis `dump-type0-<parte>-1-<hora>-C` de 487 a 841 B (comprimidas, deflate), ~1,65 KB de texto cada |
+| NVRAM livre depois do pânico | 219 KiB (**16 KiB por pânico**) |
+| NVRAM desta máquina de desenvolvimento (firmware de placa-mãe, Ubuntu com `efi_pstore` ligado) | 128 KiB, 77 KiB livres |
+
+O pstore conta os bytes **comprimidos** contra o `kmsg_bytes` (`total += record.size`), então um
+pânico custa ~16 KiB qualquer que seja o log. O risco é o de 2013 (notebooks Samsung que não davam
+boot com a NVRAM cheia de dumps; Arch FS#70140): ninguém apagava. A política:
+
+- o daemon apaga a cada boot o que o boot anterior gravou, depois de salvar (como o
+  `systemd-pstore` com `Unlink=yes`, padrão do Ubuntu);
+- depois de apagar, mede a NVRAM (`statfs` do efivarfs, que é o `QueryVariableInfo`,
+  `fs/efivarfs/super.c`) e, com menos de **41 KiB** livres (`EFI_MIN_FREE`: dois pânicos de
+  16 KiB, 4 KiB para as entradas `Boot####`, `BootOrder` e `BootNext` do A/B e os 5 KiB que o
+  Linux nunca usa, `EFI_MIN_RESERVE` de `arch/x86/platform/efi/quirks.c`), desliga o
+  `efi_pstore` naquele boot (`pstore_disable` aceita escrita em execução,
+  `drivers/firmware/efi/efi-pstore.c`), com aviso no log e na saúde; o boot seguinte mede de
+  novo;
+- a medida se repete a cada 60 s enquanto o meio está ligado: um oops grava um dump sem
+  reiniciar, e uma série deles no mesmo boot não pode tomar o lugar das entradas de boot;
+- o espaço de um dump apagado só volta quando o firmware recolhe a NVRAM, num boot (**medido**
+  no OVMF: 233 472 B livres antes do pânico, 217 088 B depois de apagado, no mesmo boot; o EDK2
+  não recolhe em tempo de execução e só o faz no boot quando o espaço livre fica curto). O
+  `QueryVariableInfo` conta só o que uma escrita agora consegue usar, que é o que a atualização
+  A/B precisa: a medida do daemon é a certa, e erra para o lado seguro;
+- a imagem live só lê: os registros são do sistema instalado.
+
+O que fica de fora: um surto de oops que grave mais de dois dumps dentro de 60 s ainda chega ao
+limite do kernel (5 KiB) antes da medida seguinte; com `kernel.panic_on_oops` (recomendado em
+todos os perfis do Tuning) o primeiro oops já reinicia. ramoops (RAM reservada) não foi adotado:
+num PC x86 a memória não sobrevive a um reset a frio e o endereço muda de máquina para máquina.
+
+**Pânico em travamento.** O detector da G1.6zi só escrevia o rastro. Numa máquina real o PID 1
+liga `kernel.softlockup_panic` (CPU presa no kernel por 20 s) e `kernel.hardlockup_panic` (presa
+com as interrupções desligadas por 10 s): o `panic=10` reinicia e o boot seguinte mostra o
+rastro. Em máquina virtual (flag `hypervisor` da CPU) fica desligado: o host pode parar uma vCPU
+por esse tempo. Um `softlockup_panic=`/`hardlockup_panic=` na linha de comando
+(`system.tuning.boot`) vale sobre o padrão; os dois aparecem no Tuning (aba Kernel, seção de
+estabilidade), recomendados em 1 numa máquina real e em 0 numa VM. `hung_task_panic` fica em 0:
+uma tarefa presa 120 s esperando um disco USB não é motivo para derrubar o encaminhamento.
+
+**OS Log.** Entradas novas no catálogo (`crates/engine/src/oslog_known.rs`): erro de PCIe (AER,
+DPC), erro de memória ECC (EDAC), falha dentro do kernel (oops, BUG), registro de pânico não
+gravado (pstore), e o travamento passou a reconhecer `detected stalls on CPUs` (RCU).
+
+**Conferido no QEMU** (`cargo xtask os ab-test --scenario crash` e `--scenario bad-param`, OVMF):
+o pânico de um teste de slot B que não sobe aparece no slot A com `slot b`; um pânico por sysrq
+é salvo, logado e apagado; com a NVRAM cheia por outro GUID até sobrarem 16 KiB, o daemon desliga
+o `efi_pstore` (aviso `kernel.crash-store`), um pânico não grava nada e a atualização A/B ainda
+grava as entradas de boot e sobe no B.
+
+**Não conferido**: ERST de servidor real (só o emulado da G1.6zi), firmware que não implementa
+`QueryVariableInfo` (o daemon então não desliga nada e fica o limite do kernel), NVRAM de
+notebook e placa reais (a do notebook Lenovo 83EU fica para a sessão principal), um travamento
+de CPU de verdade.
+
+### Erros de memória: controladores que faltavam e a política (G1.6zy)
+
+A G1.6zi deixou de fora dois controladores e a política para um erro de memória. Agora:
+
+**Os dois controladores que falam sem ECC entram como módulo.** `igen6_edac` (SoCs Intel cliente
+com ECC em banda: Elkhart Lake, Alder Lake-N, Raptor Lake-P e outros) e `pnd2_edac` (Apollo
+Lake, Denverton) escrevem uma linha de nível erro em todo boot de uma máquina sem ECC. Lido no
+fonte (6.18.59): o `igen6` só se cala quando o fusível diz que não há ECC em banda
+(`ibecc_available`, `edac_dbg`); com o ECC disponível e desligado pelo firmware ele escreve
+`MC%d In-Band ECC is disabled` (`igen6_get_dimm_config`, `KERN_ERR`) e sai com `ENODEV`. O
+`pnd2` escreve `Failed to register device with error %d` (`pnd2_init`). O PID 1 os carrega por
+nome (`EDAC_MODULES`), depois dos sensores, só quando o firmware diz que a memória tem ECC: uma
+estrutura SMBIOS tipo 16 (Physical Memory Array, DSP0134 §7.17) de uso "memória do sistema" com
+correção single-bit, multi-bit ou CRC (`plan::smbios_ecc`), e nunca em VM.
+`corerouter.edac=on` força, `off` impede. Um driver de outro controlador sai com `ENODEV` em
+silêncio; um que acha o firmware tratando os erros (GHES) sai com `EBUSY` e fica dito no log.
+Os outros (AMD64, SKX, I10NM, SBRIDGE, IE31200) continuam embutidos: calados sem ECC.
+
+**A política para um erro que o ECC não corrige** (`MEMORY_FAILURE`, `RAS_CEC`):
+
+- com `MEMORY_FAILURE` o kernel tira de uso a página com o erro e encerra (SIGBUS) só o processo
+  que a usa, em vez de entrar em pânico (sem ele, um erro desses numa página de processo era
+  pânico e reinício). Se é o daemon, o PID 1 o reinicia em 2 s; o encaminhamento, que está no
+  kernel, não para. Os padrões do kernel ficam: `vm.memory_failure_recovery = 1` (recuperar em
+  vez de pânico) e `vm.memory_failure_early_kill = 0` (matar só quem tocar na página), os dois
+  agora no Tuning, aba Kernel, com a explicação;
+- `RAS_CEC` conta os erros corrigidos por página e tira de uso a que passa do limite antes que
+  ela vire erro não corrigido; sem ECC não faz nada. É o que Ubuntu faz (o `.config` do kernel
+  7.0.0-42-generic desta máquina: `MEMORY_FAILURE=y`, `RAS_CEC=y`, `EDAC_IGEN6=m`,
+  `EDAC_PND2=m`; **medido**).
+
+**Contagem por pente em System › Health.** O coletor lê
+`/sys/devices/system/edac/mc/mc*/dimm*` (rótulo, local, tamanho, tipo, modo ECC, erros
+corrigidos e não corrigidos) e o `HardwareCorrupted` do `/proc/meminfo`, a cada 10 s (junto com
+os sensores; nada sem ECC). `system.health.memory.print` devolve os pentes; a janela Resources,
+aba Memory, mostra a tabela "Pentes com ECC" (selo de estado por pente, ⓘ nas colunas). A
+verificação `memory.ecc` só existe com ECC: erro com qualquer erro não corrigido, aviso com
+erros corrigidos ou memória retirada de uso, ok com a contagem. O catálogo do OS Log ganhou
+"Página de memória com defeito retirada" (`Memory failure:`, `soft offline:`).
+
+**Custo** (**medido**, kernel 6.18.59 compilado fora da imagem com o `.config` dela):
+
+| Variante | `bzImage` | `text` | `data` | Módulos |
+|---|---|---|---|---|
+| base | 18 314 240 B | 40 697 744 | 9 888 786 | — |
+| com `IGEN6=m`, `PND2=m`, `MEMORY_FAILURE`, `RAS_CEC` | +28 672 B | +41 981 | +14 780 | `igen6_edac` 22 022 B, `pnd2_edac` 17 403 B de `text+data+bss` |
+
+Nada roda por pacote: o custo é a contagem nos raros erros de memória.
+
+**Não conferido** (não há emulação): uma máquina com ECC de verdade, um erro corrigido ou não
+corrigido real, o `igen6` numa máquina com ECC em banda ligado. O QEMU não emula controlador de
+memória com EDAC.
+
+**Conferido no QEMU** (q35 e `pc`, a imagem desta branch): sem ECC no SMBIOS nada é carregado
+(`lsmod` sem `igen6_edac`); com `corerouter.edac=on`, o `igen6_edac` carrega (é um driver PCI:
+o módulo fica mesmo sem controlador) sem nenhuma linha de nível erro, e o PID 1 diz
+`memory errors: no memory controller of igen6_edac or pnd2_edac answered`. Por isso um driver só
+conta como achado quando aparece um `mc<N>` novo em `/sys/devices/system/edac/mc`. A tabela de
+pentes foi conferida na GUI com o laboratório virtual (dois pentes, tema claro e escuro).
+
+### Boot lento no handoff do USB (xHCI) (G1.6zq)
+
+No notebook Lenovo 83EU (i5-12450H, BIOS LZCN41WW) com a dev.591, dando boot pelo pendrive, o
+`ready` saiu 25,1 s depois do kernel, e 20,47 s disso foram um passo só (**medido**, log do
+roteador, `636,280399 → 656,753205`):
+`pci 0000:00:14.0: quirk_usb_early_handoff+0x0/0x780 took 19992855 usecs`. O número do kernel
+não é µs: `drivers/pci/quirks.c:147` faz `ns >> 10`.
+
+**O que o passo faz** (`drivers/usb/host/pci-quirks.c`, igual no 6.18.59 e no master 7.4-rc2):
+`quirk_usb_early_handoff` (linha 1261) liga o dispositivo (`pci_enable_device`, que pode rodar o
+`_PS0` da ACPI) e chama `quirk_usb_handoff_xhci` (linha 1158), que pede o controlador ao BIOS
+(escreve *HC OS Owned* no USBLEGSUP e espera *HC BIOS Owned* zerar, até 1 s, linha 1203),
+desliga os SMIs do legado (linha 1221), espera *Controller Not Ready* (até 5 s, linha 1232) e
+para o controlador (até 32 ms, linha 1248). Nenhum dos avisos de estouro desses prazos saiu.
+
+**Por que um prazo de 1 s pode virar 20 s sem aviso.** O `handshake()` (linha 1030) usa
+`readl_poll_timeout_atomic`, que desde o commit `7349a69cf312` ("iopoll: Do not use timekeeping
+in read_poll_timeout_atomic()", 2024) não olha o relógio: soma o `udelay` de cada volta
+(`include/linux/iopoll.h`, `poll_timeout_us_atomic`). O tempo que o processador passa em SMM
+(o BIOS tratando o legado USB) não entra na conta. Sobram quatro hipóteses, e cada uma pede uma
+correção diferente:
+
+| Hipótese | Onde o tempo aparece | Correção |
+|---|---|---|
+| Um SMI longo do BIOS ao soltar o controlador | "OS-owned write" ou "BIOS release", com 1–2 SMIs | do firmware (BIOS novo ou "USB Legacy" desligado); o kernel não encurta um SMI |
+| Tempestade de SMIs enquanto o kernel espera | "BIOS release", com milhares de SMIs | prazo pelo relógio no `handshake()`: 1 s de verdade, e o kernel toma o controlador |
+| `_PS0` da ACPI demorado | "enable", sem SMI | contornar na tabela ACPI ou no BIOS |
+| Controlador lento para sair do CNR | "CNR" | prazo pelo relógio, como acima |
+
+**Diagnóstico na imagem** (`os/patches/linux/0003-usb-pci-quirks-time-the-xhci-handoff.patch`):
+cada passo do handoff é cronometrado com `ktime_get()` e, em Intel, conta os SMIs dele
+(`MSR_SMI_COUNT`, 0x34). Quando o handoff passa de 10 ms (o mesmo limite da linha "took"), ou com
+`initcall_debug`, o kernel escreve no log:
+
+```text
+pci 0000:00:14.0: xHCI handoff: <total> us, <n> SMIs; USBLEGSUP <hex> USBLEGCTLSTS <hex>
+pci 0000:00:14.0: xHCI handoff:   <passo>: <µs> us, <n> SMIs     (só os passos ≥ 1 ms ou com SMI)
+```
+
+Os valores de USBLEGSUP e USBLEGCTLSTS são os que o firmware deixou (bit 16: BIOS dono; bit 24:
+SO dono; bits 0, 4, 13–15 de USBLEGCTLSTS: quais SMIs o BIOS ligou — o 14, "SMI on PCI Command",
+dispara já no `pci_enable_device`, e por isso o passo "enable" também conta SMIs). Fora isso, o patch só
+acrescenta duas leituras que esvaziam escritas postadas, para o custo cair no passo certo.
+
+### O que o roteador avisa quando a placa não sobe (G1.6ja)
+
+O serviço `nic-problems` do daemon olha a máquina a cada 10 s, fora do lock do `Session`: as placas
+em `/sys/bus/{pci,usb,mdio_bus}/devices` e o `/dev/kmsg`, com a posição própria. O parser das linhas
+é um só (`corerouter_hal::nic_problem`), usado também pelo teste de rede do instalador.
+
+| Caso | Como vê | O que diz |
+|---|---|---|
+| Sem driver | classe PCI `0x0200`; USB CDC/RNDIS, ou chip conhecido quando a classe é só "vendor" | o módulo que casa em `modules.alias`, ou que a imagem não conhece a placa, com o id |
+| Firmware | `Direct firmware load…` e as mensagens próprias de quem pede sem aviso (`r8169`, `r8152`, `e100`, `tg3`, `cxgb4`, PHYs), só de placa de rede | o arquivo, o erro e o que fazer |
+| `ice` em Safe Mode | a mensagem de `ice_log_pkg_init`; ou o máximo de 1 canal com mais de uma CPU (`ice_ethtool.c:3803`), que sobrevive a um log que deu a volta | o motivo: arquivo faltando, inválido, versão |
+
+**Não contam:** `regulatory.db` (desde a G1.30 a imagem o traz; a linha só aparece em imagem anterior), `cxgb4/*-config.txt` (a placa usa o
+da flash), `ice-<serial>.pkg` (opcional), qualquer linha de outro dispositivo (vídeo, Bluetooth), Wi-Fi
+(classe `0x0280`, listada em `ignored`) e função virtual sem driver. Na ISO, firmware e Safe Mode
+são o esperado: nota, não aviso. Um cartão sem driver na ISO continua avisando, porque o operador
+pode estar para perder a única porta.
+
+### Placas suportadas
+
+`os/board/x86_64/nics.fragment` liga 175 drivers com fio e de PHY como módulo, além dos que o
+`linux.fragment` já embute. Uma placa que não está na máquina só ocupa disco: o driver não carrega.
+
+| Família | Drivers | Situação |
+|---|---|---|
+| Intel 1G/10G/25G/40G | `e1000`, `e1000e`, `igb`, `igc`, `ixgbe`, `i40e`, `iavf` (embutidos) | `e1000`, `e1000e` e `igb` **testadas** no QEMU; as outras devem funcionar |
+| Intel E810 (100G) | `ice` | deve funcionar; DDP e Safe Mode só se confirmam em placa real |
+| Intel 100/10 antigas | `e100` | **testada** no QEMU, com firmware |
+| Intel mGbE (Atom, Core) | `dwmac-intel` | deve funcionar |
+| Mellanox/NVIDIA ConnectX-3 | `mlx4_en` | deve funcionar (a porta vem do barramento `auxiliary`) |
+| Mellanox/NVIDIA ConnectX-4 em diante | `mlx5_core` (embutido) | deve funcionar |
+| Broadcom | `tg3` (embutido), `bnxt_en`, `bnx2`, `bnx2x`, `b44` | deve funcionar |
+| Realtek | `r8169`, `8139too` (embutidos), `8139cp`, `rtase` | `rtl8139` **testada** no QEMU; as outras devem funcionar |
+| Marvell/QLogic | `qede`, `qlcnic`, `netxen`, `qla3xxx`, `sky2` (embutido), `skge` | deve funcionar |
+| Chelsio | `cxgb4`, `cxgb4vf`, `cxgb3`, `cxgb` | deve funcionar |
+| Solarflare/AMD | `sfc`, `sfc-siena`, `sfc-falcon`, `amd-xgbe` | deve funcionar |
+| Aquantia/Atheros | `atlantic`, `alx`, `atl1c`, `atl1e`, `atl1`, `atl2` | deve funcionar |
+| Nuvem e virtuais | `virtio_net`, `vmxnet3` (embutidos), `ena`, `gve`, `enic`, `idpf` | `virtio_net` e `vmxnet3` **testadas** no QEMU; as outras devem funcionar |
+| Antigas (Tulip, NE2000, AMD, Via, SiS…) | `tulip`, `ne2k-pci`, `pcnet32`, `via-rhine`, `sis900`… | `tulip`, `ne2k-pci` e `pcnet32` **testadas** no QEMU |
+| USB | `ax88179_178a`, `asix`, `cdc_ether`, `cdc_ncm`, `lan78xx` (embutidos), `r8152`, `smsc95xx`, `aqc111`, `dm9601`, `mcs7830`, `rtl8150`… | deve funcionar; RTL8153 pede teste com o adaptador real |
+
+O `r8152` é módulo (G1.29h). Embutido, ele sonda um adaptador plugado no boot antes de a raiz
+estar montada e pede o patch `rtl_nic/rtl8153*.fw` ali: dá `-ENOENT`, não tenta de novo, e o chip
+roda sem as correções da Realtek (`drivers/net/usb/r8152.c`, `rtl_hw_phy_work_func_t`, kernel
+6.18.59). Como módulo, o init o carrega da raiz e o arquivo é achado. Embutir o firmware no kernel
+(`CONFIG_EXTRA_FIRMWARE`) também resolveria, mas põe o binário proprietário dentro do kernel GPL,
+o que as distribuições evitam. O `r8169` e o `tg3`, embutidos, pedem o firmware ao abrir a porta
+(`rtl_open`, `tg3_open`), já com a raiz montada.
+
+"Testada" aqui é emulação: prova a carga, o nome da porta e o firmware, não o silício. Nenhuma
+placa física foi testada ainda.
+
+**Fora de propósito:** Netronome, LiquidIO, Octeon EP, Mellanox Spectrum e Prestera (ASIC de switch
+ou SmartNIC, com firmware grande), LTE e tethering, PCMCIA, drivers fora da árvore do kernel. As
+placas Wi-Fi têm lista própria, no fim do `nics.fragment` (G1.30, abaixo).
+
+**Sem firmware na imagem (linhas `skip` da trava):** Adaptec Starfire (o `WHENCE` não dá
+permissão), `acenic`, `cassini` e `tehuti/aqr105-tn40xx.cld` (o `linux-firmware` não tem o
+arquivo). O driver carrega, mas essas placas podem não subir. Licença "GPL sem código-fonte visível"
+sem alternativa BSD também fica de fora: a GPL pede o fonte, e sem ele o binário não pode ser
+redistribuído.
+
+**Na ISO:** o live tem porta para toda placa da tabela: as embutidas no kernel dela (as da tabela e
+mais `ice`, `bnxt_en`, `bnx2`, `bnx2x`, `mlx4_en`, `sfc`, `atlantic`, `alx`, `atl1c`,
+`installer.fragment`) e as outras pela carga de módulos (G1.6za). O instalador de console que fica no
+initramfs (pouca RAM, mídia ruim, `fw_cfg`) só vê as embutidas; o `i` no console do live já roda na
+raiz nova e vê todas.
+
+**PHYs em módulo** carregam pelo pedido do próprio kernel (`request_module`, `/sbin/modprobe` do
+busybox). Um driver embutido sonda antes do `/` e não consegue carregar um PHY em módulo: fica com
+o PHY genérico. Só os PHYs Realtek, Microchip e AX88796B são embutidos; um caso real com outro PHY
+pede passar o driver para módulo ou o PHY para embutido.
+
+**Para refazer a lista num kernel novo:** ligue todo `tristate` de
+`drivers/net/{ethernet,usb,phy,mdio,pcs}` (menos os de fora), compile uma vez pelo `cargo xtask os
+build` e fique com os módulos que têm alias `pci:`, `usb:`, `auxiliary:` ou `mdio:` e com o que eles
+pedem no `modules.dep`. Depois rode `firmware-lock`. O build falha se o kernel derrubar um símbolo
+da lista.
+
+**Números do conjunto amplo (medido, 2026-11-08):**
+
+| O quê | Antes | Depois |
+|---|---|---|
+| Módulos | 3 | 192 (28,2 MB crus) |
+| Firmware | 41 arquivos, 1,5 MB | 79 arquivos e 4 links, 11,1 MB crus; 19 licenças; 6 `skip` |
+| `rootfs.squashfs` | 37 281 792 B | 48 848 896 B (slot de 256 MiB) |
+| `corerouter.crpkg` | 57 357 909 B | 69 682 774 B |
+| `bzImage` | 19 776 512 B | 20 444 160 B (inclui o que a `main` trouxe no meio, como o suporte a BIOS) |
+| `BOOTX64.EFI` da ISO | 19 428 352 B | 21 447 680 B (limite da FAT: 32 MiB) |
+| Memória ociosa | 79–86 MiB | 72–76 MiB: o conjunto amplo não aumenta (a variação é entre rodadas) |
+| `ready` depois do kernel | 0,98–1,02 s | 0,98–1,07 s |
+
+### Wi-Fi (G1.30)
+
+Desde a G1.30 a imagem traz o que um rádio em modo estação precisa. O desenho, a pesquisa e a
+escolha de drivers estão em `docs/wifi.md`; aqui fica o que toca a imagem.
+
+| Peça | Como entra | Onde |
+|---|---|---|
+| Pilha (`cfg80211`, `mac80211`, `rfkill`) | módulo, carregada com o driver da placa. Embutida (como o `x86_64_defconfig` deixava), ela pedia o `regulatory.db` antes do `/` e ficava sem base para sempre | `nics.fragment`, `REQUIRED_NICS` |
+| Drivers | `iwlwifi` (+`iwlmvm`, `iwlmld`), `mt7921e`, `mt7925e`, `rtw88`, `rtw89`; `mac80211_hwsim` para teste | `nics.fragment` |
+| Firmware | na trava, com a regra do `iwlwifi` (a versão mais nova que o driver tenta, não a que ele declara) | `firmware.rs`, `iwlwifi_requests` |
+| `regulatory.db` e `.p7s` | do pacote `wireless-regdb`, instalados pelo `corerouter-firmware`, o dono de `lib/firmware` | `corerouter-firmware.mk`, `firmware::verify` |
+| `wpa_supplicant` 2.12 | nl80211, WPA3, socket de controle; sem D-Bus, `wpa_cli` nem arquivo de configuração | defconfig, `REQUIRED_BR2`, `post-build.sh` |
+| Carga | passada `Wifi` do PID 1, depois do sinal de boot pronto; o `iwlwifi` vem com as duas metades | `corerouter-init/src/modules.rs` |
+| ISO live | sem a pilha: o kernel da ISO não constrói nenhum driver de rádio | `installer.fragment`, `INSTALLER_OFF` |
+
+**Pegadinha achada no QEMU.** O `cargo xtask os build` esvazia o `lib/firmware` de todas as
+pastas por pacote a cada build (para o firmware de uma trava antiga não sobrar) e só o
+`corerouter-firmware` o enche de novo. O `wireless-regdb` instala o `regulatory.db` uma vez; no
+segundo build da mesma árvore o arquivo sumia e o kernel dizia `cfg80211: failed to load
+regulatory.db`. Por isso quem instala a base é o `corerouter-firmware`, e o `firmware::verify`
+reprova uma imagem com `cfg80211.ko` e sem a base.
+
+**O que o motor (parte 2) usa da imagem:**
+
+- **Nomes:** o kernel chama os rádios de `wlanN`; o PID 1 os renomeia para `wifiN` e guarda o
+  par MAC → nome em `/config/.wifi-names`, para o nome não trocar entre boots
+  (`corerouter-init/src/wifi_names.rs`). O daemon só adota um rádio depois do nome final.
+- **`wpa_supplicant`:** quem o inicia é o daemon, quando o primeiro rádio é ligado
+  (`-B -g /run/corerouter/wpa/global`), e ele termina com o último. Sem rádio ligado, nenhum
+  processo a mais.
+- **`corerouter.unmanaged=<nomes>`** na linha de comando do kernel passa `--unmanaged` ao
+  daemon: ele não toca nessas interfaces. Existe para o teste (o rádio do AP) e não é levada
+  para o slot gravado.
+- **`hostapd` está na imagem desde a G1.30a** (o roteador como ponto de acesso,
+  `docs/wifi-ap.md`). O Buildroot o compila (mesma árvore hostap do `wpa_supplicant`) e o
+  `post-build.sh` também o copia para `images/test-tools/`: o `cargo xtask os wifi-test` entrega
+  essa cópia à VM num disco só de leitura, para o AP de teste com arquivo próprio.
+
+**Acrescentar uma família de drivers:** ligue os símbolos no `nics.fragment`, rode o build (ele
+falha no fim, dizendo o firmware que falta), rode `cargo xtask os firmware-lock --tag <tag>` e o
+build de novo. A exigência de uma família nova no `firmware::check` só entra depois da trava.
+
+**Números (medido, 2026-11-11, QEMU/KVM nesta máquina; antes = G1.6zd):**
+
+| O quê | Antes | Depois |
+|---|---|---|
+| `bzImage` | 18 371 584 B | 17 376 256 B (−0,95 MiB: a pilha saiu do kernel) |
+| `rootfs.squashfs` | 56 094 720 B | 90 030 080 B (+32,36 MiB) |
+| `corerouter.crpkg` | 74 909 271 B | 108 123 735 B (+31,68 MiB) |
+| ISO | 139 735 040 B | 171 954 176 B (+30,73 MiB) |
+| `live-modules.img` | 5 607 424 B | 5 607 424 B (igual) |
+| Kernel da ISO (`BOOTX64.EFI`) | 19 633 152 B | 18 777 088 B (−0,82 MiB) |
+| Firmware de Wi-Fi na trava | – | 61 arquivos, 62 961 222 B crus (39 do `iwlwifi`: 30 `.ucode` e 9 `.pnvm`) |
+| Módulos de Wi-Fi | – | 55 `.ko`, 23 068 224 B |
+| `wpa_supplicant` e bibliotecas | – | 9 018 784 B crus (`libcrypto` 6 082 880, `wpa_supplicant` 1 456 944, `libssl` 1 064 672) |
+| Nomes que o `iwlwifi` declara | – | 49, dos quais 30 não existem na tag (viram `skip`) |
+| Carga do `mac80211_hwsim` com a pilha, no boot | – | 114 ms (`boot-test --wifi`) |
+
+### Pesquisa
+
+- **Kernel 6.18.59:** `MODULE_FIRMWARE`/`request_firmware` lidos no fonte de cada driver.
+  `Documentation/driver-api/firmware/built-in-fw.rst` cita firmware não compatível com GPL como
+  motivo para não embutir (`CONFIG_EXTRA_FIRMWARE`), que foi a alternativa recusada.
+- **RouterOS** ([pacotes](https://manual.mikrotik.com/docs/getting-started/installation-and-upgrade/packages/)):
+  no x86 há um pacote de sistema; os de driver (`extra-nic`, `wifi-qcom`) são de ARM. O manual
+  não diz como o x86 trata firmware de placa.
+- **VyOS** ([build-linux-firmware.sh](https://github.com/vyos/vyos-build/blob/current/scripts/package-build/linux-kernel/build-linux-firmware.sh)):
+  o `modinfo` dos drivers de rede escolhe os arquivos. Adotado.
+- **OpenWrt** ([intel.mk](https://github.com/openwrt/openwrt/blob/main/package/firmware/linux-firmware/intel.mk)):
+  um pacote por família (`ice-firmware`, `r8169-firmware`, `r8152-firmware`). Não adotado: a
+  imagem aqui é uma só.
+- **FreeBSD/OPNsense** ([ice(4)](https://man.freebsd.org/cgi/man.cgi?query=ice&sektion=4)):
+  o DDP é um módulo (`ice_ddp`); há [relato de fórum](https://forum.opnsense.org/index.php?topic=52881.0)
+  de link caindo com DDP no 26.7, sem confirmação oficial: testar em placa real.
+- **Buildroot** (`BR2_PACKAGE_LINUX_FIRMWARE_*`): baixa o tarball inteiro (431 MB no 20250211,
+  642 MB no 20261019) e o 20250211 não tem `rtl8127a-1.fw`, que o 6.18 pede. Daí o pacote próprio.
+
+## Instalador, imagens de VM e FRR (G1.6c)
+
+```sh
+cargo xtask os build          # também grava corerouter-install.iso, corerouter.qcow2 e corerouter.ova
+cargo xtask os install-test   # instala de CD e de USB num disco virtual, boota, confere; qcow2 e OVA
+```
+
+Saídas em `<out>/build/images/`:
+
+| Arquivo | Para quê |
+|---|---|
+| `corerouter-install.iso` | ISO híbrida: CD (El Torito, BIOS e UEFI) ou pendrive (`dd`, GPT com a partição EFI e o GRUB na MBR). Instala no disco do roteador |
+| `corerouter.qcow2` | KVM/Proxmox: o `disk.img` (já A/B) em qcow2 comprimido |
+| `corerouter.ova` | VMware/VirtualBox: OVF 1.0 + manifesto SHA-256 + VMDK streamOptimized |
+| `corerouter.crpkg` | o pacote de atualização (também dentro da ISO) |
+
+### Como o instalador funciona
+
+- **Um segundo kernel, não um bootloader.** O roteador boota sem bootloader (EFI stub, A/B por
+  `BootNext`), e a linha de comando embutida aponta para o `rootfs-a`. A ISO não pode usar essa
+  linha: num CD não há PARTUUID, e num disco com CoreRouter instalado o mesmo PARTUUID existiria
+  duas vezes. O pacote `os/package/corerouter-installer` compila o **mesmo** kernel (o mesmo
+  tarball e hash, o `.config` final da imagem) com `installer.fragment` por cima: outra linha de
+  comando (`corerouter.mode=live`, sem `root=`; se o live não puder subir, o PID 1 passa para o
+  instalador, e `corerouter.mode=install` continua indo direto para ele), um initramfs embutido e sem BTF. O
+  initramfs é uma lista do `gen_init_cpio` (donos e modos fixos: reprodutível) com o
+  `corerouter-init`, as bibliotecas que ele usa e as chaves públicas da imagem. Roda inteiro na
+  RAM: o pendrive pode sair depois.
+- **A ISO é escrita em Rust** (`crates/sysupdate/src/iso.rs`, `corerouter-image installer`):
+  ISO 9660 nível 2, El Torito com a entrada da plataforma EFI (0xEF) e, na área de sistema, MBR
+  protetor + GPT com uma partição EFI sobre a **mesma** imagem FAT (`efiboot.vfat`, do genimage).
+  Como CD, o firmware usa o El Torito; como disco (pendrive), a GPT. Sem xorriso nem GRUB.
+- **A carga** vai como arquivos da ISO: `INSTALL.JSON` (o layout lido do GPT do `disk.img` e o
+  SHA-256 de cada arquivo), `INSTALL.SIG` (assinatura Ed25519 do índice, com a mesma chave dos
+  pacotes), `COREROUTER.CRPKG` (o pacote: o rootfs vai para o slot A), `ESP.IMG` (a ESP sem os
+  blocos zerados do fim) e `CONFIG.IMG` (o ext4 vazio do `/config`, sem o fim zerado). O
+  instalador acha a mídia pelo volume id `COREROUTER_INSTALL` e lê os arquivos pelo diretório
+  raiz, direto do dispositivo (sem driver de ISO 9660).
+- **Gravação** (`crates/sysupdate/src/install.rs`): confere as duas assinaturas e o tamanho do
+  disco antes de escrever um byte; zera o primeiro e o último MiB (tabelas, rótulos de RAID/LVM
+  antigos); grava ESP, slot A e `/config` em fluxo (uma thread lê e calcula o SHA-256, outra
+  grava); `fsync`, descarta o cache e relê tudo em paralelo (ESP e `/config` pelo SHA-256, o slot
+  A recalculando a árvore do dm-verity contra o hash raiz assinado); **por último** a GPT
+  (primária e reserva), relida. Uma queda antes disso deixa um disco que o firmware não boota,
+  nunca um meio gravado que ele boota. O slot B fica para a primeira atualização.
+- **Entrada de boot:** `Boot####` "CoreRouter A" com a linha do slot (dm-verity, `corerouter.slot=a`,
+  `panic=10`) primeiro no `BootOrder`; uma "CoreRouter B" de instalação anterior sai. O primeiro
+  boot já é pelo dm-verity, e o disco instalado boota antes do pendrive que ficou espetado.
+- **Nunca grava sem confirmação nem na mídia.** A tabela mostra nome, tamanho, modelo, série,
+  barramento e o que o disco tem (vazio, GPT com as partições, CoreRouter). Não são oferecidos: a
+  mídia do instalador, drives ópticos, discos só de leitura, menores que a imagem ou com uma
+  imagem do instalador. Depois de escolher, o operador **digita o nome do disco**; outra coisa
+  volta sem gravar. O que foi digitado antes de cada pergunta é descartado. O alvo é aberto com
+  `O_EXCL` (recusado se algo o usa).
+- **Manter a configuração:** num disco com CoreRouter cuja partição `config` está no mesmo lugar,
+  o instalador pergunta se mantém (como o *keep old configuration* do Netinstall).
+- **Consoles:** a tela (`tty1`) e a serial (`ttyS0`, 115200) ao mesmo tempo; a resposta vale do
+  console onde foi digitada. A tela vale nos dois firmwares (G1.6zc): em BIOS é o modo texto VGA
+  (`vgacon`); em UEFI não existe modo texto, e o kernel desenha no framebuffer que o firmware
+  deixa (`simpledrm` + `fbcon`), até o driver da placa (i915, virtio-gpu) assumir. Antes da
+  G1.6zc, num boot UEFI a tela ficava parada no último quadro do firmware e o console só saía
+  na serial. Acima de ~2560×1440 o kernel escolhe a fonte 16×32. O custo é a cópia da tela na
+  RAM (largura × altura × 4 bytes): +6,1 MiB em repouso a 1280×800 (**medido**, QEMU com OVMF,
+  média de 3 boots, 2026-11-11); sem tela no boot (sem framebuffer do firmware) não há cópia.
+- **Endereço de gerência do primeiro boot:** o instalador lista as portas com os nomes que o
+  roteador vai dar (`ether1 (link up, 52:54:…)`), pergunta (`ether1 192.0.2.10/24 192.0.2.1`,
+  ou vazio; porta que não existe é recusada) e grava `corerouter.mgmt=` na entrada do slot A.
+  No primeiro boot o init avisa nos consoles (VGA e serial) o endereço, a porta e de onde veio,
+  habilita a porta, aplica `ip.address.add` e a rota padrão pelo canal de controle e grava
+  `/config/.installer-mgmt-applied` com fsync: não reaplica depois (nem se a configuração for
+  mantida numa reinstalação). Uma entrada com o nome do kernel (`eth0`, instalador antigo) vale
+  para a mesma placa renomeada. A atualização não leva o parâmetro para o slot B.
+- **Assistente de console** (`corerouter-init setup`, G1.6m): enquanto nenhuma porta tem
+  endereço, o console diz que não há terminal de comandos ali e convida a configurar (de novo a
+  cada 5 min); lista as portas numeradas com link e MAC, pede a porta pelo número ou nome
+  (sem padrão: Enter vazio cancela) e confirma (`Use ether1 (link up, 52:54:…)? [y/N]`), depois
+  endereço, gateway e a senha do `admin` (sem ela o login pela rede é recusado), mostra o
+  resumo e só aplica com `y`. A pergunta que espera resposta reaparece a cada 30 s (quem
+  conecta o console serial depois vê o que está pendente). Com endereço, Enter no console
+  mostra os endereços e como conectar pela GUI e pela CLI. O formato, as cores e como
+  desligá-las (`corerouter.color=`) estão em `docs/console.md` (G1.6zg): tela de status única
+  com as portas, o endereço de gerência e a impressão digital do certificado; assistente em
+  passos `[n/4]` e instalador em passos `[n/5]`.
+- **Instalação sem interação** só pelo hipervisor: `-fw_cfg
+  name=opt/org.corerouter/autoinstall,string=<json>` do QEMU, que nenhuma máquina física tem; o
+  JSON nomeia o disco duas vezes (`disk`, `confirm`), e `append` só aceita `console=`, `ip=`,
+  `corerouter.shell=` e `corerouter.color=`. É a flag do `install-test`.
+- **UEFI e BIOS** (G1.6g): seção "Boot por BIOS", abaixo.
+
+### Boot por BIOS (G1.6g)
+
+O mesmo disco boota pelos dois firmwares; nada do caminho UEFI muda.
+
+| Onde | O quê |
+|---|---|
+| Bloco 0, 440 primeiros bytes | `boot.img` do GRUB, ao lado do registro da MBR protetora |
+| Blocos 128 a 2047, antes da primeira partição | `core` do GRUB, ~150 KiB. Sem entrada na GPT: os números das partições continuam os mesmos, e o `first_usable` do cabeçalho deixa o espaço fora da área livre |
+| ESP, `corerouter/grub.cfg` | A lógica: lê o `grubenv`, escolhe o slot, cai no outro se o kernel não carrega |
+| ESP, `corerouter/grubenv` | Um bloco de 512 bytes: `primary=` e `next=` (papel do `BootOrder` e do `BootNext`) |
+| ESP, `corerouter/a.cfg`, `b.cfg` | A linha de comando de cada slot, com a tabela do dm-verity, de 4096 bytes fixos |
+
+- **O disco que a BIOS escolheu, não "o primeiro disco".** O prefixo é `(,gpt1)/corerouter`, e o `boot.img`
+  confia no número do drive que a BIOS passou (o `DRIVE_CHECK` que o `grub-install` também
+  desliga): um pendrive esquecido não troca a raiz.
+- **dm-verity desde o primeiro boot.** O `a.cfg` já sai do build com a tabela: um qcow2 em
+  SeaBIOS nunca sobe sem verificação, o que o caminho removível da UEFI faz uma vez.
+- **Instalador.** Roda pelos dois firmwares e grava as duas coisas sempre. Com BIOS: marca a
+  partição protetora como ativa e recusa disco de setor de 4 KiB com o motivo na tabela. O
+  `a.cfg` é reescrito com a linha da máquina (`corerouter.mgmt=`, `console=`) direto nos bytes
+  dele: o kernel ainda não releu as partições do disco, e o índice assinado diz onde o arquivo
+  está (por isso tamanho fixo).
+- **Selo ativo.** A UEFI 2.10 §5.2.3 manda ignorar o `BootIndicator` da partição protetora, mas
+  o EDK2 recusava o disco até 2021 (bz#1978966). Algumas BIOS, ao contrário, só bootam uma
+  partição ativa. Por isso a imagem e a ISO ficam com 0 e só o instalador rodando em BIOS liga;
+  numa BIOS exigente, o `dd` da imagem precisa do selo à mão (`sfdisk --activate`).
+- **ISO.** O catálogo El Torito tem a entrada padrão para BIOS e uma seção EFI (`BIOSCD.IMG`,
+  com a *boot info table*); como disco, o `boot.img` aponta para `BIOSUSB.IMG`. Os dois `core`
+  usam só o parser de resgate do GRUB e não passam linha de comando: vale a embutida no kernel do
+  instalador. Sem xorriso: `crates/sysupdate/src/iso.rs` faz tudo.
+- **A/B em BIOS.** As mesmas operações, a mesma ordem de passos e o mesmo estado do `ab.rs`, por
+  trás do `BootStore` (`Uefi(Vars)` ou `Bios(Grub)`):
+
+  | UEFI | BIOS | Como grava |
+  |---|---|---|
+  | `Boot####` | `a.cfg`, `b.cfg` | arquivo novo e `rename` |
+  | `BootOrder` | `primary=` | um bloco, no lugar |
+  | `BootNext` | `next=` (o `grub.cfg` apaga antes do kernel) | um bloco, no lugar |
+  | tirar o slot do `BootOrder` antes de escrever | apagar o `.cfg` dele (o GRUB cairia nele) | `unlink` |
+
+  O `system.package.print` diz `firmware` (`uefi` ou `bios`) e `boot_entry` é o `.cfg`.
+- **Sem `next=` gravável, sem teste.** Se o `save_env` falha, o GRUB boota o `primary=` e o init vê
+  `next=` ainda lá: `failed`, "this box cannot run a trial boot". Nunca um laço de pânico.
+- **Pânico não é "kernel não carregou".** O GRUB cai no outro slot só se o `linux` falha (`.cfg` ou
+  kernel faltando). Um kernel que entra em pânico reinicia (`panic=10`) e o `next=` já se foi: é
+  isso que devolve um teste ruim ao slot anterior, como o `BootNext`.
+- **Disco que troca de firmware.** Com a pasta `corerouter/` na ESP, a atualização por UEFI também
+  mantém os `.cfg` e o `primary=` certos (sem o parâmetro do `drill`): senão, levado a uma BIOS, o
+  disco bootaria um hash de verity que já não existe. A volta tem dois casos:
+  - NVRAM antiga: vale a última ordem daquele firmware, e o `provision` regrava a entrada cujo hash
+    não bate mais. Antes disso, a entrada de um slot atualizado na BIOS está velha: se a ordem
+    apontar para ela, é pânico e reinício até trocar a ordem no firmware (só quem leva o mesmo disco
+    de volta à mesma máquina, com o slot primário atualizado no meio do caminho);
+  - NVRAM vazia: o caminho removível, que é o slot A com a linha embutida (o que a UEFI já fazia), e o
+    `provision` faz do slot A o padrão, mesmo que a BIOS estivesse no B. Os parâmetros do instalador
+    (`corerouter.mgmt=`, `console=`) ficam só no `a.cfg`.
+- **Dois slots quebrados** param no prompt do GRUB, na tela e na serial.
+- **Sem serial** o GRUB segue só na tela (`if serial`).
+- **Controladoras.** O kernel ganhou `SYM53C8XX_2` (LSI, padrão do Proxmox), `MEGARAID_SAS`,
+  `MPT2SAS`/`MPT3SAS`, `HPSA`, `AACRAID` e `FUSION_SPI`/`FUSION_SAS`. Em QEMU 8.2.2 (SeaBIOS, `pc`),
+  **medido**: `virtio-blk`, `virtio-scsi`, `lsi53c895a`, `pvscsi` e IDE bootam. `mptsas1068` chega ao
+  kernel e o driver acha a controladora, mas o disco não aparece (não investigado: não é opção do
+  Proxmox; `FUSION_*` ficou sem prova para o hardware real). Dois nem isso: `lsi53c810`, para o qual
+  o SeaBIOS não tem driver (nem chega ao GRUB), e `megasas`/
+  `megasas-gen2`, por defeito do QEMU: `hw/scsi/megasas.c` (`megasas_handle_io`) monta um READ(16)
+  e chama `scsi_req_new` com o `cdb_len` do quadro, que o driver não preenche nos quadros
+  `MFI_CMD_LD_READ`/`WRITE` (o kernel vê "Invalid command operation code"; o sintoma começou na 7.2,
+  [QEMU #1888](https://gitlab.com/qemu-project/qemu/-/issues/1888); a linha é igual na `master`). Qualquer
+  Linux recente cai nisso; numa VM, use outra controladora. O driver fica para a placa de verdade.
+- **Licença.** O GRUB é GPL-3.0 e fica só na área de boot (bloco 0, espaço antes da partição,
+  arquivos da ESP) e na ISO; a raiz continua sem GPL-3.0. O fonte correspondente é o que a
+  receita do Buildroot baixa (`make legal-info`).
+
+### ISO live (G1.6y)
+
+A ISO boota **live** (`corerouter.mode=live`): a imagem roda da RAM, com o daemon completo, para
+instalar pela GUI e pelo navegador. O console continua sendo alternativa: `i` + Enter abre o
+instalador acima.
+
+- **Boot em dois estágios.** No initramfs, o `corerouter-init` (`apps/corerouter-init/src/live.rs`)
+  acha a mídia, confere as assinaturas, copia o rootfs de dentro do `COREROUTER.CRPKG` para um tmpfs
+  conferindo o SHA-256 assinado, monta o squashfs por loop e troca a raiz com o busybox
+  (`mount -o loop`, `switch_root`: sem `ioctl` em Rust, que exigiria `unsafe`). Na raiz nova, o
+  init roda de novo (`--live-root`), como o de um roteador. A pendrive fica até o fim da instalação:
+  a carga é lida dela na hora de gravar.
+- **Se algo falha, instala igual.** Menos de 448 MiB de RAM (G1.6za e G1.30, abaixo), mídia ruim ou erro na troca de raiz:
+  fica no instalador de console, que não precisa de nada disso. O `fw_cfg` do hipervisor vai
+  direto para ele.
+- **Não toca em disco nenhum.** `/config` é um tmpfs (não procura a partição `config` de um
+  CoreRouter instalado), sem estado A/B, sem `grow`, sem `system.package.*`.
+- **Só cliente.** Sem FRR. Cliente DHCP em todas as portas, com distância 200+ na rota; só manda
+  pacote em porta com link. O motor recusa qualquer comando que muda algo fora de uma lista curta
+  (`crates/engine/src/live.rs`): porta, endereço, rota, cliente DHCP, DNS, senha, instalação,
+  energia e ferramentas. O descobrimento (CRDP) continua: é como a GUI acha a máquina.
+- **`server.info`** traz `boot: live | installed` para quem está logado.
+
+Medido (2026-11-08, KVM, 2 vCPUs, sem FRR, sem GUI conectada, `-kernel`, protótipo com o mesmo
+kernel e o mesmo rootfs): 128 MiB sobe (69,5 MiB em uso), 112 MiB o OOM mata o daemon, 96 MiB não
+boota; com 256 MiB, 76,6–78,2 MiB em uso. O instalador de console instala com 160 MiB, não com 128.
+A ISO real (KVM, UEFI): com 256, 320 e 512 MiB sobe live (`ready` em 1,24–1,26 s depois do kernel);
+com 192 e 224 MiB fica no instalador de console, sem OOM. A ISO cresceu 1,2 MB (116.531.200 →
+117.776.384 B): o rootfs já estava nela, entrou o busybox no initramfs.
+
+### Módulos do kernel da ISO no live (G1.6za)
+
+Uma placa cujo driver só existe em módulo vira porta no live e pode gerenciar a instalação.
+
+- **Por que não os módulos da raiz.** Eles foram compilados para o kernel instalado, com outro
+  `.config`: o que é módulo lá pode ser embutido aqui, e o símbolo apareceria duas vezes.
+- **Outra versão de kernel.** O `installer.fragment` tem `CONFIG_LOCALVERSION="-live"`, então o
+  `uname -r` é `6.18.59-live`. O vermagic começa pela versão e o kernel compara o texto inteiro
+  (`same_magic`, `kernel/module/version.c`, sem `MODVERSIONS`). Antes, os dois kernels diziam
+  `6.18.59` e o vermagic não separava um do outro. **Medido:** carregar o `pcnet32.ko` da raiz no kernel da
+  ISO dá `version magic '6.18.59 SMP preempt mod_unload ' should be '6.18.59-live SMP preempt
+  mod_unload '`.
+- **A carga.** O pacote `corerouter-installer` compila `bzImage modules`, instala os módulos sem
+  símbolos, apaga os links `build` e `source` (apontam para a máquina do build) e faz o squashfs
+  `live-modules.img`. O `corerouter-image installer` grava o arquivo como `LIVEMODS.IMG` e o lista no
+  `INSTALL.JSON`, com tamanho e SHA-256, sob a mesma assinatura Ed25519 do índice.
+- **Na ISO, não no initramfs.** O initramfs vai dentro do kernel: pesaria no limite de 32 MiB da imagem
+  de boot e seria descomprimido na RAM em todo boot, inclusive para quem só instala.
+- **O boot.** Depois de montar a raiz, o primeiro estágio copia a carga para o mesmo tmpfs, confere o
+  SHA-256 do índice assinado, monta por loop em `/newroot/lib/modules` (`ro,nosuid,nodev,noexec`) e
+  confere que há `<uname -r>/modules.dep`. O segundo estágio roda `modules::start`, igual ao de um
+  roteador: varredura no boot e mensagens do kernel para o que for plugado. O `request_module` do
+  kernel (PHY em módulo) acha o mesmo diretório.
+- **Se a carga falha, o live sobe igual.** Hash errado, arquivo fora do índice ou erro ao montar: o
+  console diz o que houve, a RAM é devolvida e só as placas embutidas têm porta. Como
+  `/lib/modules/6.18.59-live` não existe nesse caso, nada carrega. As placas comuns seguem `=y` por isso.
+- **Porta que chega depois.** O live pôs cliente DHCP só nas portas da primeira passada; agora a porta
+  nomeada depois (placa plugada, sonda demorada) também recebe o seu (`live_dhcp_later`), com a
+  distância da rota pelo número da porta.
+- **Sem comando recusado (G1.6ze).** O daemon só adota a porta nova depois de três leituras com o
+  mesmo nome (~3 s, G1.6t), e o PID 1 repetia o `interface.set` a cada 250 ms até lá: num notebook
+  real ficaram dez linhas `Falhou: /interface set … no interface 'ether2'` no log do roteador ao
+  ligar um adaptador USB. Agora o PID 1 lê o que o daemon lista (`interface.list`,
+  `ip.dhcp-client.list`) e manda só o que falta (`plan::live_port_commands`): a porta que ele
+  acabou de nomear ele mesmo adota (`interface.ethernet.adopt`), depois liga e cria o cliente; a
+  porta plugada de novo, que já tem cliente, não recebe nada. O primeiro boot do live usa o mesmo
+  caminho. O `install-test` reprova qualquer linha de nível erro no log do live, no boot e depois
+  de plugar a placa.
+- **`corerouter.modules=off`** vale no live: a carga nem é copiada.
+- **O build confere** (`xtask/src/os/livemods.rs`): todo `.ko` da carga tem o vermagic de
+  `6.18.59-live`, `e100` e `pcnet32` estão lá, há `modules.dep` e `modules.alias`, e nenhum link sobrou.
+
+**O teste** é `cargo xtask os install-test --only live-modules [--firmware seabios]`, e faz parte do
+`install-test` completo. A máquina tem só uma `i82551` (`e100`, só módulo, e o driver não abre a porta
+sem o arquivo de firmware da raiz): o endereço por DHCP e o TLS passam por essa placa. Depois pluga uma
+`pcnet`, que recebe `ether2` e endereço; instala pelo comando, com a gerência pela placa, e o disco
+responde nela com o mesmo certificado. Por fim boota uma ISO com um byte trocado na carga: recusada, o
+live sobe, a placa embutida tem porta e a `i82551` não. Contraprova (**medido**, a ISO de antes na mesma
+máquina): nenhum `driver e100 loaded`, nenhuma linha `port names`.
+
+**Nenhuma placa física foi testada.** "Testada" é emulação em QEMU, como na G1.6j; as placas reais ficam
+com a G1.6jb.
+
+**Números (medido, 2026-11-09, KVM, build da imagem, máquina com load 34–46 de outras sessões):**
+
+| O quê | Antes | Depois |
+|---|---|---|
+| `corerouter-install.iso` | 131 176 448 B | 134 995 968 B (+3 819 520 B, 2,9%) |
+| `LIVEMODS.IMG` | — | 3 813 376 B: 181 módulos, 16,8 MiB crus, zstd 19 |
+| `BOOTX64.EFI` | 21 455 872 B | 21 459 968 B (limite da FAT: 32 MiB) |
+| `ready` depois do kernel, 3 rodadas | virtio: 0,86–1,51 s | virtio: 1,06–1,43 s; `e100`: 0,92–1,72 s. A variação entre rodadas é maior que a diferença |
+| Copiar, conferir e montar a carga | — | 29–31 ms |
+| Carregar `e100` no boot do live | — | 98–117 ms |
+| `MemAvailable` com 256 MiB, 10 s depois de `ready`, virtio | 111,6–113,4 MiB | 107,9–108,5 MiB (a carga no tmpfs e o índice lido) |
+| O mesmo, com a `e100` carregada | sem porta | 103,8–106,0 MiB |
+| QEMU → admin por TLS pela placa | sem porta | 9,3–9,4 s (UEFI e BIOS) |
+| Placa plugada → driver e nome | sem porta | 113–125 ms |
+| Placa plugada → endereço por DHCP | sem porta | 3,9–5,2 s |
+
+Reprodutível (**medido**): apagar o pacote `corerouter-installer` e refazer dá o mesmo hash em
+`live-modules.img`, `BOOTX64.EFI` e na ISO. O `bzImage` do roteador é o mesmo de antes desta gap
+(`bee6e9bd…`): o kernel instalado não mudou. A ISO do commit final tem 135 106 560 B, por causa do que a `main` trouxe no meio.
+
+Compressão, medido sobre a mesma árvore: zstd 3 dá 4 554 752 B, zstd 15 dá 3 903 488 B, zstd 19 e 22 dão
+3 813 376 B (5,3 s de CPU a cada `os build` que refaz a ISO; `--only crpkg` não paga).
+
+**O mínimo do live subiu de 256 para 320 MiB.** O `install-test` falhava em `live_install`, também
+na ISO de antes desta gap (**medido**, a mesma falha com a ISO do commit `976fdd5d`). O login com
+senha (Argon2) leva o daemon a ~128 MiB, e o OOM o matava a cada login, levando junto a instalação em
+andamento: `job` e `result` voltavam a `null`, sem erro na tela. Com a raiz na RAM crescendo de 37 para 47 MiB (G1.6j), 256 MiB
+deixou de bastar. Com 288 MiB instala, com pouca folga; com 320 MiB instala e continua logando (**medido**). Abaixo disso fica no
+instalador de console.
+
+**E de 320 para 448 MiB na G1.30.** A raiz na RAM foi de 47 para 86 MiB com o firmware de Wi-Fi, e
+a mesma falha voltou no `install-test`: com 320 MiB o primeiro login com senha mata o daemon
+(`corerouter-daemon exited … terminating_signal: 9`) e a instalação em andamento some. Com 384 MiB
+instala quase sempre, mas sem folga: no pior momento 300 dos 329 MiB que a máquina mostra sob OVMF
+estavam em uso, e 1 de 11 instalações falhou (a do `install-test`). O mínimo passou a 448 MiB (`LIVE_MIN_RAM_KIB`:
+`MemTotal` de 370 MiB), que é o que o teste usa (**medido**, QEMU/KVM). Abaixo disso a ISO fica no
+instalador de console, que instala igual. O roteador instalado não paga isso: nele a raiz é lida do
+disco.
+
+**Desempenho e paralelismo.** A carga é lida e conferida uma vez, em fluxo, com custo proporcional ao
+tamanho dela (29–31 ms). No boot, o custo é o de sempre em `modules.rs`: cada dispositivo sem driver
+contra cada alias, medido em ~1 ms na G1.6j, numa thread própria e com espera limitada. A sonda da placa é do
+kernel e fica nessa thread. Dividir em mais threads não compensa: uma máquina carrega poucos módulos, e os 29 ms são
+menores que a variação do boot.
+
+**Pesquisa.**
+
+- **RouterOS** ([pacotes](https://manual.mikrotik.com/docs/getting-started/installation-and-upgrade/packages/)):
+  no x86 há um pacote de sistema; `extra-nic` é só de arm64. O manual não diz como o instalador do x86
+  trata os drivers. Nada a copiar de nome: é interno da ISO.
+- **Alpine:** o `modloop` é um squashfs montado em `/.modloop`, alvo de `/lib/modules`, com
+  [verificação de assinatura](https://lists.alpinelinux.org/~alpine/users/%3CCAEhkKgV-OdZ8y406_yynrH7tcxjgXkKzSc6dCSZ_a6CUPUfBiA@mail.gmail.com%3E)
+  (opção `modloop_verify`): a mesma ideia. Não adotamos a opção de desligar: aqui, sem carga válida, o live sobe sem ela.
+- **Ubuntu live-server** ([livecd-rootfs](https://git.lubuntu.me/Lubuntu/livecd-rootfs/commit/d5b4aed65623f8695be9b2cb57449d5bf2e1269e)):
+  módulos num squashfs próprio, e um gancho do initrd monta `/lib/modules` dele. Adotado o lugar da
+  montagem.
+- **Arch** ([FS#50456](https://bugs.archlinux.org/task/50456)): módulos da ISO que não batem com o kernel
+  depois de atualizar o live. Aqui não acontece: o live não atualiza, e o vermagic recusa a mistura.
+- **Kernel 6.18.59:** `check_modinfo` (`kernel/module/main.c:2592`) e `same_magic`
+  (`kernel/module/version.c:97`), lidos no fonte.
+- **VyOS e pfSense:** a busca não trouxe como tratam isso; fica sem comparação.
+
+### Instalar pelos comandos (`system.install.*`, G1.6y)
+
+Só no live: um roteador instalado recusa (a flag `--live` e o que o serviço vê no sistema: linha de
+comando do kernel e `/config` em disco).
+
+- `system.install.print` traz a mídia e os discos, com `holds` (`empty`, `data`, `corerouter`) e
+  `confirm`. `system.install.rescan` relê; um pendrive novo é visto sozinho.
+- **Disco vazio:** `system.install.run` com o nome digitado. Vazio é zero no primeiro MiB, no
+  último MiB e em 64 amostras ao longo do disco; erro de leitura não conta como vazio. Dado entre as
+  amostras escapa: a tela mostra o que achou, o tamanho e o serial.
+- **Disco com dados ou CoreRouter:** `system.install.challenge` mostra nos consoles o disco, quem
+  pediu e um código de 6 caracteres (uso único, 5 minutos, 3 tentativas, preso a nome e serial). O
+  `print` nunca traz o código. Sem console: botão de energia 3 vezes em 30 s, só com o pedido aberto;
+  fora disso ele desliga. Enquanto o pedido estiver aberto, `system.shutdown` é recusado, para um
+  comando não se passar pelo botão.
+- Antes de gravar, o serviço relê o disco: se o serial, o tamanho ou o conteúdo mudou desde a
+  confirmação, não grava nada. Falhou? O live continua e dá para tentar de novo.
+- Quem pode: grupo `full`.
+- **Teste de rede** (`system.install.test`, resultado no `print`): por porta, driver, link,
+  velocidade, DHCP, gateway (ARP respondido), DNS (resposta de qualquer tipo, 3 tentativas) e a porta
+  por onde esta conexão chegou. Só avisa, não impede instalar. Firmware que falta aparece como
+  aviso de agora. Quem sonda antes da raiz (embutido, como a `ice`) não acha o arquivo; módulo carregado
+  no live acha, porque o firmware está na raiz (G1.6j, G1.6za).
+- **Primeiro boot:** `mgmt_port` e `mgmt_mode` (`dhcp`, ou `static` com endereço, gateway e DNS) vão
+  em `/config/first-boot.json`, com o hash da senha do `admin` definida no live. O PID 1 aplica uma
+  vez e apaga. O certificado TLS e os nomes das portas são copiados do live: a GUI que confiou nele
+  reconecta sem aviso. Com `keep_config`, vale o que está no disco, e nada disso é escrito.
+
+### Janela Install to disk (G1.6y)
+
+System › Install to disk, na GUI e no navegador. No live, a barra de cima mostra o selo
+`live: not installed` e a janela abre sozinha uma vez. Uma janela só: discos, teste de rede, porta de
+gerência e senha. A confirmação pede o que o disco pede, com o tempo e as tentativas que o `print`
+informa. Depois de **Reboot**, a janela espera a reconexão e diz a versão e a porta; passados 3
+minutos sem resposta, manda olhar o console.
+
+### FRR na imagem
+
+- **FRR 10.7.1 e libyang 3.13.6 (G1.6k).** O Buildroot 2025.02.19 traz o FRR 10.3 e a libyang
+  2.1.148; OSPF, LDP, Segment Routing, TI-LFA e o BFD distribuído (`bfddp`) foram validados no
+  FRR 10.7.1 da VM do laboratório (com a libyang 3.13.6 do deb.frrouting.org), e um core
+  OSPF/MPLS em produção roda a versão testada. O `master` do Buildroot já tem FRR 10.7.0 e
+  libyang 3.13.6 (commits `34dfa10d` e `c49e140b`, e os anteriores: protobuf opcional, opção de
+  ECMP, cabeçalhos em staging): `os/buildroot-patches/0001-package-frr-10.7.1-libyang-3.13.6.patch`
+  porta essas receitas para o 2025.02.19 e sobe o FRR para 10.7.1. As opções ficam as mesmas
+  (`--enable-multipath=256`, protobuf ligado, `BR2_PACKAGE_FRR_BFD`, sem `vtysh` na imagem).
+  - **Hashes:** o tarball é o arquivo da tag `frr-10.7.1` no GitHub (`6aaf9d89…`, o commit
+    `f8c0b08d` no cabeçalho pax é o da tag assinada); baixados do mesmo jeito, o 10.7.0 e a
+    libyang 3.13.6 dão os hashes do `master` do Buildroot. O Buildroot confere os dois no build
+    (`frr-10.7.1.tar.gz: OK`).
+  - **Alternativas:** `FRR_OVERRIDE_SRCDIR` (o que a G1.6c previa) tira o pacote da conferência
+    de hash do Buildroot e mostra a versão como `custom`; um pacote externo com outro nome
+    duplica a receita inteira e o `select` do nftables. O patch é pequeno (145 linhas, só
+    `package/frr` e `package/libyang`) e falha alto se a receita mudar num Buildroot novo.
+  - **Saída:** quando um LTS do Buildroot trouxer FRR ≥ 10.7.1, apagar o patch.
+- **Patch no FRR (G3.4l):** `os/patches/frr/0001-ospfd-ti-lfa-missing-router-lsa.patch`, pelo
+  `BR2_GLOBAL_PATCH_DIR`, corrige o abort do `ospfd` com TI-LFA quando a router-LSA de um vizinho
+  sai do LSDB (`docs/frr-tilfa-abort.md`). O `cargo xtask os build` faz `frr-dirclean` quando os
+  patches de `os/patches/frr/` mudam (carimbo `.corerouter-frr-patches.sha256`, como o do
+  kernel). **Saída:** apagar o patch quando o FRR da imagem trouxer a correção.
+- **Patches no FRR (G3.4q):** `0002`–`0006` de `os/patches/frr/` tiram o crescimento quadrático com
+  milhares de interfaces OSPF: o commit do northbound por `interface` no lote (`lib`), a busca
+  linear por `lsa_pos` no SPF, uma router-LSA por interface no lote, o aviso de router-LSA cheia
+  por link (2,5 GB de log com 10 000 interfaces) e a fila early do `zebra`
+  (`docs/frr-many-interfaces.md`). Os mesmos foram preparados para o FRR
+  (`docs/frr-upstream/ospfd-many-interfaces/`). **Saída:** apagar cada um quando o FRR da imagem
+  o trouxer.
+- **Patch no FRR (G3.6n):** `0008-bfdd-dplane-software-fallback.patch` faz funcionar o BFD em
+  software para onde o `bfdd` devolve as sessões quando o plano de dados (o motor do daemon) cai:
+  ele passa a ouvir (sem plano de dados, `bfd_vrf_start_sockets` abre os sockets) e uma sessão Up
+  continua Up com os tempos negociados. Assim um `kill -9` ou uma atualização só do daemon não
+  derrubam o BGP do vizinho (`docs/bfd.md`, "Reinício do daemon com o BFD no ar"; o `frr-test`
+  confere). **Saída:** apagar quando o FRR da imagem trouxer a correção.
+- **O que o `frr-test` prova** (`cargo xtask os frr-test`, `xtask/src/os/frr.rs`): dois
+  roteadores da imagem no QEMU, sem root, com os `ether1` ligados por um par de sockets UDP do
+  QEMU no loopback do host. Cada um é configurado só por comandos (13, os mesmos de CLI/MCP):
+  endereço e `/32` na `lo`, OSPFv2 ponto a ponto, SR com prefix SID automático (sem TI-LFA,
+  desligado em produção pela G3.4k), MPLS e LDP no `ether1`, um peer BFD. E tem de ler de volta
+  do FRR: vizinho OSPF `Full` (`ospfd`), o prefix SID do outro com rótulo (`16002`, saída
+  implicit-null), LDP `operational` (`ldpd`), sessão BFD `up` (a do `bfdd`, rodada pelo motor
+  do daemon como data plane), rótulos na tabela MPLS do kernel (`zebra`), ping entre as
+  loopbacks pela rota OSPF e a versão que o `zebra --version` diz igual à do patch.
+  - **Achados:** o perfil `bfd` do interface-template OSPF não chega ao `ospfd`
+    (`crates/proto-ospf/src/frr.rs`: "BFD: not typed into FRR"): o OSPF não cai pelo BFD,
+    só o BGP (gap G3.6l). E o `bfdd` não imprime os valores padrão do perfil (`detect-multiplier 3`,
+    `receive-interval 300`, …) que o render manda: o hal-frr os digita de novo a cada sync, nos
+    dois FRR (gap G3.6m). Os dois foram corrigidos na G3.9 (`docs/producao-core.md`).
+- **O `corerouter-init` inicia os daemons** (`mgmtd`, `zebra`, `staticd`, `bgpd`, `ospfd`,
+  `ospf6d`, `ldpd`, `bfdd`), em primeiro plano, com o mesmo backoff de reinício do daemon,
+  `-P 0` (sem vty TCP: só os sockets em `/var/run/frr`), log em `/var/log/frr-<daemon>.log` (com o
+  mesmo corte de 8 MiB) e `zebra -s 90000000` (buffer de netlink recomendado para tabela cheia).
+  Sem `watchfrr`/`frrinit.sh` (bash) nem `frr.conf`: a configuração mora no `/config` e chega
+  pelo hal-frr; os daemons sobem vazios e o daemon passa `--frr /var/run/frr`. Eles caem para o
+  usuário `frr` com as capacidades que precisam (`libcap`).
+- **Sob demanda (G1.6i).** Só `mgmtd`, `zebra` e `staticd` sobem sempre. `bgpd`, `ospfd`,
+  `ospf6d`, `ldpd` e `bfdd` sobem quando a configuração os usa: o daemon (`--frr-daemons
+  /run/corerouter/frr-daemons`) grava a lista no arquivo e o init (um `stat` por tick de 50 ms)
+  sobe ou para só a diferença, sem reiniciar os outros. Antes do sync o arquivo recebe o que a
+  config nova usa somado ao que já estava, e o sync espera o socket vty do daemon novo (até 10 s);
+  depois do sync bem-sucedido o arquivo fica só com o que a config usa, então um daemon só sai
+  depois que a config (e as rotas) dele foram removidas, como num `no router ospf`. O `bfdd` sobe
+  também quando um protocolo pede BFD (`neighbor X bfd`, `ip ospf bfd`). Código:
+  `crates/hal-frr/src/on_demand.rs` e `apps/corerouter-init/src/pid1.rs` (`apply_wanted`); o
+  `frr-test` confere (o bgpd sobe com a instância BGP; ldpd e bfdd saem ao remover o LDP e o
+  peer BFD, sem mexer no PID do zebra/ospfd nem na rota OSPF). Uma instância BGP desabilitada
+  continua no bgpd (`bgp shutdown`), então ele fica.
+  Memória ociosa sem protocolo de roteamento (`os boot-test`, KVM, 1 GiB, três boots cada,
+  2026-10-29, **medido**): **98,9 → 70,9 MiB** (101,9/95,2/99,6 → 72,0/69,0/71,8; −28 MiB), e o
+  FRR fica pronto 0,82 s depois do kernel (antes 1,0–1,9 s).
+- **Quem morre primeiro num OOM (G1.6zz).** O init grava o `oom_score_adj` de cada processo
+  logo depois de lançá-lo (`/proc/<pid>/oom_score_adj`, como root): `corerouter-daemon` −900,
+  `zebra` e `mgmtd` −700, `bfdd` −600, `staticd`, `ospfd`, `ospf6d` e `ldpd` −300, `bgpd` 0
+  (`apps/corerouter-init/src/plan.rs`). O kernel soma `adj × memória / 1000` aos pontos de cada
+  processo (`oom_badness`, `mm/oom_kill.c`): −900 tira 90 % da memória da conta do daemon, então
+  um `bgpd` que cresce com a tabela cheia, ou uma ferramenta descontrolada, sai antes da gerência.
+  Nada fica em −1000: um daemon que vaza ainda pode ser morto (o init o reinicia), e sem ninguém
+  para matar o kernel entra em pânico. O valor passa para os filhos no `fork`; o daemon devolve a
+  0 os auxiliares que ficam rodando (`wpa_supplicant`, `hostapd`). O FRR, o VyOS e o SONiC não
+  ajustam nada (o SONiC reinicia a máquina num OOM, `vm.panic_on_oom=2`). O `frr-test` confere
+  os valores e provoca um OOM no r2 (`tail /dev/zero`): morre o `tail`, os PIDs do daemon e do
+  FRR ficam e a adjacência OSPF volta sozinha. Sem swap, antes do OOM killer agir o kernel tira
+  o cache das páginas (o código dos programas) e a máquina pode se arrastar: numa VM de 1 GiB o
+  `tail` morreu em 1,0 s numa rodada e, noutra, o OSPF (dead 4 s) caiu e o serviço BFD ficou 54 s
+  sem heartbeat (**medido**). Matar mais cedo, pela pressão de
+  memória (PSI), é a gap G1.32.
+- **Fora da imagem** (`post-build.sh`): `vtysh` (o único que liga readline), bash, readline,
+  ncurses, o runtime C++ que a toolchain copia, scripts Python e os daemons que o CoreRouter não
+  configura (rip, isis, pim, babel, eigrp, …). O `nft` deixa de ter CLI interativa (ela puxava
+  readline). Assim a raiz continua **sem GPL-3.0** (bash e readline são GPL-3.0; o GRUB, G1.6g,
+  fica só na área de boot). O `os build`
+  confere que todo ELF da imagem acha as bibliotecas que pede (uma remoção a mais falha o build).
+
+### Imagens de VM
+
+- **qcow2**: `qemu-img convert -c` (zlib) do `disk.img`, que já é a imagem instalada A/B. Em UEFI,
+  o primeiro boot é pelo caminho de mídia removível e cria as entradas de boot (G1.6b); em SeaBIOS,
+  é pelo GRUB, já em dm-verity (G1.6g).
+- **OVA** (`corerouter-image ova`): ustar com o `.ovf` primeiro, o `.mf` (SHA-256) e o disco
+  (DSP0243). VMDK streamOptimized pelo `qemu-img`. Máquina: 2 vCPUs, 1 GiB, SATA/AHCI, duas
+  e1000, `firmware=efi` (VMware). O VirtualBox importa com o BIOS dele, e o disco boota assim
+  (G1.6g).
+- **cloud-init: não agora.** O MikroTik CHR não usa cloud-init (sobe com DHCP na primeira porta);
+  o VyOS tem. Para o IP inicial, a configuração padrão de primeiro boot do G1.6d (cliente DHCP na
+  primeira porta, como o CHR) e o assistente de console resolvem Proxmox/VMware/VirtualBox; o
+  datasource NoCloud (o disco `cidata` do Proxmox) vira a gap G1.6h.
+
+### Pesquisa
+
+Fontes: [MikroTik Netinstall](https://help.mikrotik.com/docs/spaces/ROS/pages/24805390/Netinstall)
+e [pacote Netinstall v7](https://manual.mikrotik.com/docs/7.25/getting-started/installation-and-upgrade/netinstall/netinstall-package),
+[MikroTik CHR](https://help.mikrotik.com/docs/spaces/ROS/pages/18350234/Cloud+Hosted+Router+CHR),
+[VyOS: install](https://docs.vyos.io/en/rolling/_sources/installation/install.rst.txt),
+[Talos: ISO](https://docs.siderolabs.com/talos/v1.13/platform-specific-installations/bare-metal-platforms/iso),
+[OPNsense: instalação (Thomas-Krenn)](https://www.thomas-krenn.com/en/wiki/Install_OPNsense) e
+[Dasharo/Protectli](https://docs.dasharo.com/unified/protectli/os-installation-opnsense/),
+[AWS: boot UEFI/BIOS](https://aws.amazon.com/about-aws/whats-new/2023/03/amazon-ec2-create-amis-boot-uefi-legacy-bios),
+[UEFI 2.10 §5.3 (GPT) e §13.3 (El Torito)](https://uefi.org/specs/UEFI/2.10/),
+ECMA-119 (ISO 9660), El Torito 1.0, [DMTF DSP0243 (OVF)](https://www.dmtf.org/standards/ovf),
+[FRR: zebra `-s`](https://docs.frrouting.org/en/latest/zebra.html), manual do Buildroot
+(`<pkg>_DL_SUBDIR`, `<pkg>-rebuild`).
+
+| Sistema | Como instala | O que tiramos |
+|---|---|---|
+| **MikroTik Netinstall** | Pela rede (PXE/BOOTP) de um PC; *keep old configuration*; *configure script* que vira a configuração padrão; script de modo de uma vez (7.22+) | Manter a configuração; um ajuste de primeiro boot de uma vez (`corerouter.mgmt=`) |
+| **MikroTik CHR** | Imagens prontas (raw, VMDK, VHDX, qcow2/OVA); DHCP na primeira porta; sem cloud-init | Imagens de VM já instaladas; o IP inicial pelo G1.6d |
+| **VyOS** | Boota a ISO viva, `install image`: confirmação [y/N], nome da imagem, disco ≥ 2 GB, tamanho da raiz; cloud-init nas imagens de nuvem | Assistente no console; disco mínimo recusado; confirmação |
+| **OPNsense/pfSense** | Login `installer` na ISO, escolhe ZFS/UFS, escolhe o disco e **confirma de novo** | Duas etapas: escolher e confirmar |
+| **Talos** | ISO metal (BIOS e UEFI no x86; a de Secure Boot só UEFI); o instalador grava a imagem inteira | Imagem inteira e só leitura; o instalador é o próprio sistema |
+| **Flatcar** | `flatcar-install -d /dev/sdX` (exige o disco por nome) | Disco por nome, sem padrão |
+| **Junos/IOS-XE** | Mídia de instalação/USB de recuperação, `request system snapshot`/`install` | Mídia separada do sistema instalado |
+
+**Adotado:** ISO viva que roda da RAM (VyOS, Talos), disco escolhido e **nome digitado**
+(mais forte que o [y/N] do VyOS e a segunda confirmação do OPNsense: digitar o nome não sai
+por reflexo), manter a configuração (Netinstall), ajuste de primeiro boot aplicado uma vez
+(script de modo do Netinstall), imagens de VM prontas (CHR), assistente de console.
+
+**Melhor que os outros (o que o motor permite):** o instalador confere assinatura (índice e
+pacote) antes de escrever e **relê tudo** do disco (o VyOS e o Netinstall não releem); a GPT é
+o último passo; o primeiro boot já sobe no dm-verity pela entrada criada; o IP de gerência e o
+assistente são **comandos** pelo canal de controle (journal, mesmas validações do CLI/MCP); a
+instalação sem interação só existe dentro do hipervisor (fw_cfg), então um pendrive esquecido
+num roteador nunca apaga um disco sozinho.
+
+**ISO: genimage × xorriso × Rust.** O tipo `iso` do genimage chama o `genisoimage` (cdrkit)
+e não monta a GPT híbrida que o pendrive UEFI precisa. O xorriso está no
+Buildroot (`host-xorriso`, 1.5.4, GPL-3.0, download extra) e faz tudo, mas o Buildroot só o
+usa com GRUB/isolinux. Escrever a ISO em Rust deu ~540 linhas com testes (o leitor que o
+instalador usa vem junto), saída idêntica entre builds, sem download nem ferramenta GPL-3.0 no
+build. **Adotado: Rust**; o `file`, o `sfdisk` e o OVMF (CD e USB) aceitam a imagem.
+
+**BIOS legado: GRUB (G1.6g).** A UEFI continua sem bootloader (EFI stub, A/B por
+`BootOrder`/`BootNext`, G1.6b). Quem precisa de BIOS: o Proxmox cria VMs com SeaBIOS por padrão,
+algumas nuvens bootam imagens próprias por BIOS e há servidores antigos sem UEFI. GRUB × syslinux,
+**medido** em protótipo pela receita do Buildroot (SeaBIOS, KVM): 149 KiB contra 171 KiB, kernel
+em 0,65 s contra 0,40 s, e o motivo da escolha: no `ONCE` do syslinux,
+`com32/elflink/ldlinux/ldlinux.c:312-337` ignora o retorno do `adv_write` e boota mesmo assim, o
+que num teste A/B vira laço de pânico; o `save_env` do GRUB
+(`grub-core/commands/loadenv.c:286-340`) confere os blocos e dá para decidir no script. Preço: o
+GRUB é GPL-3.0 (só na área de boot). O A/B fica uma lógica só atrás do `BootStore`
+(`crates/sysupdate/src/ab.rs`): um firmware a mais, não um segundo atualizador.
+
+**OVA:** `qemu-img` (VMDK streamOptimized, o único que uma OVA pode levar) + OVF e tar escritos
+em Rust (`corerouter-image ova`), datas fixas. O OVA ainda não é reprodutível: o `qemu-img`
+põe um `CID` aleatório no descritor do VMDK (achado na G1.6k, gap G1.6l).
+
+### Desempenho e paralelismo
+
+- **Gravação em fluxo:** o instalador usa o `package::copy` do G1.6b: uma thread lê da mídia e
+  calcula o SHA-256, outra grava (4 buffers de 1 MiB em voo). Conferir o hash **durante** a
+  gravação é o hash da origem em trânsito; a releitura do disco só pode vir depois do `fsync` e
+  do descarte do cache (senão confere a RAM, não o disco).
+- **Releitura em paralelo:** uma thread por região (ESP, slot A, `/config`), e a árvore do
+  dm-verity do slot A em N threads (G1.6b). Medido no bench `install` (ISO em memória → arquivo,
+  20 MiB de ESP, 20 MiB de rootfs, 64 MiB de `/config`, 109 MiB gravados; máquina compartilhada,
+  ±10%): sequencial e releitura serial **158 ms**; em fluxo e serial **127 ms**; sequencial e
+  releitura paralela **109 ms**; em fluxo e paralela **121 ms** (empate com o anterior dentro do
+  ruído). Os dois juntos ficam ligados: num disco real, com a mídia mais lenta que o disco (USB 2,
+  CD), o fluxo é o que esconde a leitura da mídia.
+- **No QEMU** (KVM, virtio, ISO como CD): 104 MiB gravados em 70–130 ms, relidos em 30–38 ms,
+  instalação inteira 0,1–0,3 s; do QEMU ligado ao desligado depois de instalar, **2,1–2,5 s**
+  (o firmware é ~1,5 s). Reinstalar mantendo a configuração grava 40 MiB em 35 ms.
+- **FRR no boot:** os 8 daemons sobem em paralelo com o daemon do CoreRouter (o init não espera
+  um pelo outro: o hal-frr reanexa quando os sockets aparecem). Kernel → daemon pronto
+  0,75–0,82 s (era 0,69–1,20 s sem FRR), kernel → os 8 sockets vty do FRR 0,77–0,78 s.
+- **Memória:** ociosa 93–98 MiB (era 48–58 MiB); RSS do FRR: mgmtd 11,5, zebra 14, staticd 8,
+  bgpd 17, ospfd 10,7, ospf6d 10, ldpd 8, bfdd 8,5 MiB (com as bibliotecas compartilhadas
+  contadas em cada um). Subir só os daemons configurados é a gap G1.6i.
+
+### Números
+
+**Medidos** em 2026-10-27, AMD Ryzen AI Max+ 395, KVM, 2 vCPUs, 1 GiB, build do mesmo commit, com
+outras sessões usando a máquina.
+
+| O quê | Valor |
+|---|---|
+| `rootfs.squashfs` com FRR | **19,3 MiB** (era 14,4–14,9 MiB: FRR acrescenta ~4,5 MiB comprimidos) |
+| `corerouter.crpkg` | 38,5 MiB (era 34,1) |
+| Kernel do instalador (com o initramfs) | 18,3 MiB, num FAT de 30 MiB |
+| `corerouter-install.iso` | **96,2 MiB** (pacote 38,5 + ESP 19,4 + boot 30 + `/config` 8,2) |
+| `corerouter.qcow2` | **38,9 MiB** (disco virtual de 705 MiB) |
+| `corerouter.ova` | **38,8 MiB** |
+| Montar ISO + índice (`corerouter-image installer`) | 0,35–0,41 s |
+| qcow2 / OVA a partir do `disk.img` | 0,5 s / 0,8 s |
+| Instalar (gravar + reler + GPT) | 0,1–0,3 s; QEMU ligado → desligado 2,1–3,3 s |
+| Boot do disco instalado: kernel → daemon / → FRR | 0,76–0,82 s / 0,77–0,78 s |
+| qcow2 e OVA: QEMU ligado → daemon pronto | 2,0–2,1 s |
+| `cargo xtask os install-test` (6 boots, 3 instalações) | 33,2 s |
+| Rebuild incremental da imagem (com o kernel do instalador) | 32–49 s |
+
+### FRR 10.3 → 10.7.1 (G1.6k)
+
+**Medidos** em 2026-10-28, AMD Ryzen AI Max+ 395, KVM, 2 vCPUs, 1 GiB; builds limpos do mesmo
+commit, um com o patch e outro sem, com outras sessões usando a máquina.
+
+| O quê | FRR 10.3 / libyang 2.1.148 | FRR 10.7.1 / libyang 3.13.6 |
+|---|---|---|
+| `rootfs.squashfs` | 21,4 MiB | **21,7 MiB** (+0,3) |
+| FRR + libyang no rootfs, descomprimido | 13,6 MiB | 14,2 MiB |
+| `corerouter.crpkg` / ISO / qcow2 / OVA | 40,7 / 98,4 / 41,1 / 40,9 MiB | 41,0 / 98,7 / 41,4 / 41,2 MiB |
+| RSS dos 8 daemons com OSPF+SR+LDP no ar (`frr-test`) | 85,7 MiB | **88,5 MiB** (+2,8; bgpd +0,9, zebra +0,5, mgmtd +0,5) |
+| `MemAvailable` nesse ponto (de 949 MiB) | 836,6 MiB | 834,7 MiB |
+| Kernel → os 8 sockets vty / → daemon pronto | 0,76 / 0,81 s | 0,75 / 0,80 s |
+| Vizinho OSPF `Full` / LDP `operational` depois da config | 1,9 / 11,9 s | 1,5 / 11,5 s (o `ldpd` espera 10 s fixos, RFC 5443) |
+| BFD `up` (peer explícito, 300 ms × 3) | não medido | já `up` na primeira leitura, depois do LDP |
+| `frr-test` inteiro | — | 25 s |
+| Build limpo da imagem, ccache e cargo quentes | — | 164 s (`--top-jobs 17`), 427 s sem `-j` de topo |
+
+**Reprodutível:** dois builds limpos com o patch (um com `--top-jobs 17`, outro sem `-j` de
+topo) deram o mesmo `bzImage`, `rootfs.squashfs`, `disk.img`, pacote e imagens de VM, e o mesmo
+`target/` arquivo por arquivo. Só o **OVA** saiu diferente, e não pelo FRR: o `qemu-img`
+(8.2) grava um `CID` aleatório no descritor do VMDK a cada conversão (dois `convert` do mesmo
+`disk.img` diferem no byte 549). Gap G1.6l.
+
+### O que ficou de fora e por quê
+
+- **cloud-init (NoCloud/`cidata`):** gap G1.6h; o IP inicial pelo G1.6d e pelo assistente.
+- **Só os daemons do FRR configurados** (hoje sobem os 8, ~88 MiB de RSS somado): gap G1.6i.
+- **`/config` do tamanho do resto do disco (G1.6v):** o `disk.img` continua com 64 MiB (imagens
+  pequenas). O instalador grava a partição `config` até o fim do disco (alinhada a 1 MiB) quando
+  isso lhe dá pelo menos 256 MiB; o primeiro boot cresce o ext4. Num roteador já instalado, o
+  init, fora de um boot de teste, reescreve só a entrada `config` da GPT (primária e backup; a
+  backup vai para o fim de um disco que cresceu; números, GUIDs e atributos ficam) e, no boot
+  seguinte, antes de montar, roda `e2fsck -f -p` e `resize2fs` no `/config` desmontado. Um disco
+  que deixaria menos de 256 MiB mantém o layout, e o log do boot diz quanto caberia. Da imagem,
+  só o `e2fsck` e o `resize2fs` do e2fsprogs ficam (`post-build.sh`). Uma VM criada do
+  `disk.img` (705 MiB) não tem para onde crescer: aumente o disco (`qemu-img resize`, com a VM
+  desligada) e o roteador cresce o `/config` em dois boots.
+- **Dois discos CoreRouter na mesma caixa:** os PARTUUIDs são fixos (a linha de comando embutida
+  do fallback aponta para o `rootfs-a`); o instalador recusa um disco com a imagem do
+  instalador, mas não um segundo CoreRouter. Anotado como risco.
+- **Firmware das placas (pacote DDP da `ice`)**: entrou no G1.6j; no instalador a `ice` segue
+  em Safe Mode, o que basta para listar a porta.
+- **Senha do `admin` no instalador:** não vai na linha de comando (fica na NVRAM); o assistente
+  de console do primeiro boot a pede.
+
+## Primeiro boot de verdade: nomes de porta, console e shell (G1.6m)
+
+Achados de uma instalação do `corerouter.qcow2` numa VM libvirt (UEFI, 3 placas virtio), em
+2026-10-28, e o que mudou.
+
+### Nomes de porta: `ether1…` desde o boot
+
+O kernel chama as portas `eth0`, `eth1`… na ordem de probe; a GUI, os documentos e o operador
+de MikroTik usam `ether1`, `ether2`…. O init renomeia antes do daemon subir
+(`apps/corerouter-init/src/ports.rs` decide, `links.rs` faz o `RTM_NEWLINK` com `IFLA_IFNAME`):
+
+- **Ordem do barramento, não do probe:** caminho PCI do dispositivo, depois `dev_port` (placa
+  com várias portas numa função), depois o MAC. O probe em paralelo muda a ordem entre boots
+  (relatos do RouterOS em VM e o T9127 do VyOS com a `ice`). O init espera a lista de links
+  ficar parada por 100 ms (no máximo 2 s) antes de numerar.
+- **O nome segue a placa** (`/config/.port-names`: nome, MAC, caminho), como o `hw-id` do VyOS:
+  placa nova ganha o próximo número livre e não desloca as outras.
+- **Placa trocada no mesmo slot** (MAC sumiu, MAC novo no mesmo caminho PCI) fica com o nome da
+  antiga, como o slot/porta do Junos: a configuração daquela porta continua valendo. O nome de
+  uma placa que sumiu fica reservado (a configuração aponta para ele); apagar o arquivo
+  renumera tudo a partir de `ether1` no boot seguinte.
+- **Configuração de antes (G1.6c) sem o mapa:** os nomes do kernel ficam (`eth0` na
+  configuração continua existindo) e o mapa os registra; placa nova depois disso vira `etherN`.
+  Renomear quebraria a gerência (lockout).
+- **`corerouter.mgmt=eth0,…`** (instalador antigo, NVRAM antiga) vale para a placa que o kernel
+  chamou de `eth0` neste boot, já renomeada: a tradução é pelo dispositivo, não pelo número.
+- **Porta ativa** (o `ip=` do kernel nos testes): o kernel não renomeia porta ativa; o init a
+  baixa, renomeia e sobe; o endereço IPv4 fica e as rotas por ela caem.
+- O daemon não muda: porta física é gerenciada pela regra 6 do `owner.rs` qualquer que seja o
+  nome; `--manage` não é usado na imagem.
+
+### Interfaces que o kernel criava sozinho
+
+Com os drivers `=y`, cada um criava a sua no namespace inicial durante os initcalls: `bond0`,
+`dummy0`, e as "fallback" dos túneis `gre0`, `gretap0`, `erspan0`, `ip6gre0`, `ip6tnl0`,
+`sit0`, `tunl0`. Apareciam em Interfaces como "not managed".
+
+- `bonding.max_bonds=0 dummy.numdummies=0` na linha de comando embutida (e no
+  `BUILTIN_CMDLINE` do `corerouter-sysupdate`, que o `os check` confere): bonds e loopbacks o
+  hal-linux cria por netlink.
+- Os túneis: o `sysctl.net.core.fb_tunnels_only_for_init_net=2` da linha de comando chega tarde
+  (o kernel aplica `sysctl.*` em `do_sysctl_args()`, depois dos initcalls; conferido no
+  `init/main.c` do 6.18). `os/patches/linux/0002-net-no-fallback-tunnel-devices.patch` muda o
+  padrão do sysctl para 2 (uma linha). Nada no CoreRouter usa as fallback (o hal-frr e o
+  hal-linux criam o que usam); sem elas, GRE/IPIP sem túnel configurado é descartado, o que é
+  o comportamento seguro.
+- O `cargo xtask os build` reaplica os patches do kernel quando mudam (`linux-dirclean`; antes
+  só o fragmento era acompanhado).
+- **O kernel da ISO também (G1.6ze).** Num notebook real a ISO live listou `bond0`, `dummy0` e
+  os sete túneis; o disco instalado, não. O kernel do instalador é outro pacote do Buildroot
+  (`corerouter-installer`), e as duas correções acima não chegavam nele:
+  - o `CONFIG_CMDLINE` do `installer.fragment` substitui o da imagem e não tinha os dois
+    parâmetros (`drivers/net/bonding/bond_main.c:102,6600` e `drivers/net/dummy.c:47,179` do
+    6.18.59: sem o parâmetro, um `bond0` e um `dummy0`);
+  - o `BR2_GLOBAL_PATCH_DIR` só entrega a um pacote a pasta `patches/<nome do pacote>`. O
+    kernel do instalador era o tarball puro (`.applied_patches_list` vazio), com
+    `sysctl_fb_tunnels_only_for_init_net = 0`. O `corerouter-installer.mk` agora aplica
+    `os/patches/linux` num `POST_PATCH_HOOKS`.
+
+  Travas: o `os check` exige os dois parâmetros nas duas linhas de comando e o gancho no `.mk`;
+  o build apaga uma árvore de kernel extraída sem os patches (`corerouter-installer-dirclean`)
+  e reprova se o `.applied_patches_list` de qualquer das duas não tiver todos; o
+  `install-test` reprova uma ISO live cujo `interface.list` tenha algo além de `etherN` e `lo`.
+
+### Shell de manutenção que parava
+
+Reproduzido sem root (QEMU com duas seriais em pty e uma VM libvirt de sessão com
+`virsh console --force`): reconectar o console não quebra nada; **sair do shell** (`exit`,
+Ctrl-D) sim. O init colhia filhos com `waitpid(None, NOHANG)` do rustix 1.x, que é `wait4(0)`:
+só o grupo de processos do PID 1. O shell (`setsid -c`, sessão e grupo próprios) virava zumbi,
+o init nunca via a saída e não abria outro; o eco que aparecia era o da disciplina de linha do
+`ttyS0` (aberto pelo `/dev/console`), sem ninguém lendo. O mesmo deixava zumbis de qualquer
+órfão com grupo próprio. Agora é `wait4(-1)` (`rustix::process::wait`); o `install-test` dá
+`exit` no shell, espera o novo e confere que não há zumbi.
+
+### `corerouter.mgmt=` herdado de outra VM
+
+Uma VM nova com o nome de uma antiga herdou a NVRAM (`/var/lib/libvirt/qemu/nvram/<nome>_VARS.fd`
+não é apagado com `virsh undefine` sem `--nvram`) e a entrada "CoreRouter A" com
+`corerouter.mgmt=`. Os PARTUUIDs da imagem são fixos, então a entrada antiga boota o disco
+novo e o endereço foi aplicado; por isso o assistente não apareceu. O marcador não aparecer é
+compatível com a VM desligada à força logo depois: o daemon faz fsync da configuração e o
+marcador era um `write` simples (o ext4 grava em até 5 s). Agora o marcador é gravado com
+fsync do arquivo e do diretório, e o init diz nos consoles qual endereço, em que porta, que
+veio da entrada de boot, e como sair disso (`virsh start --reset-nvram`; no Proxmox, um EFI
+disk novo). Porta que não existe: o endereço não é aplicado e o assistente pergunta.
+
+### Pesquisa
+
+- **MikroTik RouterOS v7:** portas `etherN` com `default-name` fixo por porta de hardware; no
+  x86/CHR a numeração segue a detecção, e há relatos de nomes trocados entre boots em VM e de
+  `default-name` duplicado no CHR ([fórum: CHR x86 random names](https://forum.mikrotik.com/t/chr-x86-ethernet-interfaces-random-names/115361),
+  [NIC order issues](https://forum.mikrotik.com/t/routeros-6-40-4-nic-order-issues/112975),
+  [duplicate default-name](https://forum.mikrotik.com/t/chr-duplicate-default-name-on-interfaces/130582));
+  numa máquina física, o nome só muda se a placa mudar de slot PCI
+  ([fórum](https://forum.mikrotik.com/t/how-are-hardware-ports-associated-with-names/125582)).
+  O console do CHR abre o login (sem senha na primeira vez) e um terminal completo.
+- **VyOS:** `ethN` com `hw-id` (o MAC permanente) gravado na configuração; o renomeio é por
+  udev (`vyos_net_name`), com corrida conhecida com placas lentas
+  ([docs](https://docs.vyos.io/en/1.5/troubleshooting/interfaces.html),
+  [T9127](https://vyos.dev/T9127), [T9141](https://vyos.dev/T9141)).
+- **OPNsense/pfSense:** nomes do driver (`vtnet0`, `igb1`); o menu do console atribui WAN/LAN
+  e pergunta antes de aplicar ([docs](https://docs.opnsense.org/manual/how-tos/vlan_and_lagg.html)).
+- **Junos:** nome pela posição física (`ge-0/0/1`): placa trocada no mesmo lugar herda a
+  configuração.
+- **Adotado:** nomes do RouterOS, ordem do barramento (melhor que a detecção), o nome preso ao
+  MAC (VyOS) e ao slot quando a placa é trocada (Junos); no console, a confirmação explícita
+  e o resumo antes de aplicar (OPNsense).
+- **Extras que entraram:** a pergunta pendente reaparece (console serial conectado depois); Enter
+  num console com endereço mostra o status; o aviso do `corerouter.mgmt=` com a origem; o
+  instalador recusa porta inexistente.
+- **Ficou de fora:** renomear placa que aparece depois do boot (hot-plug; hoje fica `ethN` até
+  o próximo boot); escolher o nome no console; o cliente DHCP de fábrica (G1.6d).
+
+### Desempenho e paralelismo
+
+Tudo roda uma vez no boot, fora de caminho quente. O renomeio é uma mensagem netlink por porta
+(três com a porta ativa), O(n) no número de portas; a decisão (`assign`) é O(n·m) com n, m ≤
+1024, irrelevante. A única espera é a de a lista de links parar de mudar (100 ms de silêncio,
+2 s no máximo): é o que evita numerar antes de um driver lento terminar. Não há o que dividir
+entre núcleos. O assistente e o aviso rodam em processo e thread próprios, sem lock com o
+laço do PID 1.
+
+### Números (G1.6m)
+
+**Medido** em 2026-10-28, KVM no host de desenvolvimento, build release da imagem:
+
+- kernel → daemon responde `ping`: 0,90–0,91 s em três `boot-test` (0,92 s na imagem da
+  `main` antes); com a espera de 300 ms de silêncio dos links eram 1,10 s, por isso 100 ms;
+- `early boot done`: 110–112 ms (14 ms antes; a diferença é a espera dos links);
+- `install-test` completo: 40,8 s; `/sys/class/net` com 3 placas: `ether1 ether2 ether3 lo`
+  (antes: mais `bond0`, `dummy0` e sete túneis de fallback);
+- build da imagem do zero numa worktree (toolchain externa e downloads em cache): 1064 s; um
+  build incremental só do init: 56 s.
+
+## Acesso web de fábrica (G1.6o)
+
+Como o WebFig do RouterOS: num roteador novo, `https://<endereço do roteador>/` no navegador abre
+a GUI (a mesma do aplicativo, compilada para WASM) e pede o login (`admin`). O mesmo endereço
+leva o canal de controle por WebSocket (`wss://<roteador>/ws`), com o certificado do próprio
+roteador, o mesmo da porta TLS 8729.
+
+### Como funciona
+
+- **Comandos** (`crates/engine/src/cmd/web_service.rs`), no estilo do `/ip service`:
+  - `ip.service.www-ssl.set {enabled?, address?, port?, available_from?}` e `.get` (com
+    `status`, `listening`, `last_error`, `refused`, `gui_files`): HTTPS + WSS;
+  - `ip.service.www.set` / `.get`: HTTP **só para redirecionar** (`301` →
+    `https://<host>/`, porta do `www-ssl`); nunca serve a GUI nem aceita login em texto claro.
+  - `address` é onde escuta (padrão `::`, todos os endereços IPv6 e IPv4); `available_from` é o
+    `address` do RouterOS: quem não está na lista cai antes do TLS, sem resposta, e conta em
+    `refused`. Os dois na mesma porta são recusados.
+- **Daemon** (`apps/corerouter-daemon/src/service/web.rs`, serviço `web` do supervisor): segue
+  a config em execução a cada 1 s; um commit abre, move ou fecha a porta **sem reiniciar**.
+  Conexões já abertas continuam (mudar o serviço não derruba quem o mudou, como no RouterOS).
+  Porta ocupada ou sem permissão vira `status: error` com o motivo, tentado de novo a cada
+  segundo e registrado no log uma vez.
+- **Padrão de fábrica só para config nova.** O modelo nasce desligado; o init passa
+  `--web-factory-on`, e o daemon liga o `www-ssl` (443) só quando não havia config salva. Um
+  roteador atualizado mantém o que tinha (nenhuma porta nova aberta numa atualização).
+- **Imagem:** o `cargo xtask os build` compila a GUI com o trunk em release (`xtask/src/os/web.rs`),
+  com `wasm-bindgen` e `wasm-opt` (binaryen) em versões fixas, baixados do GitHub oficial e
+  conferidos por SHA-256 (`os/dl/web-tools/`), trunk `--offline --locked`, e caminhos da
+  máquina removidos do `.wasm` (`--remap-path-prefix`). O `corerouter.mk` instala o resultado em
+  `/usr/share/corerouter/web` (`--web-files`). Nada de JS escrito à mão: o JS é o que o
+  `wasm-bindgen` gera; o `index.html` é o do trunk.
+- **Compressão:** o `.wasm` e o JS ficam na imagem só como `<arquivo>.gz` (`gzip -9 -n`,
+  reprodutível), e o daemon os entrega com `Content-Encoding: gzip` (como o `gzip_static` do
+  nginx); quem não aceita gzip recebe `406`, e todo navegador aceita. Na rede, 32 → 11 MiB; no
+  squashfs, só 1,6 MiB a mais que o `.wasm` cru (o zstd já o deixa em ~10 MiB); guardar os dois
+  custaria ~21 MiB (**medido**, ver "Números").
+- **Porta 443:** o daemon roda como root na imagem (PID 1 o inicia), então a porta privilegiada
+  abre sem `setcap`. Fora da imagem (laboratório como usuário comum) o `get` mostra
+  `cannot listen on [::]:443: Permission denied … CAP_NET_BIND_SERVICE`; use outra porta
+  (`ip.service.www-ssl.set port=8443`).
+
+O certificado é autoassinado: o navegador avisa na primeira vez ("Sua conexão não é
+particular"/"Aviso: risco potencial"). Compare a impressão digital SHA-256 que o navegador mostra
+com a do log do daemon (`TLS certificate fingerprint`) ou a do console, e aceite. Sem HSTS de
+propósito: com certificado próprio, o HSTS impediria o navegador de deixar aceitar a exceção.
+
+### Pesquisa
+
+- **MikroTik RouterOS v7** ([`/ip service`](https://help.mikrotik.com/docs/spaces/ROS/pages/103841820/Services)):
+  linhas `www` (80, ligada) e `www-ssl` (443, **desligada**, `certificate=none` até o operador
+  criar ou importar um); parâmetros `address` (prefixos permitidos; os outros não são
+  descartados na rede, só têm o acesso negado), `port`, `certificate`, `tls-version`, `vrf`,
+  `max-sessions` (padrão 20). Não dá para criar serviço novo.
+- **pfSense** ([Admin Access](https://docs.netgate.com/pfsense/en/latest/config/advanced-admin.html)):
+  HTTPS na 443 por padrão, certificado autoassinado gerado no primeiro boot, redirecionamento de
+  80 ligado por padrão, HSTS ligado (dá para desligar), 2 processos.
+- **OPNsense** ([Settings › Administration](https://docs.opnsense.org/manual/settingsmenu.html)):
+  HTTPS recomendado, certificado autoassinado por padrão, regra de redirecionamento 80/443 criada
+  sozinha (desligável), HSTS opcional, escuta em todas as interfaces por padrão.
+- **VyOS** (`service https`): desligado por padrão, só a API; sem GUI.
+- **RFC 9110 §12.5.3** (`Accept-Encoding`, `q=0`), **RFC 6455** (WebSocket, já no G0.4),
+  **RFC 6797** (HSTS, não adotado: ver acima).
+- **Adotado:** nomes e forma do RouterOS (`www-ssl`, `www`, `port`, lista de origem), o HTTPS de
+  fábrica com certificado próprio do pfSense/OPNsense (o RouterOS deixa o operador sem HTTPS até
+  ele criar um certificado, e com `www` em texto claro ligado).
+- **Melhor que o RouterOS:** HTTPS ligado e HTTP desligado de fábrica; `www` só redireciona
+  (senha nunca em texto claro); a porta muda sem reiniciar; `status`/`last_error` dizem por que
+  a porta não abriu; `X-Frame-Options: DENY` contra clickjacking; padrão novo só em config
+  nova.
+- **Ficou de fora** (gaps): janela IP › Services na GUI com ⓘ (G1.6p), `vrf` e `max-sessions`
+  por serviço, certificado escolhido pelo operador (`certificate=`, ACME), `tls-version`.
+
+### Desempenho e paralelismo
+
+- Cada conexão (arquivo estático ou WebSocket) tem a sua thread (`control::server::accept_loop`),
+  então downloads e sessões de GUI de vários operadores rodam em paralelo, em núcleos
+  diferentes. O que é compartilhado: a tabela de vagas do endpoint (um `Mutex` curto por
+  conexão aceita) e o lock do `Session` só durante cada comando, como no TCP.
+- **Limites** (os do canal de controle): 16 conexões por endpoint, 8 sem login, 4 sem login por
+  origem (IPv4 ou /64); acima disso a conexão cai. Uma página da GUI usa 3 conexões curtas
+  (`index.html`, JS, wasm; `Connection: close`) e depois uma WebSocket. O arquivo vai em fluxo
+  (`io::copy`), sem carregar 32 MiB na memória por cliente.
+- O redirecionamento HTTP usa uma thread de `accept` (sondando a cada 50 ms) e uma por
+  conexão, no máximo 16, cada uma com 5 s para ler 8 KiB de cabeçalho.
+- O laço do serviço olha a config uma vez por segundo (um clone pequeno sob o lock): custo
+  desprezível, sem crescer com nada.
+- Não há caminho quente aqui: servir a GUI é uma vez por sessão do operador. O que pesa é o
+  tamanho do `.wasm` na rede, por isso o gzip.
+
+### Números (G1.6o)
+
+**Medido** em 2026-10-28, host de desenvolvimento (KVM), build release da imagem; antes = a
+imagem da `main` (`7a6041d5`) feita no mesmo host:
+
+| | `.wasm` |
+|---|---|
+| saída do cargo (release, wasm32) | 42,2 MB |
+| depois do `wasm-bindgen` + `wasm-opt` padrão do trunk | 32,2 MB |
+| com `wasm-opt -Oz` explícito | 31,5 MB (−2%: não compensa o tempo, não adotado) |
+| `gzip -9` (o que vai na imagem e na rede) | 11,5 MB |
+| `xz` (só referência) | 7,0 MB |
+
+| Imagem | antes | só `.wasm` cru | `.wasm` + `.gz` | só `.gz` (adotado) |
+|---|---|---|---|---|
+| `rootfs.squashfs` | 21,7 MiB | 31,6 MiB | 42,5 MiB | **32,7 MiB** (+11,0) |
+| `corerouter.qcow2` | 41,4 MiB | 51,4 MiB | 62,4 MiB | **52,5 MiB** |
+| `corerouter-install.iso` | 98,7 MiB | 108,6 MiB | 119,7 MiB | **109,8 MiB** |
+| `corerouter.crpkg` | 41,0 MiB | 51,0 MiB | 62,0 MiB | **52,1 MiB** |
+
+- `boot-test`: `GET /` e o `.wasm` (10,9 MiB comprimido) em 0,21–0,29 s pela rede do QEMU; o
+  WebSocket responde ao `auth.login` (recusado, como deve, enquanto o `admin` não tem senha);
+  kernel → `ping` em 0,94–1,76 s (variação do host carregado por outros builds), memória ociosa
+  95,6–101,6 MiB.
+- Build da GUI dentro do `os build`: 2,5 min do zero (wasm32 release, `lto = "thin"`),
+  segundos com o cache do cargo; o download único das ferramentas é de 106 MiB (binaryen) +
+  11 MiB (wasm-bindgen), guardado em `os/dl/web-tools/`.
+- Captura: a GUI servida pela imagem no QEMU abre a tela de conexão apontando para
+  `wss://<host>/ws` com `admin`.
+
+## Pacote pela rede e ciclo rápido de teste (G1.6e)
+
+Até a G1.6b o `.crpkg` tinha de estar no disco do roteador (um arquivo em `/tmp`, um pendrive).
+Agora ele vai pelo **canal de controle** (TLS, ou o canal local de uma GUI com `--control`), em
+blocos, e é gravado no slot inativo **enquanto chega**.
+
+```sh
+# Do PC de desenvolvimento, numa VM que já roda a imagem (sem recriá-la):
+cargo xtask os push --to 127.0.0.1:7990                     # o canal local da GUI que gerencia a VM (token local)
+cargo xtask os push --to 192.0.2.10:8729 --user admin       # direto no roteador, TLS ($COREROUTER_PASSWORD ou prompt)
+cargo xtask os push --to … --no-build --confirm manual      # pacote já construído; confirmação manual
+
+# Qualquer pacote, de qualquer máquina:
+corerouter-cli --connect tls://192.0.2.10:8729 --user admin upload corerouter.crpkg --wait
+corerouter-cli --connect … upload corerouter.crpkg '{"check":true}'    # só confere, não grava
+```
+
+Na GUI: **System › Packages › From this computer** (digite o caminho ou solte o `.crpkg` na
+janela), **Upload and check** ou **Upload and install…**, barra de progresso e **Abort**.
+
+### O ciclo rápido
+
+`os push` faz, e cronometra, cada etapa:
+
+1. `cargo xtask os build --only crpkg`: o build de sempre até o `corerouter-image seal` (rootfs,
+   árvore do dm-verity, manifesto assinado, `corerouter.crpkg`) e para: sem o `disk.img` (o
+   genimage), sem a ISO do instalador e o kernel dele, sem o qcow2 e o OVA;
+2. `corerouter-cli upload --wait`: envia, espera gravar e reler, espera o roteador voltar do
+   reboot **no slot novo** e o boot de teste se confirmar (ou voltar ao anterior: aí falha e
+   diz por quê).
+
+A VM não é recriada: `/config` (com a senha do `admin` e o certificado TLS) fica, o
+`known_hosts` do PC continua valendo e a GUI reconecta sozinha. A versão (`build`) é a hora do
+commit: dois builds do mesmo commit (mudanças ainda não commitadas) têm o mesmo `build`, e
+atualizar para o mesmo `build` é permitido.
+
+### Como funciona
+
+- **Comandos** (`crates/engine/src/cmd/package.rs`): `system.package.upload.start {size, check?,
+  downgrade?, confirm?, timeout?, reboot?}` põe um trabalho na fila (as mesmas regras do
+  `update`: um por vez, nenhum boot de teste pendente, só na imagem A/B) e devolve o id do envio;
+  `system.package.upload.chunk {upload, offset, data}` leva cada bloco em base64 (até 4 MiB
+  decodificados; o cliente manda 1 MiB) **em ordem** (`offset` tem de ser o que já chegou);
+  `system.package.upload.abort` interrompe. O bloco não entra no journal (seria 1 MiB por
+  linha) mas pede o grupo `write`, como o `update`.
+- **Fila limitada, sem esperar sob o lock.** O engine entrega cada bloco a uma fila de 8 blocos
+  (`sync_channel`): no máximo ~8 MiB do pacote em RAM. Fila cheia (o disco atrasou) responde
+  `busy: true` e o cliente manda o mesmo bloco de novo; nada bloqueia com o lock do `Session`.
+- **O serviço `package` lê a fila como um fluxo** (`crates/sysupdate/src/upload.rs`,
+  `ChunkReader`) e chama a mesma instalação de um arquivo (`Platform::install_from`): lê o
+  cabeçalho, **confere a assinatura antes de gravar um byte** e o tamanho declarado contra o do
+  manifesto, grava kernel e rootfs no slot inativo com o SHA-256 no caminho (uma thread lê e
+  hasheia, outra grava), relê o slot sem o cache de páginas e recalcula a árvore do dm-verity, e
+  só então grava o cabeçalho, a entrada de boot e o `BootNext`. Daí em diante é o boot de teste da
+  G1.6b: confirmação automática ou manual, volta sozinho se não confirmar.
+- **Interrupção.** `abort`, a conexão que cai (60 s sem bloco: o envio é abandonado) ou um pacote
+  adulterado (hash do payload diferente) terminam o trabalho com erro; o slot inativo fica sem
+  cabeçalho (não é volta de ninguém) e o slot em uso continua o padrão. Testado no laboratório
+  virtual (`apps/corerouter-daemon/tests/package_upload.rs`), no `sysupdate`
+  (`streamed_install_and_its_failures`) e no QEMU (`ab-test --scenario push`).
+- **O resultado antes do reboot.** O serviço espera 2 s entre o resultado e o reboot, para quem
+  enviou (CLI, GUI) ler o resultado antes de a conexão cair; se cair antes, o `--wait` segue
+  pelo estado depois do reboot.
+
+### Download pelo próprio roteador
+
+```sh
+corerouter-cli … run system.package.download '{"url":"https://updates.example/corerouter.crpkg"}'
+corerouter-cli … run system.package.download '{"url":"http://192.0.2.5:8000/corerouter.crpkg","check":true}'
+```
+
+Como o `/system package update install` do RouterOS, mas de um endereço que o operador dá: o
+serviço `package` baixa numa thread própria (`pkg-download`) com o cliente HTTP do daemon
+(`service/https.rs`: resolvedor do roteador, certificado conferido pelas raízes da Mozilla
+embutidas, `ssl_verify=false` como o `ssl-verify=no`, redirecionamento para dentro da LAN
+recusado), e o corpo vai em pedaços de 256 KiB pela **mesma** fila limitada do envio até a
+mesma instalação em fluxo. `http://` é aceito: o pacote é assinado, o TLS só esconde o que se
+baixa. Na GUI, um endereço no campo **Package file** faz o Check e o Install and reboot baixarem.
+Erros do servidor (404, conexão cortada) aparecem no resultado do trabalho; nada é gravado no
+slot antes de a assinatura conferir.
+
+Fica para depois: o **canal** (um índice por canal — stable, testing… — com a última versão,
+como o `check-for-updates` do RouterOS) e o **delta por blocos** (o índice do RAUC): hoje cada
+atualização baixa o pacote inteiro (41 MiB).
+
+### O teste em QEMU (`cargo xtask os ab-test --scenario push`)
+
+A imagem A recebe senha do `admin` e um nome (`system.identity.set`); o teste lê a impressão
+digital do certificado no log do daemon e roda `corerouter-cli --connect tls://… --user admin
+--fingerprint … upload b.crpkg --wait` pela rede de usuário do QEMU (encaminhamento de porta para
+o 8729). O roteador grava o slot B, reinicia (cada reboot é um QEMU novo com a mesma NVRAM), o
+boot de teste de B se confirma, e o CLI — que fez login de novo **com a mesma senha** e
+**exigindo o mesmo certificado** — vê B confirmado. O nome continua (o `/config` ficou). Depois um
+pacote cujo daemon nunca responde vai pelo mesmo caminho (`timeout` 30 s): o init reinicia no
+prazo, o firmware boota B, a configuração volta, e o CLI sai com erro dizendo que o slot não
+ficou.
+
+### Pesquisa
+
+Fontes: [MikroTik: Packages](https://help.mikrotik.com/docs/spaces/ROS/pages/40992872/Packages) e
+[Upgrading and installation](https://help.mikrotik.com/docs/spaces/ROS/pages/328142/Upgrading+and+installation),
+[VyOS: update](https://docs.vyos.io/en/latest/installation/update.html),
+[Junos `request system software add`](https://www.juniper.net/documentation/us/en/software/junos/cli-reference/topics/ref/command/request-system-software-add.html),
+[IOS-XE install mode](https://www.cisco.com/c/en/us/td/docs/routers/C8000V/Configuration/c8000v-installation-configuration-guide/m_installing-the-software-using-install-commands.html),
+[RAUC: HTTP streaming](https://rauc.readthedocs.io/en/latest/advanced.html#http-streaming),
+[SWUpdate: streaming](https://sbabic.github.io/swupdate/swupdate.html),
+[Mender: artifact streaming](https://docs.mender.io/overview/artifact).
+
+| Sistema | Como o pacote chega | Grava enquanto chega? |
+|---|---|---|
+| **MikroTik RouterOS v7** | Arrastar o `.npk` para Files (WinBox/WebFig, FTP, SFTP) e reiniciar; ou `/system package update` baixa do canal | Não: o `.npk` fica inteiro no armazenamento e é instalado no reboot |
+| **VyOS** | `add system image <url>` (HTTP/HTTPS/SCP/arquivo) | Não: baixa a ISO inteira, depois copia o squashfs |
+| **Junos** | `request system software add <url>` (FTP/SCP/HTTP) ou um arquivo em `/var/tmp` | Não: o pacote vai para `/var/tmp` primeiro |
+| **IOS-XE** | `copy` para a flash, depois `install add file` | Não: o pacote fica na flash |
+| **RAUC / SWUpdate / Mender** | bundle por HTTP, servidor de atualização ou API local | **Sim**: RAUC (bundle verity por HTTP range), SWUpdate e Mender gravam o stream direto na partição inativa |
+
+**Adotado:** o pacote vai pelo mesmo canal autenticado da GUI/CLI/MCP (sem abrir FTP/SFTP nem
+outra porta), em blocos que vão direto ao slot inativo como no RAUC/SWUpdate/Mender (o roteador não
+precisa de espaço para guardar o pacote — o `/config` tem 64 MiB e o pacote 34–41 MiB), com
+a assinatura conferida antes do primeiro byte. Os nomes seguem o MikroTik (Packages, check,
+install/reboot).
+
+**Melhor que os outros:** a atualização continua um **comando** (journal, permissão de grupo,
+MCP); um envio interrompido não deixa lixo no disco nem muda a caixa; e o `os push` fecha o
+ciclo de teste (build → envio → boot de teste → confirmação) num comando, medindo cada etapa.
+
+### Desempenho e paralelismo
+
+- **Por bloco**, com o lock do `Session`: conferir os parâmetros, decodificar o base64 e pôr na
+  fila. **Medido** (`cargo bench -p corerouter-engine --bench package_upload`): 587 µs por bloco
+  de 1 MiB (1,66 GiB/s, com o build da imagem rodando ao lado), uma vez por MiB enviado. O parse da linha JSON acontece antes, na thread da conexão.
+- **Gravação:** a mesma da G1.6b — uma thread lê do fluxo e hasheia, outra grava (4 buffers de
+  1 MiB); a releitura com a árvore do dm-verity usa até 8 threads. O envio pela rede e a
+  gravação andam em paralelo (a fila de 8 blocos é o colchão): o tempo total é o do mais lento.
+- **Um bloco em voo por vez** (pedido e resposta): na rede local isso não é o gargalo
+  (abaixo); numa WAN de alta latência valeria mandar vários antes da resposta. Fica como ideia,
+  sem gap, até alguém atualizar por uma WAN lenta.
+- **Não paraleliza mais:** a ordem dos bytes é obrigatória (hash em fluxo, slot gravado em
+  sequência) e um envio por vez é regra da atualização.
+
+### Números
+
+**Medidos** em 2026-10-28, AMD Ryzen AI Max+ 395 (32 threads), build release, com outras sessões
+usando a máquina.
+
+| O quê | Valor |
+|---|---|
+| Pacote de hoje | 41,0 MiB (kernel 19,1 + rootfs 21,9) |
+| Envio no laboratório virtual (canal local, TCP em loopback) | 41,0 MiB em 0,27 s (152 MiB/s); gravado e conferido 0,88 s depois do início |
+| Envio pela GUI (debug, sem GPU, Xvfb) para o laboratório | 41,0 MiB em ~4,7 s (um bloco por quadro da janela) |
+| Envio por TLS para o QEMU (KVM, rede de usuário, CLI release) | 41,0 MiB em 2,16 s (19 MiB/s; o gargalo é a rede de usuário do QEMU); gravado e relido 3,17 s depois do início |
+| `ab-test --scenario push`: envio → B confirmado (relógio do CLI) | 25,6 s (10 s são a carência da confirmação automática) |
+| `os build` incremental (só o daemon mudou), completo | 184 s (`make all` 150 s) |
+| `os build --only crpkg`, mesma mudança | 127 s (`make all` 110 s, dos quais 100 s são o cargo release do daemon com LTO); −57 s, −31% |
+| `os push` inteiro (build `--only crpkg` + envio + reboot + confirmação) | ~153 s (**estimado**: soma das duas linhas medidas acima) |
+| Build frio da imagem numa worktree nova (downloads em cache) | 1207 s |
+
+O que sobra do ciclo é o cargo release do daemon; um perfil de build sem LTO para o ciclo de
+teste encurtaria isso, mas o binário testado deixaria de ser o de produção: não entrou.

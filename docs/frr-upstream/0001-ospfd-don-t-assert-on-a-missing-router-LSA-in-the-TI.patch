@@ -1,0 +1,50 @@
+From 4a771711841f9bd6ec603fd6ca8ecee97f888d60 Mon Sep 17 00:00:00 2001
+From: Valdijanio Vieira <48389119+valdijanio@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 19:57:36 -0300
+Subject: [PATCH 1/2] ospfd: don't assert on a missing router-LSA in the TI-LFA
+ reverse SPF
+
+With "fast-reroute ti-lfa", ospf_ti_lfa_generate_q_spaces() builds each
+Q space as a reverse SPF tree (area->spf_reversed). For a point-to-point
+link V->W, ospf_spf_next() reads the reverse distance from W's
+router-LSA in get_reverse_distance() before it checks that W's LSA is in
+the LSDB at all (RFC 2328 16.1 (2b), the "w_lsa == NULL" check a few
+lines below). When V's router-LSA already advertises a link to a router
+whose own router-LSA is not in the LSDB (it has not arrived yet while
+adjacencies come up, or it was flushed), the lookup returns NULL and
+ospfd aborts:
+
+  ospf_spf.c:1269: get_reverse_distance(): assertion (w_lsa && w_lsa->data) failed
+
+The forward SPF just skips W in that case. Do the same in the reverse
+SPF: only read the reverse distance when the LSA was found, and let the
+existing check skip W.
+
+Signed-off-by: Valdijanio Vieira <48389119+valdijanio@users.noreply.github.com>
+---
+ ospfd/ospf_spf.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/ospfd/ospf_spf.c b/ospfd/ospf_spf.c
+index eee48fe392..c3d2e62d10 100644
+--- a/ospfd/ospf_spf.c
++++ b/ospfd/ospf_spf.c
+@@ -1404,9 +1404,14 @@ static void ospf_spf_next(struct vertex *v, struct ospf_area *area,
+ 			/*
+ 			 * For TI-LFA we might need the reverse SPF.
+ 			 * Currently only works with P2P!
++			 *
++			 * W's router-LSA may not be in the LSDB (not received
++			 * yet, or already flushed) while V still advertises
++			 * the link: then there is no reverse distance to read,
++			 * and the check below skips W, as the forward SPF does.
+ 			 */
+ 			if (type == LSA_LINK_TYPE_POINTOPOINT
+-			    && area->spf_reversed)
++			    && area->spf_reversed && w_lsa)
+ 				link_distance =
+ 					get_reverse_distance(v, l, w_lsa);
+ 			else
+-- 
+2.43.0
+

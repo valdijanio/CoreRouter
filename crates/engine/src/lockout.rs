@@ -1,0 +1,624 @@
+//! Lockout check (G2.1b): before a firewall change reaches the data plane,
+//! would it cut the management connection that sent it?
+//!
+//! The control channel tells the engine which TCP connection each caller
+//! is ([`Link`]: its peer and our local address). At commit time the
+//! connection's packets are walked through the running and the candidate
+//! firewall (`corerouter_firewall::eval`):
+//!
+//! - its packets and our replies in raw `prerouting`/`output` (G2.1c; a
+//!   `notrack` there turns the filter's view into `untracked`),
+//! - its established packets in `input` (the session itself),
+//! - a new connection from the same address to the same port (logging in
+//!   again after this session ends),
+//! - our replies in `output`,
+//! - the new connection in `dstnat` (a redirect would send it elsewhere).
+//!
+//! Each walk sees the interface that holds our address in *that* config,
+//! and a change that takes the address away (removed, disabled, or its
+//! interface disabled) is refused as well: no packet reaches us then.
+//!
+//! If the candidate drops one of them and the running config did not, the
+//! commit is refused with the rule that would do it, unless the command
+//! said `force: true` (or Safe Mode is on: then losing the connection
+//! already undoes the change). Callers inside the process (the GUI lab,
+//! tests, `corerouter-cli run`) have no connection to lose.
+//!
+//! G1.5b: a route that drops the caller's replies (`blackhole`,
+//! `unreachable`, `prohibit`, more specific than the way back) is refused
+//! the same way ([`discard_for`]).
+//!
+//! G1.6p: a browser's session comes through `www-ssl`. Changing the service
+//! leaves the open connection up, but the next login comes through it too:
+//! turning it off, moving it or leaving the caller's address out of
+//! `available_from` is refused the same way ([`service_cut`]).
+
+use std::net::{IpAddr, SocketAddr};
+
+use corerouter_firewall::eval::{Outcome, Packet, Verdict, walk};
+use corerouter_model::route::{self, Reach};
+use corerouter_model::{Config, IfName, RouteEntry, RoutingTable};
+use corerouter_model::firewall::{ConnState, DynamicAddress, Protocol, Table};
+use corerouter_model::web::WebListener;
+use serde_json::Value;
+
+use crate::cmd::args::opt_bool;
+use crate::cmd::firewall::summary;
+use crate::{EngineError, Result, Session};
+
+/// The TCP connection behind a control-channel caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Link {
+    pub peer: SocketAddr,
+    pub local: SocketAddr,
+}
+
+/// `::ffff:10.0.0.1` (a dual-stack socket) is 10.0.0.1 to the firewall.
+pub(crate) fn plain(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+/// The interface that holds our local address: `lo` for loopback, else the
+/// one the config gives the address to (`None` if no interface has it).
+pub fn local_interface(cfg: &Config, local: IpAddr) -> Option<String> {
+    if local.is_loopback() {
+        return Some("lo".into());
+    }
+    cfg.ip
+        .addresses
+        .iter()
+        .find(|a| !a.disabled && a.address.addr() == local)
+        .map(|a| a.interface.as_str().to_owned())
+}
+
+/// Marks the current command as acknowledging a lockout (`force: true`).
+pub(crate) fn take_force(s: &mut Session, p: &Value) -> Result<()> {
+    if opt_bool(p, "force")?.unwrap_or(false) {
+        s.lockout_ack = true;
+    }
+    Ok(())
+}
+
+const HOW_TO_PROCEED: &str = "Enter Safe Mode first \
+     (config.safe-mode.enter: if the connection is lost the change is undone), \
+     or repeat with force=true (transactional mode: config.commit force=true)";
+
+struct Probe {
+    what: &'static str,
+    table: Table,
+    chain: &'static str,
+    packet: Packet,
+}
+
+/// The interface the caller's packets come in on (and our replies leave
+/// by): the one routing points at for `peer`, in the table of the
+/// interface that holds `local`. With management on a loopback /32 the
+/// connection still arrives on the WAN port, not on `lo0` (audit-net).
+/// `local_interface` when nothing routes to the peer.
+fn ingress_interface(cfg: &Config, peer: IpAddr, local: IpAddr) -> Option<String> {
+    let holder = local_interface(cfg, local);
+    if local.is_loopback() {
+        return holder;
+    }
+    way_back(cfg, peer, local).or(holder)
+}
+
+/// The interface routing points at for `peer` (the way back to the
+/// caller), in the table of the interface that holds `local`; `None` when
+/// no connected network nor active route reaches it.
+fn way_back(cfg: &Config, peer: IpAddr, local: IpAddr) -> Option<String> {
+    let holder = local_interface(cfg, local);
+    let table = holder
+        .as_deref()
+        .and_then(|h| h.parse::<IfName>().ok())
+        .map_or(RoutingTable::Main, |h| route::table_of(cfg, &h));
+    route_out(cfg, peer, &table)
+}
+
+/// The interface routing sends `peer` out of in `table`: the longest
+/// enabled connected network or active route (the packet tester uses it
+/// too, G2.1c).
+pub(crate) fn route_out(cfg: &Config, peer: IpAddr, table: &RoutingTable) -> Option<String> {
+    match best_way(cfg, peer, table, false)? {
+        Way::Link(link) => Some(link.as_str().to_owned()),
+        Way::Discard(_) => None,
+    }
+}
+
+/// What routing does with a packet to `peer`.
+pub(crate) enum Way<'a> {
+    Link(IfName),
+    Discard(&'a RouteEntry),
+}
+
+/// The longest enabled connected network or active route to `peer` in
+/// `table`; discard routes (G1.5a) compete only with `discards`.
+pub(crate) fn best_way<'a>(
+    cfg: &'a Config,
+    peer: IpAddr,
+    table: &RoutingTable,
+    discards: bool,
+) -> Option<Way<'a>> {
+    // Longest prefix wins; a connected network beats a route of the same
+    // length (distance 0), then the lower distance.
+    let mut best: Option<(u8, u8, Way<'a>)> = None;
+    let mut consider = |len: u8, distance: u8, way: Way<'a>| {
+        let better = best
+            .as_ref()
+            .is_none_or(|(l, d, _)| len > *l || (len == *l && distance < *d));
+        if better {
+            best = Some((len, distance, way));
+        }
+    };
+    for a in &cfg.ip.addresses {
+        if !a.disabled
+            && a.address.contains(&peer)
+            && route::is_up(cfg, &a.interface)
+            && route::table_of(cfg, &a.interface) == *table
+        {
+            consider(a.address.prefix_len(), 0, Way::Link(a.interface.clone()));
+        }
+    }
+    for r in &cfg.ip.routes {
+        if r.routing_table != *table || !r.dst_address.contains(&peer) {
+            continue;
+        }
+        match route::reach(cfg, r) {
+            Reach::Active { link, .. } => {
+                consider(r.dst_address.prefix_len(), r.distance, Way::Link(link));
+            }
+            Reach::Discard(_) if discards => {
+                consider(r.dst_address.prefix_len(), r.distance, Way::Discard(r));
+            }
+            _ => {}
+        }
+    }
+    best.map(|(_, _, way)| way)
+}
+
+/// G1.5b: the discard route that takes the replies to `peer`, the caller, in
+/// the table the routing rules choose for them. The connection still
+/// reaches the router (its addresses are in the local table, looked up
+/// first), but nothing comes back: from the operator's side it hangs.
+pub(crate) fn discard_for(cfg: &Config, peer: IpAddr, local: IpAddr) -> Option<&RouteEntry> {
+    let table = crate::policy_rule::reply_table(cfg, peer, local)?;
+    match best_way(cfg, peer, &table, true)? {
+        Way::Discard(r) => Some(r),
+        Way::Link(_) => None,
+    }
+}
+
+/// The connection's two addresses, as the firewall and routing see them.
+pub(crate) fn plain_ends(link: &Link) -> (IpAddr, IpAddr) {
+    (plain(link.peer.ip()), plain(link.local.ip()))
+}
+
+/// The addresses of `cfg` this connection depends on (G1.28), with why:
+/// the one it connects to, and the connected network it arrives through.
+/// Taking one of them away (remove, disable, move) is refused without
+/// `force` or Safe Mode. Only these few are checked, so a long list costs
+/// one pass.
+pub fn access_addresses(cfg: &Config, link: &Link) -> Vec<(corerouter_model::ItemId, String)> {
+    let (peer, local) = (plain(link.peer.ip()), plain(link.local.ip()));
+    if local.is_loopback() {
+        return Vec::new();
+    }
+    let via = way_back(cfg, peer, local);
+    cfg.ip
+        .addresses
+        .iter()
+        .filter(|a| !a.disabled)
+        .filter_map(|a| {
+            let why = if a.address.addr() == local {
+                format!("this session (tcp {} -> {}) connects to this address", link.peer, link.local)
+            } else if a.address.contains(&peer) && via.as_deref() == Some(a.interface.as_str()) {
+                format!(
+                    "this session (tcp {} -> {}) arrives through this network on {}",
+                    link.peer, link.local, a.interface
+                )
+            } else {
+                return None;
+            };
+            Some((a.id, why))
+        })
+        .collect()
+}
+
+/// Whether this connection, which came in through `table` (its local
+/// address's VRF, or main), came in through listener `w`: the port, an
+/// address that covers ours, and the VRF (G3.4zb: a listener bound to a
+/// VRF only takes that VRF's connections; an unbound one in main may take a
+/// VRF's too, with `tcp_l3mdev_accept`). The listeners are the only sockets
+/// on their port.
+pub(crate) fn comes_through(w: &WebListener, link: &Link, table: &RoutingTable) -> bool {
+    w.enabled
+        && w.port == link.local.port()
+        && (w.address.is_unspecified() || plain(w.address) == plain(link.local.ip()))
+        && (w.vrf.is_main() || w.vrf == *table)
+}
+
+/// What changing `www-ssl` from `before` to `after` does to the caller's next
+/// login, when this session comes through it (G1.6p); `None`: nothing.
+pub(crate) fn service_cut(
+    before: &WebListener,
+    after: &WebListener,
+    link: &Link,
+    table: &RoutingTable,
+) -> Option<String> {
+    if !comes_through(before, link, table) {
+        return None;
+    }
+    // A session of a VRF reached an unbound main listener only because the
+    // kernel lets it (`tcp_l3mdev_accept`); moved to another VRF it cannot.
+    let vrf_ok = after.vrf == *table || (after.vrf.is_main() && (table.is_main() || before.vrf.is_main()));
+    let moved;
+    let what = if !after.enabled {
+        "would turn off www-ssl"
+    } else if !vrf_ok {
+        moved = format!(
+            "would move www-ssl to {}, and this session comes in through {}",
+            if after.vrf.is_main() { "main".to_owned() } else { format!("VRF {}", after.vrf) },
+            if table.is_main() { "main".to_owned() } else { format!("VRF {table}") }
+        );
+        moved.as_str()
+    } else if !comes_through(after, link, table) {
+        "would move www-ssl away from the address and port"
+    } else if !after.allows(link.peer.ip()) {
+        "would leave your address out of the available_from of www-ssl"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "{what}, which this session uses (tcp {} -> {}): this connection stays up, but the next \
+         login from here would find nothing. {HOW_TO_PROCEED}",
+        link.peer, link.local
+    ))
+}
+
+fn probes(cfg: &Config, dynamic: &[DynamicAddress], link: &Link) -> Vec<Probe> {
+    let (peer, local) = (plain(link.peer.ip()), plain(link.local.ip()));
+    let iface = ingress_interface(cfg, peer, local);
+    let packet = |state| Packet {
+        src: peer,
+        dst: local,
+        protocol: Protocol::TCP,
+        src_port: Some(link.peer.port()),
+        dst_port: Some(link.local.port()),
+        icmp: None,
+        in_interface: iface.clone(),
+        out_interface: None,
+        state,
+        nat: None,
+    };
+    // A raw `notrack` makes the filter see the packets as untracked (an
+    // `accept established` no longer takes them).
+    let untracked = |chain, p: Packet| {
+        if walk(cfg, dynamic, Table::Raw, chain, &p).verdict == Verdict::Notrack {
+            Packet {
+                state: ConnState::Untracked,
+                ..p
+            }
+        } else {
+            p
+        }
+    };
+    let inbound = |state| untracked("prerouting", packet(state));
+    let reply = Packet {
+        src: local,
+        dst: peer,
+        protocol: Protocol::TCP,
+        src_port: Some(link.local.port()),
+        dst_port: Some(link.peer.port()),
+        icmp: None,
+        in_interface: None,
+        out_interface: iface.clone(),
+        state: ConnState::Established,
+        nat: None,
+    };
+    vec![
+        Probe {
+            what: "would drop this connection before connection tracking",
+            table: Table::Raw,
+            chain: "prerouting",
+            packet: packet(ConnState::Established),
+        },
+        Probe {
+            what: "would drop the replies to this connection before connection tracking",
+            table: Table::Raw,
+            chain: "output",
+            packet: reply.clone(),
+        },
+        Probe {
+            what: "would drop this connection",
+            table: Table::Filter,
+            chain: "input",
+            packet: inbound(ConnState::Established),
+        },
+        Probe {
+            what: "would drop the replies to this connection",
+            table: Table::Filter,
+            chain: "output",
+            packet: untracked("output", reply),
+        },
+        Probe {
+            what: "would refuse a new login from your address (after this session ends)",
+            table: Table::Filter,
+            chain: "input",
+            packet: inbound(ConnState::New),
+        },
+        Probe {
+            what: "would redirect a new login from your address elsewhere (dst-nat)",
+            table: Table::Nat,
+            chain: "dstnat",
+            packet: inbound(ConnState::New),
+        },
+    ]
+}
+
+fn cut(table: Table, o: Outcome) -> bool {
+    match table {
+        Table::Nat => o.verdict == Verdict::Nat,
+        _ => o.verdict.blocks(),
+    }
+}
+
+impl Session {
+    /// The dynamic address-list entries as the data plane holds them.
+    pub(crate) fn dynamic_now(&self) -> Vec<DynamicAddress> {
+        let now = self.steady_now();
+        self.dynamic_addresses
+            .entries()
+            .iter()
+            .map(|e| e.data_plane(now))
+            .collect()
+    }
+
+    /// Refuse going from `before` (+ `dyn_before`) to `after` (+ `dyn_after`)
+    /// if that cuts the caller's connection; see the module docs.
+    pub(crate) fn check_lockout(
+        &self,
+        before: &Config,
+        after: &Config,
+        dyn_before: &[DynamicAddress],
+        dyn_after: &[DynamicAddress],
+    ) -> Result<()> {
+        if self.lockout_ack || self.in_safe_mode() {
+            return Ok(());
+        }
+        match self.lockout_reason(before, after, dyn_before, dyn_after) {
+            Some(why) => Err(EngineError::Lockout(why)),
+            None => Ok(()),
+        }
+    }
+
+    /// Why going from `before` to `after` would cut the caller's
+    /// connection, whatever `force` and Safe Mode say (a preview asks
+    /// before the change is sent, G1.28). `None`: it would not, or the
+    /// caller has no connection.
+    pub(crate) fn lockout_reason(
+        &self,
+        before: &Config,
+        after: &Config,
+        dyn_before: &[DynamicAddress],
+        dyn_after: &[DynamicAddress],
+    ) -> Option<String> {
+        let link = self.caller().link?;
+        let table = crate::mgmt_guard::table_of_local(before, link.local.ip());
+        if let Some(why) = service_cut(&before.system.web.www_ssl, &after.system.web.www_ssl, &link, &table) {
+            return Some(why);
+        }
+        // G3.4z: the guard that keeps a learned route off this session.
+        if let Some(why) = crate::mgmt_guard::unguard_cut(self, before, after, &link) {
+            return Some(format!("{why}. {HOW_TO_PROCEED}"));
+        }
+        let local = plain(link.local.ip());
+        let (iface_before, iface_after) =
+            (local_interface(before, local), local_interface(after, local));
+        let up = |cfg: &Config, iface: &Option<String>| {
+            iface.as_deref().is_none_or(|name| {
+                cfg.interfaces
+                    .values()
+                    .find(|i| i.name.as_str() == name)
+                    .is_none_or(|i| !i.disabled)
+            })
+        };
+        // The address itself goes away, or its interface goes down.
+        if let Some(was_on) = &iface_before
+            && up(before, &iface_before)
+        {
+            let lost = match &iface_after {
+                None => Some(format!("would remove or disable {local}, the address")),
+                Some(on) if !up(after, &iface_after) => {
+                    Some(format!("would disable {on}, the interface holding {local},"))
+                }
+                Some(_) => None,
+            };
+            if let Some(what) = lost {
+                return Some(format!(
+                    "{what} this connection uses (tcp {} -> {} on {was_on}). {}",
+                    link.peer, link.local, HOW_TO_PROCEED
+                ));
+            }
+        }
+        // The way back goes: the connected network (or route) the caller's
+        // packets arrive through, removed or disabled (G1.28).
+        let peer = plain(link.peer.ip());
+        // G1.5b: a blackhole, unreachable or prohibit route takes them first.
+        if !local.is_loopback()
+            && let Some(r) = discard_for(after, peer, local)
+            && discard_for(before, peer, local).is_none()
+        {
+            let kind = r.gateway.discards().map_or("discard", |d| d.as_str());
+            return Some(format!(
+                "the {kind} route {} would drop the replies to {peer}, where this connection \
+                 comes from (tcp {} -> {}). {HOW_TO_PROCEED}",
+                r.dst_address, link.peer, link.local
+            ));
+        }
+        if !local.is_loopback()
+            && let Some(was) = way_back(before, peer, local)
+            && way_back(after, peer, local).is_none()
+        {
+            return Some(format!(
+                "would remove the way back to {peer} (the network or route on {was}) this \
+                 connection uses (tcp {} -> {}). {HOW_TO_PROCEED}",
+                link.peer, link.local
+            ));
+        }
+        // G1.31b: the session comes through a WireGuard tunnel whose key,
+        // port or peer changes.
+        if !local.is_loopback()
+            && let Some(wg) = way_back(before, peer, local).and_then(|w| w.parse::<IfName>().ok())
+            && let Some(why) = crate::wireguard::tunnel_cut(before, after, &wg, peer)
+        {
+            return Some(format!("{why} (tcp {} -> {}). {HOW_TO_PROCEED}", link.peer, link.local));
+        }
+        // G2.5a: the XDP filter drops in the driver, before any rule.
+        let ingress = ingress_interface(after, peer, local);
+        if let Some(list) = crate::xdp::blocks(after, dyn_after, ingress.as_deref(), peer) {
+            let was = ingress_interface(before, peer, local);
+            if crate::xdp::blocks(before, dyn_before, was.as_deref(), peer).is_none() {
+                return Some(format!(
+                    "the XDP filter would drop {peer}, which is in its block list '{list}' \
+                     (tcp {} -> {}); put it in an allow list (ip.firewall.xdp.set allow_lists). \
+                     {HOW_TO_PROCEED}",
+                    link.peer, link.local
+                ));
+            }
+        }
+        // G1.27e: a routing rule takes the replies away.
+        if let Some(why) = crate::policy_rule::reply_cut(before, after, &link) {
+            return Some(format!("{why}. {HOW_TO_PROCEED}"));
+        }
+        let same = before.ip.firewall == after.ip.firewall
+            && before.interface_lists == after.interface_lists
+            && dyn_before == dyn_after
+            && iface_before == iface_after;
+        if same {
+            return None;
+        }
+        firewall_cut(before, after, dyn_before, dyn_after, &link)
+            .map(|why| format!("{why}. {HOW_TO_PROCEED}"))
+    }
+}
+
+/// The first of `link`'s packets (see [`probes`]) that the firewall of
+/// `after` drops and the one of `before` did not, said as the rule (or
+/// policy) that does it; `None`: none.
+pub(crate) fn firewall_cut(
+    before: &Config,
+    after: &Config,
+    dyn_before: &[DynamicAddress],
+    dyn_after: &[DynamicAddress],
+    link: &Link,
+) -> Option<String> {
+    let was_probes = probes(before, dyn_before, link);
+    for (probe, old) in probes(after, dyn_after, link).into_iter().zip(was_probes) {
+        let now = walk(after, dyn_after, probe.table, probe.chain, &probe.packet);
+        let was = walk(before, dyn_before, old.table, old.chain, &old.packet);
+        if !cut(probe.table, now) || cut(probe.table, was) {
+            continue;
+        }
+        let by = match now.rule.and_then(|id| {
+            after
+                .ip
+                .firewall
+                .rules(probe.table)
+                .iter()
+                .find(|r| r.id == id)
+        }) {
+            Some(r) => format!("{} rule {} ({})", probe.table, r.id, summary(r)),
+            None => format!("the {} policy", probe.chain),
+        };
+        let via = probe
+            .packet
+            .in_interface
+            .as_deref()
+            .map(|i| format!(" on {i}"))
+            .unwrap_or_default();
+        return Some(format!(
+            "{by} {} (tcp {} -> {}{via})",
+            probe.what, link.peer, link.local
+        ));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_service_cuts_only_the_session_it_carries() {
+        let link = Link { peer: "192.0.2.7:50000".parse().unwrap(), local: "192.0.2.1:443".parse().unwrap() };
+        let on = WebListener { enabled: true, ..corerouter_model::web::WebService::factory().www_ssl };
+        let with = |f: &dyn Fn(&mut WebListener)| {
+            let mut w = on.clone();
+            f(&mut w);
+            w
+        };
+        let main = RoutingTable::Main;
+        assert!(comes_through(&on, &link, &main), "every address, port 443");
+        // Unchanged, or a change that still lets this client back in.
+        assert_eq!(service_cut(&on, &on, &link, &main), None);
+        let ok = with(&|w| w.available_from = vec!["192.0.2.0/24".parse().unwrap()]);
+        assert_eq!(service_cut(&on, &ok, &link, &main), None);
+        let ok = with(&|w| w.address = "192.0.2.1".parse().unwrap());
+        assert_eq!(service_cut(&on, &ok, &link, &main), None);
+        // Each way of losing the next login.
+        for (after, says) in [
+            (with(&|w| w.enabled = false), "turn off"),
+            (with(&|w| w.port = 8443), "move"),
+            (with(&|w| w.address = "192.0.2.9".parse().unwrap()), "move"),
+            (with(&|w| w.available_from = vec!["198.51.100.0/24".parse().unwrap()]), "leave your address out"),
+        ] {
+            let why = service_cut(&on, &after, &link, &main).unwrap();
+            assert!(why.contains(says) && why.contains("Safe Mode"), "{why}");
+        }
+        // Another session (the TLS control port): the service is not its way in.
+        let other = Link { local: "192.0.2.1:8729".parse().unwrap(), ..link };
+        assert_eq!(service_cut(&on, &with(&|w| w.enabled = false), &other, &main), None);
+        // Off before: nothing to lose.
+        assert_eq!(service_cut(&with(&|w| w.enabled = false), &on, &link, &main), None);
+    }
+
+    /// G3.4zb: the VRF of www-ssl and the VRF a session comes in through.
+    #[test]
+    fn moving_www_ssl_to_another_vrf_cuts_the_session_of_this_one() {
+        let link = Link { peer: "10.99.0.2:50000".parse().unwrap(), local: "10.99.0.1:443".parse().unwrap() };
+        let mgmt: RoutingTable = "mgmt".parse().unwrap();
+        let main = RoutingTable::Main;
+        let on = WebListener { enabled: true, ..corerouter_model::web::WebService::factory().www_ssl };
+        let in_vrf = |v: &RoutingTable| WebListener { vrf: v.clone(), ..on.clone() };
+        // A main session: moving the service into a VRF cuts it.
+        let why = service_cut(&on, &in_vrf(&mgmt), &link, &main).unwrap();
+        assert!(why.contains("to VRF mgmt") && why.contains("through main"), "{why}");
+        // A session of the VRF: into its own VRF is fine, into another is not.
+        assert_eq!(service_cut(&on, &in_vrf(&mgmt), &link, &mgmt), None);
+        let blue: RoutingTable = "blue".parse().unwrap();
+        assert!(service_cut(&in_vrf(&mgmt), &in_vrf(&blue), &link, &mgmt).unwrap().contains("to VRF blue"));
+        // Back to main from the VRF: an unbound listener does not take the
+        // VRF's connections by default (tcp_l3mdev_accept=0).
+        assert!(service_cut(&in_vrf(&mgmt), &on, &link, &mgmt).unwrap().contains("to main"));
+        // A listener of another VRF never carried this session.
+        assert!(!comes_through(&in_vrf(&blue), &link, &mgmt));
+        assert_eq!(service_cut(&in_vrf(&blue), &on, &link, &mgmt), None);
+    }
+
+    #[test]
+    fn mapped_addresses_and_interfaces() {
+        assert_eq!(
+            plain("::ffff:10.0.0.1".parse().unwrap()),
+            "10.0.0.1".parse::<IpAddr>().unwrap()
+        );
+        let cfg = Config::default();
+        assert_eq!(
+            local_interface(&cfg, "127.0.0.1".parse().unwrap()).as_deref(),
+            Some("lo")
+        );
+        assert_eq!(local_interface(&cfg, "192.0.2.1".parse().unwrap()), None);
+    }
+}

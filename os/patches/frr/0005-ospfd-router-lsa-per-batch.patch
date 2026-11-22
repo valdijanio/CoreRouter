@@ -1,0 +1,177 @@
+From: CoreRouter <noreply@corerouter>
+Subject: [PATCH] ospfd: one router-LSA per configuration batch, not one per
+ interface
+
+Each interface that comes up or goes down originates a new router-LSA at
+once (ism_change_state() -> ospf_router_lsa_update_area()), and building,
+installing and flooding it walks all the interfaces of the area: the
+links, ospf_ls_retransmit_delete_nbr_area(), ospf_discard_from_db() and
+the flooding. Configuring OSPF on thousands of interfaces, or taking it
+off, is then quadratic: with 10000 interfaces the batch that enables them
+took 22 s, almost all of it in these refreshes, and originated 10000
+instances of the router-LSA.
+
+While a configuration batch is read (between ospf_config_start() and
+ospf_config_end(), the callbacks of XFRR_start/end_configuration), let
+the new router-LSA wait for the end of the batch, at most
+OSPF_ROUTER_LSA_BATCH_DELAY (1 s) if the batch does not end. Outside a
+batch nothing changes. Neighbors would discard most of those instances
+anyway, as they arrive within MinLSArrival of each other (RFC 2328,
+section 13, step 5a), and section 12.4 limits a router to one new instance
+of an LSA per MinLSInterval.
+
+Measured with 10000 interfaces, on top of the lib change and the index:
+the batch that enables OSPF on them takes 2.3 s instead of 22.2 s and
+leaves the router-LSA at sequence 0x80000003 (0x80002710 before); the
+one that takes it off, 10.5 s instead of 27.2 s.
+
+G3.4q (docs/frr-many-interfaces.md): the same patch sent to FRR
+(docs/frr-upstream/ospfd-many-interfaces/), applied to 10.7.1. To be
+dropped once the image carries an FRR with it.
+---
+ ospfd/ospf_lsa.c  | 54 +++++++++++++++++++++++++++++++++++++++++++++--
+ ospfd/ospf_lsa.h  |  2 ++
+ ospfd/ospf_main.c |  3 +++
+ ospfd/ospfd.c     |  1 +
+ ospfd/ospfd.h     |  1 +
+ 5 files changed, 59 insertions(+), 2 deletions(-)
+
+diff --git a/ospfd/ospf_lsa.c b/ospfd/ospf_lsa.c
+index 7b941b59c5..c28cf6b595 100644
+--- a/ospfd/ospf_lsa.c
++++ b/ospfd/ospf_lsa.c
+@@ -996,8 +996,60 @@ static struct ospf_lsa *ospf_router_lsa_refresh(struct ospf_lsa *lsa)
+ 	return NULL;
+ }
+ 
++/*
++ * While a configuration is read in a batch (XFRR_start_configuration to
++ * XFRR_end_configuration: "vtysh -b", "vtysh -f", frr-reload), a new
++ * router-LSA waits for the end of the batch, at most
++ * OSPF_ROUTER_LSA_BATCH_DELAY ms. Each interface that comes up or goes
++ * down changes the router-LSA, and building, installing and flooding it
++ * walks all the interfaces of the area: one new instance per interface is
++ * quadratic with thousands of interfaces, and MinLSArrival makes the
++ * neighbors discard most of them anyway (RFC 2328, section 13).
++ */
++#define OSPF_ROUTER_LSA_BATCH_DELAY 1000
++static bool router_lsa_batch;
++
++static void ospf_router_lsa_update_area_now(struct ospf_area *area);
++
++static void ospf_router_lsa_batch_timer(struct event *t)
++{
++	ospf_router_lsa_update_area_now(EVENT_ARG(t));
++}
++
++void ospf_router_lsa_batch_start(void)
++{
++	router_lsa_batch = true;
++}
++
++void ospf_router_lsa_batch_end(void)
++{
++	struct listnode *node, *anode;
++	struct ospf *ospf;
++	struct ospf_area *area;
++
++	router_lsa_batch = false;
++	for (ALL_LIST_ELEMENTS_RO(om->ospf, node, ospf))
++		for (ALL_LIST_ELEMENTS_RO(ospf->areas, anode, area))
++			if (event_is_scheduled(area->t_router_lsa_update))
++				ospf_router_lsa_update_area_now(area);
++}
++
+ int ospf_router_lsa_update_area(struct ospf_area *area)
+ {
++	if (router_lsa_batch) {
++		event_add_timer_msec(master, ospf_router_lsa_batch_timer, area,
++				     OSPF_ROUTER_LSA_BATCH_DELAY, &area->t_router_lsa_update);
++		return 0;
++	}
++
++	ospf_router_lsa_update_area_now(area);
++	return 0;
++}
++
++static void ospf_router_lsa_update_area_now(struct ospf_area *area)
++{
++	event_cancel(&area->t_router_lsa_update);
++
+ 	if (IS_DEBUG_OSPF_EVENT)
+ 		zlog_debug("[router-LSA]: (router-LSA area update)");
+ 
+@@ -1007,8 +1059,6 @@ int ospf_router_lsa_update_area(struct ospf_area *area)
+ 	/* Newly originate router-LSA. */
+ 	else
+ 		ospf_router_lsa_originate(area);
+-
+-	return 0;
+ }
+ 
+ int ospf_router_lsa_update(struct ospf *ospf)
+diff --git a/ospfd/ospf_lsa.h b/ospfd/ospf_lsa.h
+index d5fb9d7849..747e4353ad 100644
+--- a/ospfd/ospf_lsa.h
++++ b/ospfd/ospf_lsa.h
+@@ -261,6 +261,8 @@ extern void ospf_router_lsa_body_set(struct stream **s, struct ospf_area *area);
+ extern uint8_t router_lsa_flags(struct ospf_area *area);
+ extern int ospf_router_lsa_update(struct ospf *ospf);
+ extern int ospf_router_lsa_update_area(struct ospf_area *area);
++extern void ospf_router_lsa_batch_start(void);
++extern void ospf_router_lsa_batch_end(void);
+ 
+ extern void ospf_network_lsa_update(struct ospf_interface *oi);
+ 
+diff --git a/ospfd/ospf_main.c b/ospfd/ospf_main.c
+index d75214df96..97b80ccf8f 100644
+--- a/ospfd/ospf_main.c
++++ b/ospfd/ospf_main.c
+@@ -178,6 +178,7 @@ static void ospf_config_finish(struct event *t)
+ {
+ 	flog_err(EC_OSPF_CONFIG_TIMEOUT, "OSPF configuration end timer expired after %d seconds.",
+ 		 OSPF_PRE_CONFIG_MAX_WAIT_SECONDS);
++	ospf_router_lsa_batch_end();
+ }
+ 
+ static void ospf_config_start(struct vty *vty)
+@@ -187,6 +188,7 @@ static void ospf_config_start(struct vty *vty)
+ 		zlog_debug("ospfd config start callback received.");
+ 	event_add_timer(master, ospf_config_finish, NULL,
+ 			OSPF_PRE_CONFIG_MAX_WAIT_SECONDS, &t_ospf_cfg);
++	ospf_router_lsa_batch_start();
+ }
+ 
+ static void ospf_config_end(struct vty *vty)
+@@ -195,6 +197,7 @@ static void ospf_config_end(struct vty *vty)
+ 		zlog_debug("ospfd config end callback received.");
+ 
+ 	event_cancel(&t_ospf_cfg);
++	ospf_router_lsa_batch_end();
+ }
+ 
+ /* OSPFd main routine. */
+diff --git a/ospfd/ospfd.c b/ospfd/ospfd.c
+index 3bcec84736..bb51796abe 100644
+--- a/ospfd/ospfd.c
++++ b/ospfd/ospfd.c
+@@ -1011,6 +1011,7 @@ static void ospf_area_free(struct ospf_area *area)
+ 
+ 	/* Cancel timer. */
+ 	event_cancel(&area->t_stub_router);
++	event_cancel(&area->t_router_lsa_update);
+ 	event_cancel(&area->t_opaque_lsa_self);
+ 
+ 	if (OSPF_IS_AREA_BACKBONE(area))
+diff --git a/ospfd/ospfd.h b/ospfd/ospfd.h
+index fb09d07d8e..5e739f5938 100644
+--- a/ospfd/ospfd.h
++++ b/ospfd/ospfd.h
+@@ -625,6 +625,7 @@ struct ospf_area {
+ 
+ 	/* Threads. */
+ 	struct event *t_stub_router;	 /* Stub-router timer */
++	struct event *t_router_lsa_update; /* router-LSA, while reading config */
+ 	struct event *t_opaque_lsa_self; /* Type-10 Opaque-LSAs origin. */
+ 
+ 	/* Statistics field. */

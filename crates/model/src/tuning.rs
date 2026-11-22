@@ -1,0 +1,850 @@
+//! System › Tuning (G1.26): kernel and hardware settings for a box that
+//! forwards packets, applied by CoreRouter itself (no `tuned`, no
+//! `sysctl.conf`), so every change is a command with a transaction, Safe
+//! Mode, diff and rollback.
+//!
+//! The config keeps only what the operator (or a profile) set: a parameter
+//! missing from [`Tuning::sysctl`] is left as the kernel has it, and taking
+//! one out puts back the value the kernel had before CoreRouter first
+//! changed it. The exception is [`DEFAULTS`] (G1.26i): what a router needs
+//! to be one (it forwards), kept by CoreRouter until the config says
+//! otherwise. [`PARAMS`] is the catalog: which kernel parameters exist
+//! here, where the window shows them and the values they accept.
+//! [`PORT_PARAMS`] is the same for the settings of each port (G1.26b):
+//! rings, queues, interrupt coalescing, transmit queue and filter, kept in
+//! [`Tuning::ports`]; its offload and flow-control rows live in the port's
+//! `ethernet` settings (`interface.ethernet.set`, G1.20). [`CPU_PARAMS`]
+//! (G1.26c): the CPU frequency governor, the C-state limit (PM QoS) and the
+//! hardware watchdog, kept in [`Tuning::cpu`]; each port's IRQ affinity,
+//! RPS and XPS are port settings of section [`SEC_CPU_IRQ`].
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::types::IfName;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Tuning {
+    /// Kernel parameters by `sysctl` name (`net.core.netdev_max_backlog`):
+    /// the value to keep there. Only names of [`PARAMS`].
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub sysctl: BTreeMap<String, i64>,
+    /// Settings of each port (G1.26b), by [`PORT_PARAMS`] key
+    /// (`rx_ring`): the value to keep there.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub ports: BTreeMap<IfName, BTreeMap<String, i64>>,
+    /// CPU settings (G1.26c), by [`CPU_PARAMS`] key (`governor`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub cpu: BTreeMap<String, i64>,
+    /// Kernel command line of the next boot (G1.26d), by [`BOOT_PARAMS`]
+    /// name (`isolcpus` → `2-7`); checked by [`boot_value`].
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub boot: BTreeMap<String, String>,
+}
+
+impl Tuning {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The kernel parameters CoreRouter keeps under this config: the
+    /// [`DEFAULTS`], then what the config sets over them.
+    pub fn effective_sysctl(&self) -> BTreeMap<String, i64> {
+        let mut out: BTreeMap<String, i64> = DEFAULTS
+            .iter()
+            .map(|(n, v)| ((*n).to_owned(), *v))
+            .collect();
+        out.extend(self.sysctl.iter().map(|(n, v)| (n.clone(), *v)));
+        out
+    }
+}
+
+pub const IP_FORWARD: &str = "net.ipv4.ip_forward";
+pub const IPV6_FORWARDING: &str = "net.ipv6.conf.all.forwarding";
+
+/// What CoreRouter keeps in the kernel while the config does not set the
+/// parameter (G1.26i). A router is the node that forwards packets not
+/// addressed to itself (RFC 4861 §2.1; RFC 1812 §2.2.8.1), and RouterOS
+/// ships `/ip settings ip-forward=yes` and `/ipv6 settings forward=yes`.
+/// Linux boots as a host (RFC 1122 §3.1: the gateway function of a host
+/// MUST default to off), so a new install, and the live image, would not
+/// route before a profile was applied. `system.tuning.set` with 0 still
+/// turns either family off.
+///
+/// G3.4m: the routing daemons' multicast groups. `ospfd` joins
+/// AllSPFRouters (and AllDRouters as DR/BDR) on every OSPF interface
+/// through **one** socket, and Linux caps a socket at
+/// `igmp_max_memberships` groups (20 by default, net/ipv4/af_inet.c) and
+/// at `optmem_max` bytes of option memory (128 KiB, 48 B a group:
+/// net/ipv4/igmp.c `ip_mc_join_group`, net/core/sock.c `sock_kmalloc`).
+/// The 21st OSPF interface failed with ENOBUFS and stayed without an
+/// adjacency (ospfd retries only on a state change; measured in the lab
+/// of docs/ospf-stress.md). FRR's own advice is at least 1000
+/// (doc/user/Useful_Sysctl_Settings.md); 16 384 groups and 1 MiB cover
+/// 8 192 OSPF interfaces that are DR, IPv6 (ospf6d) included. These two
+/// are floors ([`AT_LEAST`]): a bigger value in the kernel is left alone.
+pub const DEFAULTS: &[(&str, i64)] = &[
+    (IP_FORWARD, 1),
+    (IPV6_FORWARDING, 1),
+    (IGMP_MAX_MEMBERSHIPS, 16_384),
+    (OPTMEM_MAX, 1 << 20),
+];
+
+pub const IGMP_MAX_MEMBERSHIPS: &str = "net.ipv4.igmp_max_memberships";
+pub const OPTMEM_MAX: &str = "net.core.optmem_max";
+
+/// The [`DEFAULTS`] that are a least value: the kernel keeps a bigger one.
+pub const AT_LEAST: &[&str] = &[IGMP_MAX_MEMBERSHIPS, OPTMEM_MAX];
+
+/// CoreRouter's own default of `name` (see [`DEFAULTS`]).
+pub fn default_of(name: &str) -> Option<i64> {
+    DEFAULTS.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+}
+
+/// Whether the kernel's `now` already satisfies CoreRouter's default
+/// `value` of `name`: equal, or at least it for an [`AT_LEAST`] one.
+pub fn default_holds(name: &str, value: i64, now: i64) -> bool {
+    now == value || (AT_LEAST.contains(&name) && now >= value)
+}
+
+/// Why CoreRouter keeps `name` (for the log).
+pub fn default_reason(name: &str) -> &'static str {
+    if AT_LEAST.contains(&name) {
+        "one multicast group per OSPF interface"
+    } else {
+        "a router forwards"
+    }
+}
+
+/// Tab of the Tuning window a parameter belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Tab {
+    Kernel,
+    Interfaces,
+    Cpu,
+    Boot,
+}
+
+/// One tunable kernel parameter (`/proc/sys/<name with / for .>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Param {
+    pub name: &'static str,
+    pub tab: Tab,
+    /// Group inside the tab (an English label).
+    pub section: &'static str,
+    pub min: i64,
+    pub max: i64,
+    /// `""`, `"B"`, `"KiB"`, `"s"`, `"µs"`, `"packets"`, `"entries"`.
+    pub unit: &'static str,
+    /// Named values (`rp_filter`: 0 off, 1 strict, 2 loose); empty for a
+    /// number.
+    pub choices: &'static [(i64, &'static str)],
+    /// The kernel's own default, when it is fixed (not computed from RAM).
+    pub default: Option<i64>,
+    /// Only the first network namespace has it (a container or a test
+    /// namespace does not).
+    pub init_ns_only: bool,
+    /// Kept by the kernel only for compatibility: writing it changes
+    /// nothing (`net.ipv4.route.max_size` since Linux 3.6).
+    pub obsolete: bool,
+    /// Affects the router's own sockets (BGP, the API), not forwarded
+    /// traffic.
+    pub control_plane: bool,
+    /// Changing it resets the port: the link goes down for a moment.
+    pub link_flap: bool,
+    /// Valid from the next boot only.
+    pub reboot: bool,
+    /// A port setting kept in the port's `ethernet` settings (offloads,
+    /// flow control: `interface.ethernet.set`), not in [`Tuning::ports`].
+    pub ethernet: bool,
+}
+
+const OFF_ON: &[(i64, &str)] = &[(0, "off"), (1, "on")];
+const RP_FILTER: &[(i64, &str)] = &[(0, "off"), (1, "strict"), (2, "loose")];
+const HASH: &[(i64, &str)] = &[
+    (0, "layer 3"),
+    (1, "layer 4"),
+    (2, "layer 3 inner"),
+    (3, "custom"),
+];
+const SYNCOOKIES: &[(i64, &str)] = &[(0, "off"), (1, "when needed"), (2, "always")];
+
+/// Largest value Linux keeps in an `int` sysctl.
+pub const INT_MAX: i64 = i32::MAX as i64;
+
+const fn p(
+    name: &'static str,
+    section: &'static str,
+    (min, max): (i64, i64),
+    unit: &'static str,
+    default: Option<i64>,
+) -> Param {
+    Param {
+        name,
+        tab: Tab::Kernel,
+        section,
+        min,
+        max,
+        unit,
+        choices: &[],
+        default,
+        init_ns_only: false,
+        obsolete: false,
+        control_plane: false,
+        link_flap: false,
+        reboot: false,
+        ethernet: false,
+    }
+}
+
+const fn choice(
+    name: &'static str,
+    section: &'static str,
+    choices: &'static [(i64, &'static str)],
+    default: i64,
+) -> Param {
+    let mut out = p(name, section, (0, (choices.len() as i64) - 1), "", Some(default));
+    out.choices = choices;
+    out
+}
+
+const fn init_ns(mut p: Param) -> Param {
+    p.init_ns_only = true;
+    p
+}
+
+const fn obsolete(mut p: Param) -> Param {
+    p.obsolete = true;
+    p
+}
+
+const fn control(mut p: Param) -> Param {
+    p.control_plane = true;
+    p
+}
+
+pub const SEC_RX: &str = "Packet receive";
+pub const SEC_ROUTING: &str = "Routing";
+pub const SEC_CONNTRACK: &str = "Connection tracking";
+pub const SEC_NEIGH: &str = "Neighbor tables";
+pub const SEC_STABILITY: &str = "Stability";
+pub const SEC_CONTROL: &str = "Control plane (TCP)";
+
+const CT: &str = "net.netfilter.nf_conntrack_";
+
+/// The kernel parameters of the Kernel tab, in display order.
+pub const PARAMS: &[Param] = &[
+    init_ns(p(
+        "net.core.netdev_max_backlog",
+        SEC_RX,
+        (64, 1 << 20),
+        "packets",
+        Some(1000),
+    )),
+    init_ns(p("net.core.netdev_budget", SEC_RX, (50, 100_000), "packets", Some(300))),
+    init_ns(p(
+        "net.core.netdev_budget_usecs",
+        SEC_RX,
+        (100, 1_000_000),
+        "µs",
+        None,
+    )),
+    init_ns(p("net.core.dev_weight", SEC_RX, (16, 10_000), "packets", Some(64))),
+    choice(IP_FORWARD, SEC_ROUTING, OFF_ON, 0),
+    choice(IPV6_FORWARDING, SEC_ROUTING, OFF_ON, 0),
+    choice("net.ipv4.conf.all.rp_filter", SEC_ROUTING, RP_FILTER, 0),
+    choice("net.ipv4.conf.default.rp_filter", SEC_ROUTING, RP_FILTER, 0),
+    choice("net.ipv4.fib_multipath_hash_policy", SEC_ROUTING, HASH, 0),
+    choice("net.ipv6.fib_multipath_hash_policy", SEC_ROUTING, HASH, 0),
+    obsolete(p("net.ipv4.route.max_size", SEC_ROUTING, (0, INT_MAX), "entries", None)),
+    p("net.ipv6.route.max_size", SEC_ROUTING, (4096, INT_MAX), "entries", None),
+    p(
+        "net.netfilter.nf_conntrack_max",
+        SEC_CONNTRACK,
+        (4096, 1 << 26),
+        "entries",
+        None,
+    ),
+    init_ns(p(
+        "net.netfilter.nf_conntrack_buckets",
+        SEC_CONNTRACK,
+        (1024, 1 << 24),
+        "entries",
+        None,
+    )),
+    p(
+        "net.netfilter.nf_conntrack_tcp_timeout_established",
+        SEC_CONNTRACK,
+        (60, INT_MAX),
+        "s",
+        Some(432_000),
+    ),
+    p(
+        "net.netfilter.nf_conntrack_tcp_timeout_syn_sent",
+        SEC_CONNTRACK,
+        (5, 3600),
+        "s",
+        Some(120),
+    ),
+    p(
+        "net.netfilter.nf_conntrack_tcp_timeout_syn_recv",
+        SEC_CONNTRACK,
+        (5, 3600),
+        "s",
+        Some(60),
+    ),
+    p(
+        "net.netfilter.nf_conntrack_tcp_timeout_fin_wait",
+        SEC_CONNTRACK,
+        (5, 3600),
+        "s",
+        Some(120),
+    ),
+    p(
+        "net.netfilter.nf_conntrack_tcp_timeout_close_wait",
+        SEC_CONNTRACK,
+        (5, 3600),
+        "s",
+        Some(60),
+    ),
+    p(
+        "net.netfilter.nf_conntrack_tcp_timeout_time_wait",
+        SEC_CONNTRACK,
+        (5, 3600),
+        "s",
+        Some(120),
+    ),
+    p(
+        "net.netfilter.nf_conntrack_udp_timeout",
+        SEC_CONNTRACK,
+        (5, 3600),
+        "s",
+        Some(30),
+    ),
+    p(
+        "net.netfilter.nf_conntrack_udp_timeout_stream",
+        SEC_CONNTRACK,
+        (30, 86_400),
+        "s",
+        Some(120),
+    ),
+    p(
+        "net.netfilter.nf_conntrack_icmp_timeout",
+        SEC_CONNTRACK,
+        (5, 3600),
+        "s",
+        Some(30),
+    ),
+    p(
+        "net.netfilter.nf_conntrack_generic_timeout",
+        SEC_CONNTRACK,
+        (30, 86_400),
+        "s",
+        Some(600),
+    ),
+    init_ns(p(
+        "net.ipv4.neigh.default.gc_thresh1",
+        SEC_NEIGH,
+        (0, 1 << 20),
+        "entries",
+        Some(128),
+    )),
+    init_ns(p(
+        "net.ipv4.neigh.default.gc_thresh2",
+        SEC_NEIGH,
+        (0, 1 << 20),
+        "entries",
+        Some(512),
+    )),
+    init_ns(p(
+        "net.ipv4.neigh.default.gc_thresh3",
+        SEC_NEIGH,
+        (16, 1 << 20),
+        "entries",
+        Some(1024),
+    )),
+    init_ns(p(
+        "net.ipv6.neigh.default.gc_thresh1",
+        SEC_NEIGH,
+        (0, 1 << 20),
+        "entries",
+        Some(128),
+    )),
+    init_ns(p(
+        "net.ipv6.neigh.default.gc_thresh2",
+        SEC_NEIGH,
+        (0, 1 << 20),
+        "entries",
+        Some(512),
+    )),
+    init_ns(p(
+        "net.ipv6.neigh.default.gc_thresh3",
+        SEC_NEIGH,
+        (16, 1 << 20),
+        "entries",
+        Some(1024),
+    )),
+    init_ns(p("kernel.panic", SEC_STABILITY, (0, 3600), "s", Some(0))),
+    init_ns(choice("kernel.panic_on_oops", SEC_STABILITY, OFF_ON, 0)),
+    // G1.6zy: an uncorrectable memory error in a process's page.
+    init_ns(choice("vm.memory_failure_early_kill", SEC_STABILITY, OFF_ON, 0)),
+    init_ns(choice("vm.memory_failure_recovery", SEC_STABILITY, OFF_ON, 1)),
+    // G1.6zx: PID 1 turns both on at boot on a real machine (not in a VM).
+    init_ns(choice("kernel.softlockup_panic", SEC_STABILITY, OFF_ON, 0)),
+    init_ns(choice("kernel.hardlockup_panic", SEC_STABILITY, OFF_ON, 0)),
+    init_ns(p(
+        "vm.min_free_kbytes",
+        SEC_STABILITY,
+        (1024, 1 << 22),
+        "KiB",
+        None,
+    )),
+    control(init_ns(p(
+        "net.core.rmem_max",
+        SEC_CONTROL,
+        (4096, 1 << 30),
+        "B",
+        Some(4 << 20),
+    ))),
+    control(init_ns(p(
+        "net.core.wmem_max",
+        SEC_CONTROL,
+        (4096, 1 << 30),
+        "B",
+        Some(4 << 20),
+    ))),
+    control(p("net.core.somaxconn", SEC_CONTROL, (128, 65_535), "", Some(4096))),
+    // G3.4m: kept at least at CoreRouter's default (DEFAULTS).
+    control(p(
+        IGMP_MAX_MEMBERSHIPS,
+        SEC_CONTROL,
+        (20, 1 << 20),
+        "",
+        Some(20),
+    )),
+    control(p(OPTMEM_MAX, SEC_CONTROL, (10_240, 1 << 26), "B", None)),
+    control(choice("net.ipv4.tcp_syncookies", SEC_CONTROL, SYNCOOKIES, 1)),
+    control(p(
+        "net.ipv4.tcp_max_syn_backlog",
+        SEC_CONTROL,
+        (128, 1 << 20),
+        "",
+        None,
+    )),
+];
+
+pub const SEC_RINGS: &str = "Rings and queues";
+pub const SEC_COALESCE: &str = "Interrupt coalescing";
+pub const SEC_OFFLOADS: &str = "Offloads";
+pub const SEC_FLOW: &str = "Flow control";
+pub const SEC_TXQ: &str = "Transmit queue";
+pub const SEC_FILTER: &str = "Filtering";
+pub const SEC_CPU_IRQ: &str = "CPU and IRQ";
+pub const SEC_FREQ: &str = "Frequency";
+pub const SEC_IDLE: &str = "Idle states";
+pub const SEC_WATCHDOG: &str = "Watchdog";
+
+/// CPU frequency governors, by code.
+pub const GOVERNORS: &[(i64, &str)] = &[
+    (0, "performance"),
+    (1, "schedutil"),
+    (2, "ondemand"),
+    (3, "powersave"),
+    (4, "conservative"),
+];
+
+/// IRQ affinity of a port: the kernel's, or one queue per CPU of the
+/// port's NUMA node.
+const IRQ_MODES: &[(i64, &str)] = &[(0, "kernel"), (1, "local node")];
+
+/// Root queueing disciplines a port may get, by code.
+pub const QDISCS: &[(i64, &str)] = &[
+    (0, "fq_codel"),
+    (1, "fq"),
+    (2, "pfifo_fast"),
+    (3, "mq"),
+    (4, "noqueue"),
+];
+
+const fn port(mut p: Param) -> Param {
+    p.tab = Tab::Interfaces;
+    p
+}
+
+const fn flaps(mut p: Param) -> Param {
+    p.link_flap = true;
+    p
+}
+
+const fn ethernet(mut p: Param) -> Param {
+    p.ethernet = true;
+    p
+}
+
+/// The settings of each port, in display order. The maxima of rings and
+/// queues come from the NIC (the engine narrows them per port).
+pub const PORT_PARAMS: &[Param] = &[
+    port(flaps(p("rx_ring", SEC_RINGS, (16, 65_536), "descriptors", None))),
+    port(flaps(p("tx_ring", SEC_RINGS, (16, 65_536), "descriptors", None))),
+    port(flaps(p("combined_channels", SEC_RINGS, (1, 4096), "queues", None))),
+    port(flaps(p("rx_channels", SEC_RINGS, (1, 4096), "queues", None))),
+    port(flaps(p("tx_channels", SEC_RINGS, (1, 4096), "queues", None))),
+    port(choice("adaptive_rx", SEC_COALESCE, OFF_ON, 1)),
+    port(p("rx_usecs", SEC_COALESCE, (0, 10_000), "µs", None)),
+    port(choice("adaptive_tx", SEC_COALESCE, OFF_ON, 1)),
+    port(p("tx_usecs", SEC_COALESCE, (0, 10_000), "µs", None)),
+    port(ethernet(choice("gro", SEC_OFFLOADS, OFF_ON, 1))),
+    port(ethernet(choice("lro", SEC_OFFLOADS, OFF_ON, 0))),
+    port(ethernet(choice("tso", SEC_OFFLOADS, OFF_ON, 1))),
+    port(ethernet(choice("gso", SEC_OFFLOADS, OFF_ON, 1))),
+    port(ethernet(choice("rx_pause", SEC_FLOW, OFF_ON, 0))),
+    port(ethernet(choice("tx_pause", SEC_FLOW, OFF_ON, 0))),
+    port(p("txqueuelen", SEC_TXQ, (0, 100_000), "packets", Some(1000))),
+    port(qdisc()),
+    port(choice("rp_filter", SEC_FILTER, RP_FILTER, 0)),
+    port(choice("irq_affinity", SEC_CPU_IRQ, IRQ_MODES, 0)),
+    port(choice("rps", SEC_CPU_IRQ, OFF_ON, 0)),
+    port(choice("xps", SEC_CPU_IRQ, OFF_ON, 0)),
+];
+
+const fn cpu(mut p: Param) -> Param {
+    p.tab = Tab::Cpu;
+    p
+}
+
+const fn governor() -> Param {
+    let mut g = p("governor", SEC_FREQ, (0, 4), "", None);
+    g.choices = GOVERNORS;
+    g
+}
+
+/// The CPU settings, in display order.
+pub const CPU_PARAMS: &[Param] = &[
+    cpu(governor()),
+    cpu(p("cpu_dma_latency", SEC_IDLE, (0, 2000), "µs", None)),
+    cpu(choice("hw_watchdog", SEC_WATCHDOG, OFF_ON, 0)),
+];
+
+/// What a boot parameter takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootKind {
+    /// A CPU list (`2-7,10`); CPU 0 stays with the system.
+    Cpus,
+    Int(i64, i64),
+    Choice(&'static [&'static str]),
+}
+
+/// One kernel command-line parameter of the image (G1.26d).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootParam {
+    pub name: &'static str,
+    /// Group inside the Boot tab (an English label).
+    pub section: &'static str,
+    pub kind: BootKind,
+    /// Weakens security: needs an explicit confirmation.
+    pub danger: bool,
+}
+
+pub const SEC_ISOLATION: &str = "CPU isolation";
+pub const SEC_POWER: &str = "Power saving";
+pub const SEC_IOMMU: &str = "IOMMU";
+pub const SEC_SECURITY: &str = "Security";
+pub const SEC_HARDWARE: &str = "Hardware";
+
+/// The kernel command-line parameters of the Boot tab, in display order.
+pub const BOOT_PARAMS: &[BootParam] = &[
+    BootParam {
+        name: "isolcpus",
+        section: SEC_ISOLATION,
+        kind: BootKind::Cpus,
+        danger: false,
+    },
+    BootParam {
+        name: "nohz_full",
+        section: SEC_ISOLATION,
+        kind: BootKind::Cpus,
+        danger: false,
+    },
+    BootParam {
+        name: "intel_idle.max_cstate",
+        section: SEC_IDLE,
+        kind: BootKind::Int(0, 9),
+        danger: false,
+    },
+    BootParam {
+        name: "processor.max_cstate",
+        section: SEC_IDLE,
+        kind: BootKind::Int(0, 9),
+        danger: false,
+    },
+    BootParam {
+        name: "pcie_aspm",
+        section: SEC_POWER,
+        kind: BootKind::Choice(&["off", "force"]),
+        danger: false,
+    },
+    BootParam {
+        name: "iommu",
+        section: SEC_IOMMU,
+        kind: BootKind::Choice(&["pt", "nopt", "off"]),
+        danger: false,
+    },
+    BootParam {
+        name: "mitigations",
+        section: SEC_SECURITY,
+        kind: BootKind::Choice(&["auto", "auto,nosmt", "off"]),
+        danger: true,
+    },
+    // G1.6zf: read by `corerouter-init`, not by the kernel: whether it looks
+    // for the motherboard's sensor chip (a probe of I/O ports).
+    BootParam {
+        name: "corerouter.sensors",
+        section: SEC_HARDWARE,
+        kind: BootKind::Choice(&["auto", "on", "off"]),
+        danger: false,
+    },
+];
+
+/// Longest boot parameter value (a CPU list of a 4096-CPU box fits).
+pub const MAX_BOOT_VALUE: usize = 256;
+
+/// The catalog entry of boot parameter `name`.
+pub fn boot_param(name: &str) -> Option<&'static BootParam> {
+    BOOT_PARAMS.iter().find(|p| p.name == name)
+}
+
+/// `value` for `p`, checked and written as the kernel reads it; `cpus`:
+/// the machine's CPU count, when known. The text never holds a space, a
+/// quote or `=`: it goes onto the kernel command line as is.
+pub fn boot_value(p: &BootParam, value: &str, cpus: Option<u32>) -> Result<String, String> {
+    let v = value.trim();
+    if v.is_empty() || v.len() > MAX_BOOT_VALUE {
+        return Err(format!("{}: 1..={MAX_BOOT_VALUE} characters", p.name));
+    }
+    match p.kind {
+        BootKind::Int(min, max) => match v.parse::<i64>() {
+            Ok(n) if (min..=max).contains(&n) => Ok(n.to_string()),
+            _ => Err(format!("{} must be {min}..={max}", p.name)),
+        },
+        BootKind::Choice(list) => list
+            .iter()
+            .find(|c| **c == v)
+            .map(|c| (*c).to_owned())
+            .ok_or_else(|| format!("{} must be one of {}", p.name, list.join(", "))),
+        BootKind::Cpus => {
+            for part in v.split(',') {
+                let (a, b) = part.split_once('-').unwrap_or((part, part));
+                let (Ok(a), Ok(b)) = (a.parse::<u32>(), b.parse::<u32>()) else {
+                    return Err(format!(
+                        "{}: a CPU list like 2-7,10 (no spaces), not '{}'",
+                        p.name,
+                        part.chars().take(32).collect::<String>()
+                    ));
+                };
+                if a > b {
+                    return Err(format!("{}: {a}-{b} goes backwards", p.name));
+                }
+                if let Some(n) = cpus
+                    && b >= n
+                {
+                    return Err(format!(
+                        "{}: CPU {b} does not exist (this machine has 0-{})",
+                        p.name,
+                        n.saturating_sub(1)
+                    ));
+                }
+                if a == 0 {
+                    return Err(format!(
+                        "{}: CPU 0 stays with the system (the boot CPU runs the kernel's own                          housekeeping)",
+                        p.name
+                    ));
+                }
+            }
+            Ok(v.to_owned())
+        }
+    }
+}
+
+/// The parameters as the kernel command line writes them.
+pub fn cmdline(boot: &BTreeMap<String, String>) -> String {
+    BOOT_PARAMS
+        .iter()
+        .filter_map(|p| boot.get(p.name).map(|v| format!("{}={v}", p.name)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The catalog parameters on a kernel command line (`/proc/cmdline`).
+pub fn parse_cmdline(text: &str) -> BTreeMap<String, String> {
+    text.split_whitespace()
+        .take(1024)
+        .filter_map(|w| {
+            let (k, v) = w.split_once('=')?;
+            boot_param(k).map(|p| (p.name.to_owned(), v.chars().take(MAX_BOOT_VALUE).collect()))
+        })
+        .collect()
+}
+
+/// The catalog entry of CPU setting `key`.
+pub fn cpu_param(key: &str) -> Option<&'static Param> {
+    CPU_PARAMS.iter().find(|p| p.name == key)
+}
+
+const fn qdisc() -> Param {
+    let mut q = p("qdisc", SEC_TXQ, (0, 4), "", None);
+    q.choices = QDISCS;
+    q
+}
+
+/// The kernel feature behind an offload row (`gro` → `rx-gro`).
+pub fn offload_feature(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "gro" => "rx-gro",
+        "lro" => "rx-lro",
+        "tso" => "tx-tcp-segmentation",
+        "gso" => "tx-generic-segmentation",
+        _ => return None,
+    })
+}
+
+/// The catalog entry of port setting `key`.
+pub fn port_param(key: &str) -> Option<&'static Param> {
+    PORT_PARAMS.iter().find(|p| p.name == key)
+}
+
+/// The catalog entry of `name`.
+pub fn param(name: &str) -> Option<&'static Param> {
+    PARAMS.iter().find(|p| p.name == name)
+}
+
+/// Whether `name` is a conntrack parameter (needs `nf_conntrack` loaded).
+pub fn is_conntrack(name: &str) -> bool {
+    name.starts_with(CT)
+}
+
+/// `/proc/sys` path of `name`, relative (`net/core/netdev_budget`). Only
+/// for catalog names: they have no `/` and no `..`.
+pub fn proc_path(name: &str) -> String {
+    name.replace('.', "/")
+}
+
+/// The name of `value` among `p`'s choices, or the number.
+pub fn value_text(p: &Param, value: i64) -> String {
+    p.choices
+        .iter()
+        .find(|(v, _)| *v == value)
+        .map_or_else(|| value.to_string(), |(_, n)| format!("{value} ({n})"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_is_sane() {
+        let mut names: Vec<&str> = PARAMS.iter().map(|p| p.name).collect();
+        let n = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), n, "each parameter once");
+        for p in PARAMS {
+            assert!(p.min <= p.max, "{}", p.name);
+            if let Some(d) = p.default {
+                assert!((p.min..=p.max).contains(&d), "{} default", p.name);
+            }
+            assert!(
+                p.name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._".contains(&b)),
+                "{}",
+                p.name
+            );
+            assert!(!p.name.contains(".."), "{}", p.name);
+            for (i, (v, _)) in p.choices.iter().enumerate() {
+                assert_eq!(*v, i as i64, "{} choices are 0..n", p.name);
+            }
+        }
+        for p in PORT_PARAMS {
+            assert_eq!(p.tab, Tab::Interfaces, "{}", p.name);
+            assert!(p.min <= p.max, "{}", p.name);
+            assert_eq!(p.ethernet, offload_feature(p.name).is_some() || p.name.ends_with("_pause"));
+        }
+        assert_eq!(port_param("rx_ring").map(|p| p.link_flap), Some(true));
+        for p in CPU_PARAMS {
+            assert_eq!(p.tab, Tab::Cpu, "{}", p.name);
+        }
+        assert!(cpu_param("governor").is_some());
+        let iso = boot_param("isolcpus").unwrap();
+        assert_eq!(boot_value(iso, "2-7,10", Some(16)), Ok("2-7,10".into()));
+        for bad in ["0-3", "2-40", "2 3", "a", "7-2", "", "2=3"] {
+            assert!(boot_value(iso, bad, Some(16)).is_err(), "{bad}");
+        }
+        let mit = boot_param("mitigations").unwrap();
+        assert!(mit.danger);
+        assert!(boot_value(mit, "off", None).is_ok());
+        assert!(boot_value(mit, "off quiet", None).is_err());
+        let mut b = BTreeMap::new();
+        b.insert("mitigations".to_owned(), "off".to_owned());
+        b.insert("isolcpus".to_owned(), "2-7".to_owned());
+        assert_eq!(cmdline(&b), "isolcpus=2-7 mitigations=off");
+        let back = parse_cmdline("BOOT_IMAGE=/vmlinuz ro quiet isolcpus=2-7 mitigations=off foo=bar");
+        assert_eq!(back, b);
+        assert_eq!(proc_path("net.core.netdev_budget"), "net/core/netdev_budget");
+        assert!(is_conntrack("net.netfilter.nf_conntrack_max"));
+        assert!(!is_conntrack("net.core.somaxconn"));
+    }
+
+    #[test]
+    fn tuning_round_trips_and_stays_out_of_old_configs() {
+        let t: Tuning = serde_json::from_str("{}").unwrap();
+        assert!(t.is_default());
+        assert_eq!(serde_json::to_string(&t).unwrap(), "{}");
+        let mut t = Tuning::default();
+        t.sysctl.insert("net.core.netdev_budget".into(), 600);
+        t.ports
+            .entry("ether1".parse().unwrap())
+            .or_default()
+            .insert("rx_ring".into(), 4096);
+        let back: Tuning = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(back, t);
+        assert_eq!(
+            value_text(param("net.ipv4.conf.all.rp_filter").unwrap(), 2),
+            "2 (loose)"
+        );
+    }
+
+    /// G1.26i: with nothing configured the router forwards IPv4 and IPv6; a
+    /// config written before this (no forwarding entry, or the 1 a profile
+    /// wrote) loads the same and means the same; an explicit 0 stays 0.
+    #[test]
+    fn a_router_forwards_unless_the_config_says_no() {
+        for (name, value) in DEFAULTS {
+            let p = param(name).expect("a default is a catalog parameter");
+            assert!((p.min..=p.max).contains(value), "{name}");
+            assert_eq!(default_of(name), Some(*value));
+        }
+        assert_eq!(default_of("net.core.netdev_budget"), None);
+        let fresh = Tuning::default();
+        assert_eq!(fresh.effective_sysctl().get(IP_FORWARD), Some(&1));
+        assert_eq!(fresh.effective_sysctl().get(IPV6_FORWARDING), Some(&1));
+        // The defaults are not written into the config.
+        assert_eq!(serde_json::to_string(&fresh).unwrap(), "{}");
+        // A router that applied a profile before G1.26i.
+        let old: Tuning = serde_json::from_str(
+            r#"{"sysctl": {"net.ipv4.ip_forward": 1, "net.core.netdev_budget": 600}}"#,
+        )
+        .unwrap();
+        let eff = old.effective_sysctl();
+        assert_eq!(eff.get(IP_FORWARD), Some(&1));
+        assert_eq!(eff.get(IPV6_FORWARDING), Some(&1));
+        assert_eq!(eff.get("net.core.netdev_budget"), Some(&600));
+        // The operator's 0 wins, for each family on its own.
+        let off: Tuning =
+            serde_json::from_str(r#"{"sysctl": {"net.ipv4.ip_forward": 0}}"#).unwrap();
+        assert_eq!(off.effective_sysctl().get(IP_FORWARD), Some(&0));
+        assert_eq!(off.effective_sysctl().get(IPV6_FORWARDING), Some(&1));
+    }
+}

@@ -1,0 +1,36 @@
+[package]
+name = "corerouter-ui"
+description = "L5: WinBox-style panels in egui (no eframe, no winit): reads engine state, acts via run(id, params)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+corerouter-buildinfo.workspace = true
+corerouter-engine.workspace = true
+corerouter-shell.workspace = true
+egui.workspace = true
+egui_plot.workspace = true
+serde_json.workspace = true
+# G6.4a: the sniffer's capture file arrives base64-encoded.
+base64.workspace = true
+# G1.31b: the WireGuard client config as a QR code.
+qrcode.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+corerouter-hal.workspace = true
+corerouter-model.workspace = true
+corerouter-proto-bgp.workspace = true
+corerouter-proto-dns.workspace = true
+corerouter-proto-flow.workspace = true
+
+[[bench]]
+name = "frames"
+harness = false
+
+[lints]
+workspace = true

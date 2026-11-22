@@ -1,0 +1,90 @@
+# CoreRouter x86_64 image (G1.6a, docs/os-image.md). Built by
+# `cargo xtask os build`; options are explained in the doc.
+BR2_x86_64=y
+BR2_x86_x86_64=y
+BR2_DL_DIR="$(BR2_EXTERNAL_COREROUTER_PATH)/dl"
+BR2_PER_PACKAGE_DIRECTORIES=y
+BR2_DOWNLOAD_FORCE_CHECK_HASHES=y
+BR2_REPRODUCIBLE=y
+BR2_GLOBAL_PATCH_DIR="$(BR2_EXTERNAL_COREROUTER_PATH)/patches"
+BR2_TOOLCHAIN_EXTERNAL=y
+BR2_TOOLCHAIN_EXTERNAL_BOOTLIN=y
+BR2_TOOLCHAIN_EXTERNAL_BOOTLIN_X86_64_GLIBC_STABLE=y
+BR2_TARGET_GENERIC_HOSTNAME="corerouter"
+BR2_TARGET_GENERIC_ISSUE="CoreRouter"
+BR2_INIT_NONE=y
+BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_DEVTMPFS=y
+# BR2_TARGET_ENABLE_ROOT_LOGIN is not set
+BR2_SYSTEM_BIN_SH_BUSYBOX=y
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_COREROUTER_PATH)/board/x86_64/post-build.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_COREROUTER_PATH)/board/x86_64/post-image.sh"
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_CUSTOM_VERSION=y
+BR2_LINUX_KERNEL_CUSTOM_VERSION_VALUE="6.18.59"
+BR2_LINUX_KERNEL_USE_ARCH_DEFAULT_CONFIG=y
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_COREROUTER_PATH)/board/x86_64/linux.fragment $(BR2_EXTERNAL_COREROUTER_PATH)/board/x86_64/nics.fragment"
+BR2_LINUX_KERNEL_NEEDS_HOST_OPENSSL=y
+BR2_LINUX_KERNEL_NEEDS_HOST_LIBELF=y
+BR2_LINUX_KERNEL_NEEDS_HOST_PAHOLE=y
+BR2_PACKAGE_NFTABLES=y
+BR2_PACKAGE_COREROUTER=y
+# G1.6j: the firmware the network drivers declare (firmware.lock).
+BR2_PACKAGE_COREROUTER_FIRMWARE=y
+# G1.6c: FRR (G3.1) — the routing daemons hal-frr drives through their vty
+# sockets; corerouter-init starts them (no bash init scripts, no vtysh in the
+# image: post-build.sh). libcap: the daemons keep only the capabilities
+# they need after dropping to the frr user.
+BR2_PACKAGE_FRR=y
+BR2_PACKAGE_FRR_BFD=y
+BR2_PACKAGE_LIBCAP=y
+# G1.6v: /config grows to the rest of the disk at boot (corerouter-init:
+# e2fsck -f -p, then resize2fs, on the unmounted partition). Only those two
+# stay in the image (post-build.sh); util-linux comes for libblkid/libuuid.
+BR2_PACKAGE_E2FSPROGS=y
+# BR2_PACKAGE_E2FSPROGS_FSCK is not set
+BR2_PACKAGE_E2FSPROGS_RESIZE2FS=y
+# G1.6zr: names of the PCI network cards (interface.hardware, the health
+# check): hwdata's pci.ids, cut by post-build.sh to the cards the image's
+# network drivers bind (~66 KB of 1.4 MB). USB cards name themselves.
+BR2_PACKAGE_HWDATA=y
+BR2_PACKAGE_HWDATA_PCI_IDS=y
+# BR2_PACKAGE_HWDATA_USB_IDS is not set
+# G1.30: Wi-Fi in station mode. wpa_supplicant does the authentication
+# (WPA2-PSK, WPA3-SAE: on every card of nics.fragment that runs in user
+# space), driven through its control socket only: no wpa_cli, no D-Bus, no
+# configuration file (post-build.sh). WPA3 brings OpenSSL (SAE's elliptic
+# curves). wireless-regdb is cfg80211's signed regulatory.db: without it no
+# country can be set and 5 GHz is listen-only.
+BR2_PACKAGE_WPA_SUPPLICANT=y
+BR2_PACKAGE_WPA_SUPPLICANT_NL80211=y
+BR2_PACKAGE_WPA_SUPPLICANT_WPA3=y
+BR2_PACKAGE_WPA_SUPPLICANT_CTRL_IFACE=y
+BR2_PACKAGE_WIRELESS_REGDB=y
+# G1.30a: hostapd is the router's access point (`interface.wifi.set mode=ap`),
+# built against the image's libraries (libnl, OpenSSL); post-build.sh also
+# copies it to images/test-tools/ for the access point of `os wifi-test`.
+BR2_PACKAGE_HOSTAPD=y
+BR2_PACKAGE_HOSTAPD_WPA3=y
+# G1.30m: iw moves the simulated radios into the namespaces of the bonding
+# lab (scripts/wifi-bond-lab.sh); a test's tool, out of the image
+# (post-build.sh moves it to images/test-tools/).
+BR2_PACKAGE_IW=y
+# BR2_PACKAGE_HOSTAPD_ACS is not set
+# BR2_PACKAGE_HOSTAPD_VLAN is not set
+# G1.6c: the installer's kernel (the ISO, post-image.sh).
+BR2_PACKAGE_COREROUTER_INSTALLER=y
+BR2_TARGET_ROOTFS_SQUASHFS=y
+# G1.6g: boot by BIOS (docs/os-image.md); the images are made by post-image.sh.
+BR2_TARGET_GRUB2=y
+BR2_TARGET_GRUB2_I386_PC=y
+BR2_TARGET_GRUB2_BOOT_PARTITION="hd0,gpt1"
+BR2_TARGET_GRUB2_BUILTIN_MODULES_PC="biosdisk part_gpt fat normal linux loadenv test echo serial terminal configfile"
+BR2_TARGET_ROOTFS_SQUASHFS4_ZSTD=y
+# BR2_TARGET_ROOTFS_TAR is not set
+BR2_PACKAGE_HOST_DOSFSTOOLS=y
+BR2_PACKAGE_HOST_E2FSPROGS=y
+BR2_PACKAGE_HOST_GENIMAGE=y
+BR2_PACKAGE_HOST_MTOOLS=y
+BR2_CCACHE=y
+# `cargo xtask os build` overrides it with BR2_CCACHE_DIR=<out>/ccache.
+BR2_CCACHE_DIR="$(BR2_EXTERNAL_COREROUTER_PATH)/out/ccache"

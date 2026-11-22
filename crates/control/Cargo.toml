@@ -1,0 +1,41 @@
+[package]
+name = "corerouter-control"
+description = "L4: control channel — JSON-per-line over loopback TCP, WebSocket for the web GUI, method dispatch, client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+corerouter-engine.workspace = true
+corerouter-buildinfo.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+log.workspace = true
+tungstenite.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+ring.workspace = true
+# TCP keepalive and TCP_USER_TIMEOUT on accepted sockets (dead peers, Safe Mode).
+socket2 = { version = "0.6.5", features = ["all"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# SO_PEERCRED of the local Unix socket (G0.11): who is on the other end.
+rustix = { version = "1.1.5", default-features = false, features = ["std", "net", "process"] }
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "control"
+harness = false
+
+[[bench]]
+name = "load"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "corerouter-proto-lldp"
+description = "L2: LLDP (IEEE 802.1AB) LLDPDU codec, pure (no I/O)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "codec"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,337 @@
+# BGP (G3.2)
+
+O BGP do CoreRouter roda no FRR (decisão do G3.1, `docs/architecture.md` 1.3). O engine guarda a
+config no modelo do RouterOS v7, valida, rende para o `bgpd` e aplica só a diferença pelo
+socket vty (`crates/hal-frr`). O G3.2 foi dividido em três partes:
+
+| Parte | O quê |
+|---|---|
+| **G3.2a** (esta) | templates, conexões, sessões ao vivo, validação, janela Routing › BGP |
+| G3.2b | políticas: prefix-list, community normal e large, AS-path, `routing.filter.rule` com prévia (`docs/bgp-policy.md`) |
+| G3.2c | RPKI (RFC 6811/8210) por padrão, "Por que essa rota?" e rotas por conexão (`docs/rpki.md`) |
+
+## Como usar
+
+```sh
+corerouter-cli run routing.bgp.instance.set '{"asn":65000,"router_id":"10.255.0.1"}'
+corerouter-cli run routing.bgp.template.add '{"name":"transit","local_role":"ebgp-customer","hold_time":90,"afi":"ip,ipv6","max_prefix_ipv4":1200000}'
+corerouter-cli run routing.bgp.connection.add '{"name":"upstream1","remote_address":"198.51.100.2","remote_as":65100,"templates":"transit","tcp_md5_key":"…"}'
+corerouter-cli run routing.bgp.session.list
+corerouter-cli run routing.bgp.session.refresh '{"connection":"upstream1"}'
+```
+
+| Comando | RouterOS v7 |
+|---|---|
+| `routing.bgp.template.{add,set,remove,list,check}` | `/routing bgp template` |
+| `routing.bgp.connection.{add,set,remove,list,check}` | `/routing bgp connection` |
+| `routing.bgp.session.list` | `/routing bgp session print` |
+| `routing.bgp.session.refresh` / `resend` / `clear` | `/routing bgp session refresh` / `resend` / `clear` |
+| `routing.bgp.connection.set {disabled: true}` | `disable` (shutdown) |
+
+Parâmetros de conexão e template (os mesmos nos dois): `remote_as`, `local_role` (`ibgp`,
+`ebgp`, `ebgp-provider`, `ebgp-customer`, `ebgp-peer`, `ebgp-rs`, `ebgp-rs-client`),
+`multihop`, `hold_time`, `keepalive_time`, `tcp_md5_key`, `afi` (`ip`, `ipv6`),
+`max_prefix_ipv4`, `max_prefix_ipv6`, `max_prefix_action` (`shutdown`, `warning`, `restart`),
+`max_prefix_restart`, `update_source` (o `local.address` do RouterOS) e `nexthop_choice`
+(`default`, `force-self`, `propagate`). Um parâmetro ausente herda do primeiro template que o
+define; `null` num `set` volta a herdar.
+
+### Anunciar redes e refletir rotas (G3.9f)
+
+```sh
+corerouter-cli run ip.firewall.address-list.add '{"list":"bgp-out","address":"100.64.0.0/22"}'
+corerouter-cli run routing.bgp.connection.set '{"id":"upstream1","output_network":"bgp-out"}'
+corerouter-cli run routing.bgp.connection.set '{"id":"core2","output_redistribute":"connected,static"}'
+corerouter-cli run routing.bgp.connection.add '{"name":"client1","remote_address":"10.0.0.7","remote_as":65000,"local_role":"ibgp-rr"}'
+```
+
+- `output_network` (RouterOS `output.network`): a address-list do firewall cujas redes são
+  anunciadas, cada uma só enquanto houver rota para ela (o `network` do FRR com
+  `bgp network import-check`, o "só com rota IGP correspondente" do RouterOS). Mudar a lista
+  chega ao FRR no mesmo commit (~0,1 s até o vizinho, **medido**). Faixas `a-b` ficam de fora.
+- `output_redistribute` (RouterOS `output.redistribute`): `connected`, `static`, `ospf`. As
+  estáticas do CoreRouter são instaladas pelo backend linux (`proto static`), e o `zebra` as vê
+  como rotas *kernel*: `static` vira `redistribute kernel` com um route-map que só deixa passar
+  os prefixos das estáticas configuradas (`CR-BGP-STATIC4/6`).
+- Por conexão, como no RouterOS (G3.9fb): cada vizinho recebe só o que a conexão dele pede. O
+  FRR origina por instância (a união dos pedidos); a conexão que pede menos que a união ganha um
+  route-map de saída próprio, `CR-C+<conexão>`: passam as nossas rotas da lista dela
+  (`CR-C+<conexão>+4/+6`) e dos protocolos que ela redistribui (`match source-protocol`); são
+  recusadas as rotas `network` das outras conexões (o prefixo, `CR-C+<conexão>+not4/6`, com o
+  AS_PATH vazio de rota nossa, `CR-C+local`) e os protocolos que só as outras redistribuem; o
+  que passa segue para a chain dela (`call CR-<chain>`). Rotas recebidas de outros vizinhos não
+  mudam. O `match peer local` do FRR não serve: num route-map de saída o "peer" é o vizinho de
+  destino (`bgp_route.c`, `prep_for_rmap_apply`). Um prefixo conectado (ou estático) que outra
+  conexão põe no `output_network` vai também para a que redistribui connected (static): no
+  `bgpd` é uma rota só, a do `network`. Quando todas pedem o mesmo, nada muda no render. O eBGP
+  sem chain continua sem receber nada (RFC 8212). Limite: um prefixo do OSPF que outra conexão
+  lista no `output_network` não vai para a que só redistribui `ospf`.
+- `local_role=ibgp-rr` (RouterOS `ibgp-rr`): iBGP em que este roteador reflete rotas para o
+  vizinho, seu cliente (RFC 4456, `route-reflector-client` no FRR). O cluster-id é o router-id,
+  como no RouterOS.
+
+## Pesquisa
+
+### MikroTik RouterOS v7
+
+- [BGP](https://help.mikrotik.com/docs/spaces/ROS/pages/328220/BGP) e a referência da CLI
+  [`/routing/bgp/connection`](https://manual.mikrotik.com/docs/7.25/cli-reference/routing/bgp/connection/)
+  e [`/routing/bgp/template`](https://manual.mikrotik.com/docs/7.24/cli-reference/routing/bgp/template).
+- O v7 separou o v6 (`peer`) em três menus: `template` (parâmetros do protocolo), `connection`
+  (o vizinho, que também expõe os parâmetros do template) e `session` (estado em cache, só
+  leitura, com `clear`/`refresh`/`resend`).
+- Nomes adotados: `remote.address`, `remote.as` (vazio: aprende do OPEN), `local.role`
+  (obrigatório no RouterOS; os papéis da RFC 9234), `templates`, `multihop`, `hold-time`
+  (3 s..65535 s ou infinity; padrão 3 min), `keepalive-time` (vazio: um terço do hold),
+  `tcp-md5-key`, `afi`, `nexthop-choice`, `input.limit-process-routes-ipv4/ipv6`.
+- O que o RouterOS faz pior: o `local.role` é obrigatório mesmo quando o AS remoto já diz o
+  tipo; o limite de prefixos só para de processar (não fecha a sessão nem avisa); a doc não diz
+  como a herança de vários templates se resolve.
+
+### Outros
+
+- **Junos**: `group` → `neighbor`, herança em dois níveis, `family inet unicast prefix-limit
+  maximum N teardown <pct> idle-timeout <min>` — ação e reinício por família, que adotamos.
+- **Cisco IOS-XE**: `template peer-session` e `peer-policy` com `inherit` (até 7 níveis), mais
+  os `peer-group` antigos; `neighbor X maximum-prefix N [threshold] [restart M | warning-only]`.
+- **Nokia SR Linux**: `group` com `neighbor`, `afi-safi` por grupo e por vizinho,
+  `prefix-limit max-received-routes` com `prevent-teardown`.
+- **VyOS / FRR**: `peer-group`; `neighbor X local-role` (RFC 9234), `maximum-prefix … restart |
+  warning-only`, `ebgp-multihop`, `update-source`, `password`.
+- Comum aos melhores: limite de prefixos com ação, herança em mais de um nível, papel RFC 9234
+  para pegar vazamento de rotas.
+
+### RFCs (base, atualizações e errata)
+
+- [RFC 4271](https://www.rfc-editor.org/info/rfc4271) (BGP-4), atualizada por 4724, 6286, 6608,
+  6793, 7606, 7607, 7705, 8212, 8654, 9072, 9687 e 9774. Errata verificadas: 9, das quais
+  técnicas a 1633 (§6.3), a 2838 (§8.2.2: HoldTimer_Expires em Established apaga as rotas) e a
+  4493 (§4.5: subcódigo 0). Aplicado: hold 0 ou ≥ 3 s (§4.2), keepalive menor que o hold e um
+  terço por padrão (§10), estados da §8.2.2 na coluna State.
+- [RFC 6793](https://www.rfc-editor.org/info/rfc6793) (AS de 4 bytes; obsoleta a 4893, sem
+  atualizações): asplain e asdot aceitos; AS_TRANS (23456) recusado como AS local ou remoto.
+- [RFC 7607](https://www.rfc-editor.org/info/rfc7607) (AS 0) e
+  [RFC 7300](https://www.rfc-editor.org/info/rfc7300) (65535, 4294967295): recusados.
+- [RFC 4760](https://www.rfc-editor.org/info/rfc4760) (multiprotocolo, atualizada pela 7606):
+  `afi` com IPv4 e IPv6 unicast; uma conexão sem família é recusada.
+- [RFC 7606](https://www.rfc-editor.org/info/rfc7606) (tratamento de erro revisado,
+  treat-as-withdraw): é do FRR, ligado por padrão; nada a configurar.
+- [RFC 8212](https://www.rfc-editor.org/info/rfc8212): eBGP sem política não aceita nem envia
+  (o `bgp ebgp-requires-policy` do FRR, mantido ligado); a janela diz isso no detalhe da
+  sessão e na prévia, e as políticas chegam no G3.2b.
+- [RFC 2385](https://www.rfc-editor.org/info/rfc2385) (TCP MD5): até 80 bytes
+  (`TCP_MD5SIG_MAXKEYLEN` do Linux); [RFC 9234](https://www.rfc-editor.org/info/rfc9234)
+  (papéis); [RFC 2918](https://www.rfc-editor.org/info/rfc2918) (ROUTE-REFRESH, usado pelo
+  `refresh`).
+
+### O que adotamos e o que melhoramos
+
+- Modelo e nomes do RouterOS v7, com herança de vários templates resolvida assim: valor da
+  conexão; senão, o primeiro template da lista que o define (cada template já com os pais
+  resolvidos). Laço e profundidade acima de 8 são recusados com a cadeia na mensagem.
+- `local.role` opcional: vazio, sai do AS remoto (o nosso → iBGP). `remote_as` vazio vira
+  `remote-as external`/`internal` no FRR.
+- Limite de prefixos por família com ação (`shutdown`, `warning`, `restart` + minutos), como
+  Junos e Cisco, em vez do "para de processar" do RouterOS.
+- Chave MD5 selada como as senhas PPP: nunca aparece em config, histórico, journal, logs,
+  respostas ou MCP; o modal a trata como campo só de escrita.
+- Prévia no modal (o mesmo comando `check` serve à CLI e ao MCP): valores em vigor, o que vem
+  de template, timers calculados, aviso de hold curto, de eBGP sem política e sem chave, e de
+  que mudanças reiniciam a sessão; a prévia de um template recusa a mudança que deixaria uma
+  conexão inválida.
+- Transação: mudar um vizinho não derruba os outros (teste com FRR real).
+
+### G3.9f: interoperabilidade (RouterOS v7.25, FRR 10.7.1, CoreRouter × CoreRouter)
+
+- [`/routing/bgp/connection` 7.25](https://manual.mikrotik.com/docs/7.25/cli-reference/routing/bgp/connection/):
+  `output.network` (address-list, enviada só com rota IGP correspondente), `output.redistribute`,
+  `local.role` com `ibgp-rr`, `use-bfd`, `input.limit-process-routes-ipv4/6` (para de processar,
+  não fecha a sessão); sem parâmetro de graceful restart (a sessão anuncia a capacidade `gr`).
+- Outros: Junos (`export` de política com `from protocol static`), IOS-XE (`network` +
+  `redistribute static route-map`), FRR (`network` com `import-check`; `redistribute` por
+  address-family, não por vizinho), VyOS (o mesmo do FRR).
+- RFCs: 4271 §5.1.3 (next hop mantido no iBGP; o `nexthop-choice=force-self` é o `next-hop-self`),
+  4456 §8 (ORIGINATOR_ID e CLUSTER_LIST, conferidos no laboratório), 4760 e 2545 §3 (IPv6 numa
+  sessão IPv4: next hop global, mais o link-local num enlace compartilhado), 1997 (no-export
+  respeitado), 8092, 4486 (Cease subcódigo 1 no max-prefix, visto do outro lado como `0601`),
+  5880/5882 (o BGP cai com o BFD), 2385 (MD5).
+- Como testar: `scripts/bgp-crcr-userns.sh` (no host, sem root nem VM: CoreRouter × CoreRouter e
+  FRR) e `scripts/routeros-interop-bgp.sh` (na VM, contra o CHR).
+- Divergências do RouterOS 7.25 vistas no laboratório (quem está certo):
+  - IPv6 numa sessão IPv4 (`afi=ip,ipv6`): o CHR manda o next hop `::ffff:10.39.1.1`
+    (IPv4-mapeado). A RFC 2545 §3 pede um endereço IPv6 global; nenhum kernel instala o mapeado,
+    e o próprio RouterOS o trata como inalcançável. Errado o RouterOS. O CoreRouter manda global +
+    link-local e o CHR instala. Desde a G3.9fh a chain de entrada reescreve o next hop com o
+    IPv6 do CHR no enlace, `if (afi ipv6) { set gw fd39:1::1 } accept` (FRR `set ipv6 next-hop
+    global`), e as rotas entram no kernel; a prévia da conexão avisa (`mpbgp-nexthop`) e diz o
+    que escrever. A outra saída continua valendo: uma segunda conexão ao endereço IPv6 com
+    `afi=ipv6`.
+  - Refletor: o CHR põe o próprio Router ID no ORIGINATOR_ID; a RFC 4456 §8 pede o do originador
+    do anúncio no AS. Errado o RouterOS; o CLUSTER_LIST e o next hop estão certos.
+  - `set bgp-path-prepend N`: no eBGP o CHR sai com o próprio AS N vezes no total (N = 1, 2, 3 →
+    1, 2, 3 cópias, **medido**); na saída iBGP e na entrada não põe nada. Desde a G3.9fg o
+    CoreRouter faz igual; filtros antigos mantêm a contagem anterior (N além do que a sessão põe)
+    até `routing.filter.prepend.set` (`docs/bgp-policy.md`).
+  - iBGP de rede própria: o CHR anuncia com o endereço da interface (10.39.1.1) quando a sessão
+    é entre loopbacks com `local.address`; a RFC 4271 §5.1.3 permite. Sem `local.address` ele
+    abre a sessão a partir do loopback.
+  - `input.limit-process-routes-ipv4`: para de processar sem mandar Cease; o `max_prefix` do
+    CoreRouter fecha com Cease 6/1 (RFC 4486), que o CHR registra.
+
+### G3.9ff: graceful restart (RFC 4724)
+
+Quando o `bgpd` do CoreRouter cai e volta, o vizinho guarda as nossas rotas (stale) e o nosso
+kernel guarda as dele: o tráfego segue enquanto o `bgpd` sobe de novo.
+
+```sh
+corerouter-cli run routing.bgp.connection.set '{"id":"core2","graceful_restart":true}'
+corerouter-cli run routing.bgp.instance.set '{"asn":65000,"router_id":"10.255.0.1","graceful_restart_time":120}'
+```
+
+- Por conexão ou template, `graceful_restart`: `true` → `neighbor X graceful-restart` (quem
+  reinicia, e helper); `false` → `graceful-restart-disable`; sem valor: só helper (o padrão do
+  FRR). O RouterOS 7.25 não tem parâmetro (só anuncia a capacidade `gr`).
+- Na instância: `graceful_restart_time` (o Restart Time anunciado, 1..=4095 s, padrão 120; RFC
+  4724 §3: 12 bits), `graceful_stale_time` (quanto as rotas stale de um vizinho que reinicia
+  ficam, padrão 360) e `graceful_defer_time` (quanto o melhor caminho espera os End-of-RIB depois
+  que o `bgpd` sobe, §4.1; padrão do CoreRouter 10 s, FRR 360). O `instance.set` sem eles mantém
+  o que havia.
+- Com uma conexão em modo restart, o render põe `bgp graceful-restart preserve-fw-state` (bit F):
+  o `bgpd` se registra no `zebra` com GR e o `zebra` mantém as rotas dele no kernel enquanto ele
+  está fora (`zebra_gr.c`, `rib-stale-time` 500 s; visto no log do `zebra`: "Stale timer update
+  to 500", "0 bgp routes removed").
+- `routing.bgp.session.list` traz `gr_local`, `gr_remote` e `end_of_rib_received`; a coluna GR da
+  janela mostra o papel e `EoR`, ou `no EoR` (âmbar) quando estamos como restart e o vizinho
+  nunca mandou o End-of-RIB. A prévia avisa quando o Restart Time não é menor que o hold time
+  (`gr-restart-time`).
+
+**Medido** (2026-10-29), `kill -9` do `bgpd` do CR1, ping a cada 20 ms atravessando as rotas BGP,
+`bgpd` de volta 3 s depois:
+
+| Vizinho | Sem GR | Com GR |
+|---|---|---|
+| CoreRouter (FRR 10.7.1, host, `bgp-crcr-userns.sh gr`) | 469 de 656 pings perdidos (~9,4 s); o vizinho retira a rota em 105 ms | **2 de 656** (~40 ms); as duas rotas ficam |
+| CoreRouter × CoreRouter na VM | — | as duas rotas ficam |
+| RouterOS 7.25 CHR (`routeros-interop-bgp.sh gr`) | o CHR retira em 8 ms | o CHR retira em 9 ms; o kernel do CR1 guarda as do CHR |
+
+Divergências do RouterOS 7.25: anuncia `gr` (vê o nosso bit F: `remote.gr-afi-fwp=ip`), mas
+retira as nossas rotas assim que o TCP cai, com `kill -9` e com `TERM` (RFC 4724 §4.2 pede que o
+helper as guarde como stale), e nunca manda End-of-RIB (§4.2: o helper MUST mandar depois do
+update inicial). Com o `select-defer-time` padrão do FRR (360 s; o temporizador por família ficou
+em 120 s), a rota do CHR ficava fora do kernel 120 s depois de ligar o GR ou de um início do
+`bgpd`; com os 10 s do CoreRouter entra em 8,9 s. Com MikroTik, o GR só protege o nosso lado.
+
+### G3.9fj: tempos de GR na janela e o vizinho sem End-of-RIB na saúde
+
+- **Routing › BGP › Instances** virou lista com modal (padrão G0.24): estado, AS, router-id, os
+  três tempos de GR (sem valor: o padrão, "120 s (default)") e comentário; duplo clique edita,
+  ✓/✗ ativam e desativam. O modal pergunta ao `routing.bgp.instance.check` (prévia, nunca erro:
+  campo ruim vira checagem) e aplica o `instance.set` que ele devolve; campo de tempo vazio volta
+  ao padrão. A prévia avisa: Restart Time não menor que o hold time de cada conexão em restart
+  (RFC 4724 §3, nomeando a conexão), AS ou router-id novos reiniciam as sessões da instância
+  (RFC 4486 Cease), instância desativada para as sessões, nome que já existe, e informa
+  Defer Time 0, tempos sem conexão em restart e os vizinhos sem End-of-RIB (o Defer Time
+  inteiro de espera a cada início do `bgpd`). Depois do OK, o texto que vai para o `bgpd` fica
+  embaixo da lista.
+- **Saúde** (`system.health.check`, System › Resources, log quando muda): `bgp.end-of-rib`
+  avisa quando um vizinho com GR dos dois lados (nós `restart`, ele anuncia a capacidade) está
+  estabelecido há 5 min e nunca mandou End-of-RIB (§4.2: o helper MUST mandar depois do update
+  inicial). O valor é "N de M" e o motivo nomeia até 3 conexões; a ação explica o RouterOS 7.25
+  e o que fazer (Defer Time curto ou `graceful_restart=no` na conexão). 5 min: uma tabela cheia
+  leva minutos para chegar.
+
+```sh
+corerouter-cli run routing.bgp.instance.check '{"id":"default","asn":"65000","router_id":"10.255.0.1","graceful_restart_time":"60"}'
+corerouter-cli run system.health.check | jq '.checks[] | select(.key == "bgp.end-of-rib")'
+```
+
+### G3.9fj: Hard Reset e o bit N (RFC 8538)
+
+O FRR 10.7.1 já anuncia o bit N e manda Hard Reset no `clear` por padrão (desde a 8.3,
+`FRR_CFG_DEFAULT_BOOL` em `bgpd/bgp_vty.c`). Com o bit N dos dois lados, toda NOTIFICATION que não
+é Hard Reset e o **hold timer expirado** viram graceful restart (§4): as rotas ficam stale.
+Hard Reset (Cease 9) no FRR: Maximum Prefixes, Administrative Shutdown, Peer De-configured,
+BFD Down (Cease 10) e Administrative Reset conforme `hard_admin_reset` (`bgp_packet.c`,
+`bgp_notify_send_hard_reset`).
+
+```sh
+corerouter-cli run routing.bgp.instance.set '{"asn":65000,"router_id":"10.255.0.1","hard_admin_reset":false}'
+```
+
+- Na instância: `graceful_notification` (bit N, padrão `true`) e `hard_admin_reset` (padrão
+  `true`; `false`: um `routing.bgp.session.clear` de um vizinho com bit N mantém as rotas stale).
+  Só o desligado fica na config e vira `no bgp graceful-restart notification` / `no bgp
+  hard-administrative-reset`. O FRR imprime só o que difere do padrão, e digitar a forma ligada a
+  cada commit faria o diff redigitá-la. Pior: `graceful-restart notification` manda a capacidade
+  a todo vizinho cada vez que é digitado.
+- `routing.bgp.session.list`: `n_bit` (o vizinho anunciou, sessão estabelecida com GR) e
+  `last_hard_reset`. Na janela, o selo `N` na coluna GR e "(Hard Reset)" no último erro. Na aba Instances, a coluna Notification (`N bit`, `graceful clear`) e os
+  dois campos no modal.
+- **Risco já existente que o PR expõe:** com GR e bit N, uma queda silenciosa (energia, link
+  cortado) do lado que reinicia deixa as rotas dele no vizinho por hold time + Restart Time. A
+  prévia da conexão avisa (`gr-bfd`) quando há `graceful_restart=yes` sem BFD, e a saúde
+  (`bgp.gr-bfd`) aponta as sessões estabelecidas assim. O remédio é BFD (a queda do BFD é Hard
+  Reset) ou desligar o bit N.
+- RouterOS 7.25: nada documentado sobre a RFC 8538. Como ele não é helper, o bit N não muda nada
+  com ele.
+
+### G3.9fj: BFD e graceful restart (RFC 5882 §4.3)
+
+O BFD do CoreRouter roda no `corerouter-daemon`: o `bfdd` só o comanda, pelo plano de dados
+distribuído. **Medido** no host (`scripts/bgp-crcr-userns.sh cbit`), com GR e BFD de
+100 ms × 3, `kill -9` no CR1 e tudo de volta 3 s depois:
+
+| O que morre no CR1 | O CR2 com a rota do CR1 | Pings perdidos (20 ms) |
+|---|---|---|
+| `bgpd` + `bfdd` | fica: o BFD continua no ar | 1–105 de ~560 |
+| `corerouter-daemon` + `bgpd` + `bfdd` | fica | 2–4 de ~564 |
+| só o `corerouter-daemon` | **sai em 416–423 ms** (BFD down com a TCP no ar: Cease 10) | 144–154 de ~560 |
+
+- Com a pilha inteira morta, a TCP cai primeiro. O FRR 10.7.1 não tira as rotas stale por causa
+  de um BFD down que chega depois disso: o `bgp_stop` só mexe nos tempos de GR com a sessão
+  estabelecida, e o `BGP_Stop` em Idle não limpa nada (`bgpd/bgp_fsm.c`). Por isso
+  `neighbor X bfd check-control-plane-failure` (RFC 5882 §4.3) não mudou nada. Com ele
+  desligado, ligado só no helper e ligado nos dois lados, a rota ficou nos três casos (**medido**),
+  e o CoreRouter não o expõe.
+- O `remote_flags` que o CoreRouter manda ao `bfdd` agora traz o bit C recebido do vizinho
+  (`RBIT_CPI`); antes ia sempre 0. O bit C enviado continua 0: o BFD cai junto com o daemon
+  enquanto o kernel continua encaminhando, então C = 1 seria falso (RFC 5880 §6.8.7). O pedido do
+  `bfdd` de pôr C = 1 não é seguido.
+- Gap: com BFD, o `kill -9` (ou uma atualização) só do `corerouter-daemon` derruba as sessões BGP,
+  embora o `bgpd` e o kernel continuem vivos.
+- RouterOS 7.25: nada documentado sobre o bit C, e ele não é helper.
+
+### G3.9fj: Long-Lived Graceful Restart (RFC 9494)
+
+```sh
+corerouter-cli run routing.bgp.instance.set '{"asn":65000,"router_id":"10.255.0.1","llgr_stale_time":3600}'
+```
+
+- `llgr_stale_time` na instância (1..16777215 s, 24 bits; sem valor: desligado, §5) vira
+  `bgp long-lived-graceful-restart stale-time N`. Quando acaba o Restart Time, o vizinho guarda as
+  nossas rotas por mais esse tempo, com a comunidade `llgr-stale` e com a menor preferência (§4.2,
+  §4.3).
+- No FRR o mesmo valor é também o máximo que guardamos das rotas de um vizinho: o
+  `bgp_open.c` fica com MIN(o recebido, o nosso). Um helper com 0 (o padrão) não guarda nada:
+  ligue nos dois lados.
+- É um valor só para todas as famílias. A RFC pede por AFI/SAFI (§5), e a prévia avisa.
+- `no-llgr` no `routing.filter` (`append bgp-communities no-llgr`) marca o que nunca deve ficar
+  velho. `llgr-stale` e `no-llgr` são os nomes que o FRR imprime.
+- `routing.bgp.session.list`: `llgr_stale_time` (o que o vizinho anunciou, quando não é 0); selo
+  `LLGR` na coluna GR.
+- A prévia mostra o pior caso (hold + Restart Time + LLGR) e avisa acima de 1 h: salto a salto,
+  uma rota stale mais específica ainda ganha de uma viva menos específica (§5).
+- RouterOS 7.25: não suporta. O FRR não manda rotas `llgr-stale` a quem não anunciou a
+  capacidade 71 (§4.3).
+
+**Medido** (2026-10-29, host, `scripts/bgp-crcr-userns.sh llgr`): Restart Time 5 s, `kill -9` do
+`bgpd` do CR1, que fica fora 25 s. Sem LLGR, o CR2 tira a rota em 5,1 s. Com 10 s de LLGR, tira em
+15,1 s; aos 7 s a rota ainda está lá, com `llgr-stale`.
+
+### Ficou para depois
+
+- Políticas e o "quais rotas passam" (G3.2b); RPKI e "Por que essa rota?" (G3.2c).
+- BFD por conexão (`use-bfd`): a coluna BFD já lê o estado do FRR; ligar o BFD é do G3.6.
+- Send Hold Timer (RFC 9687) e TTL security (GTSM, RFC 5082) como parâmetros: o FRR suporta,
+  sem pedido ainda.
+- VRF por instância (hoje uma instância não `default` vira `view` do FRR).

@@ -1,0 +1,226 @@
+From: CoreRouter <noreply@corerouter>
+Subject: [PATCH] ospfd: index the router-LSA links by position
+
+ospf_if_lookup_by_lsa_pos() finds the interface of a link of the
+router-LSA by walking all the interfaces of the area. The SPF calls it for
+each stub link of the root (ospf_intra_add_stub()) and for the next hop
+of each neighbor of the root (ospf_nexthop_calculation()), so every SPF
+run is quadratic in the number of interfaces.
+
+Keep, per area, the interface of each link of the router-LSA last built,
+filled where lsa_pos_beg and lsa_pos_end are set (router_lsa_link_set()),
+and look the position up there. An interface leaves the index when it
+goes down (where its range was reset) and when it is freed.
+
+Measured with N point-to-point interfaces without neighbors, the duration
+of one SPF after a cost change ("show ip ospf", last SPF duration), median
+of 15 on 10.7.1: 4000 interfaces 48 ms -> 3 ms, 10000: 121 ms -> 5 ms.
+
+G3.4q (docs/frr-many-interfaces.md): the same patch sent to FRR
+(docs/frr-upstream/ospfd-many-interfaces/), applied to 10.7.1. To be
+dropped once the image carries an FRR with it.
+---
+ ospfd/ospf_interface.c | 39 +++++++++++++++++++++++++--------------
+ ospfd/ospf_lsa.c       | 22 ++++++++++++++++++++++
+ ospfd/ospf_memory.c    |  1 +
+ ospfd/ospf_memory.h    |  1 +
+ ospfd/ospfd.c          |  1 +
+ ospfd/ospfd.h          |  8 ++++++++
+ 6 files changed, 58 insertions(+), 14 deletions(-)
+
+diff --git a/ospfd/ospf_interface.c b/ospfd/ospf_interface.c
+index dd6abe1ff5..7310ba8728 100644
+--- a/ospfd/ospf_interface.c
++++ b/ospfd/ospf_interface.c
+@@ -367,6 +367,21 @@ void ospf_if_cleanup(struct ospf_interface *oi)
+ 	ospf_nbr_self_reset(oi, oi->ospf->router_id);
+ }
+ 
++/* Take the interface out of the router-LSA position index. */
++static void ospf_if_lsa_pos_unset(struct ospf_interface *oi)
++{
++	struct ospf_area *area = oi->area;
++	int pos;
++
++	if (area)
++		for (pos = oi->lsa_pos_beg; pos < oi->lsa_pos_end && pos < area->lsa_pos_count;
++		     pos++)
++			if (area->lsa_pos_oi[pos] == oi)
++				area->lsa_pos_oi[pos] = NULL;
++	oi->lsa_pos_beg = 0;
++	oi->lsa_pos_end = 0;
++}
++
+ void ospf_if_free(struct ospf_interface *oi)
+ {
+ 	struct interface *ifp = oi->ifp;
+@@ -404,6 +419,7 @@ void ospf_if_free(struct ospf_interface *oi)
+ 
+ 	ospf_delete_from_if(oi->ifp, oi);
+ 
++	ospf_if_lsa_pos_unset(oi);
+ 	listnode_delete(oi->ospf->oiflist, oi);
+ 	listnode_delete(oi->area->oiflist, oi);
+ 
+@@ -422,18 +438,17 @@ int ospf_if_is_up(struct ospf_interface *oi)
+ 	return if_is_up(oi->ifp);
+ }
+ 
+-/* Lookup OSPF interface by router LSA position */
++/*
++ * Lookup OSPF interface by router LSA position: the index that building
++ * the router-LSA keeps (router_lsa_link_set()), so that the SPF does not
++ * search all the interfaces for each link.
++ */
+ struct ospf_interface *ospf_if_lookup_by_lsa_pos(struct ospf_area *area,
+ 						 int lsa_pos)
+ {
+-	struct listnode *node;
+-	struct ospf_interface *oi;
+-
+-	for (ALL_LIST_ELEMENTS_RO(area->oiflist, node, oi)) {
+-		if (lsa_pos >= oi->lsa_pos_beg && lsa_pos < oi->lsa_pos_end)
+-			return oi;
+-	}
+-	return NULL;
++	if (lsa_pos < 0 || lsa_pos >= area->lsa_pos_count)
++		return NULL;
++	return area->lsa_pos_oi[lsa_pos];
+ }
+ 
+ struct ospf_interface *ospf_if_lookup_by_local_addr(struct ospf *ospf,
+@@ -940,8 +955,7 @@ int ospf_if_down(struct ospf_interface *oi)
+ 
+ 	OSPF_ISM_EVENT_EXECUTE(oi, ISM_InterfaceDown);
+ 	/* delete position in router LSA */
+-	oi->lsa_pos_beg = 0;
+-	oi->lsa_pos_end = 0;
++	ospf_if_lsa_pos_unset(oi);
+ 	/* Shutdown packet reception and sending */
+ 	ospf_if_stream_unset(oi);
+ 
+@@ -954,7 +968,6 @@ int ospf_if_down(struct ospf_interface *oi)
+ 	return 1;
+ }
+ 
+-
+ /* Virtual Link related functions. */
+ 
+ struct ospf_vl_data *ospf_vl_data_new(struct ospf_area *area,
+@@ -1238,7 +1251,6 @@ static int ospf_vl_set_params(struct ospf_area *area,
+ 	return changed;
+ }
+ 
+-
+ void ospf_vl_up_check(struct ospf_area *area, struct in_addr rid,
+ 		      struct vertex *v)
+ {
+@@ -1340,7 +1352,6 @@ int ospf_vls_in_area(struct ospf_area *area)
+ 	return c;
+ }
+ 
+-
+ struct crypt_key *ospf_crypt_key_new(void)
+ {
+ 	return XCALLOC(MTYPE_OSPF_CRYPT_KEY, sizeof(struct crypt_key));
+diff --git a/ospfd/ospf_lsa.c b/ospfd/ospf_lsa.c
+index 6e4da169de..295417e74d 100644
+--- a/ospfd/ospf_lsa.c
++++ b/ospfd/ospf_lsa.c
+@@ -707,6 +707,24 @@ static int lsa_link_ptomp_set(struct stream **s, struct ospf_interface *oi)
+ 	return links;
+ }
+ 
++/* Index the router-LSA links [oi->lsa_pos_beg, oi->lsa_pos_end) to oi. */
++static void router_lsa_link_index(struct ospf_area *area, struct ospf_interface *oi)
++{
++	int pos;
++
++	if (oi->lsa_pos_end > area->lsa_pos_size) {
++		int size = MAX(area->lsa_pos_size * 2, 64);
++
++		while (size < oi->lsa_pos_end)
++			size *= 2;
++		area->lsa_pos_oi = XREALLOC(MTYPE_OSPF_LSA_POS, area->lsa_pos_oi,
++					    size * sizeof(*area->lsa_pos_oi));
++		area->lsa_pos_size = size;
++	}
++	for (pos = oi->lsa_pos_beg; pos < oi->lsa_pos_end; pos++)
++		area->lsa_pos_oi[pos] = oi;
++}
++
+ /* Set router-LSA link information. */
+ static int router_lsa_link_set(struct stream **s, struct ospf_area *area)
+ {
+@@ -714,6 +732,8 @@ static int router_lsa_link_set(struct stream **s, struct ospf_area *area)
+ 	struct ospf_interface *oi;
+ 	int links = 0;
+ 
++	area->lsa_pos_count = 0;
++
+ 	for (ALL_LIST_ELEMENTS_RO(area->oiflist, node, oi)) {
+ 		struct interface *ifp = oi->ifp;
+ 
+@@ -743,9 +763,11 @@ static int router_lsa_link_set(struct stream **s, struct ospf_area *area)
+ 					links += lsa_link_loopback_set(s, oi);
+ 				}
+ 				oi->lsa_pos_end = links;
++				router_lsa_link_index(area, oi);
+ 			}
+ 		}
+ 	}
++	area->lsa_pos_count = links;
+ 
+ 	return links;
+ }
+diff --git a/ospfd/ospf_memory.c b/ospfd/ospf_memory.c
+index 478af323d3..fdf918cba1 100644
+--- a/ospfd/ospf_memory.c
++++ b/ospfd/ospf_memory.c
+@@ -47,3 +47,4 @@ DEFINE_MTYPE(OSPFD, OSPF_P_SPACE, "OSPF TI-LFA P-Space");
+ DEFINE_MTYPE(OSPFD, OSPF_Q_SPACE, "OSPF TI-LFA Q-Space");
+ DEFINE_MTYPE(OSPFD, OSPF_LSA_LIST, "OSPF LSA List");
+ DEFINE_MTYPE(OSPFD, OSPF_LSDB_NODE, "OSPF LSDB Linked Node");
++DEFINE_MTYPE(OSPFD, OSPF_LSA_POS, "OSPF router-LSA link index");
+diff --git a/ospfd/ospf_memory.h b/ospfd/ospf_memory.h
+index e2139b517b..5a7c066b0c 100644
+--- a/ospfd/ospf_memory.h
++++ b/ospfd/ospf_memory.h
+@@ -46,5 +46,6 @@ DECLARE_MTYPE(OSPF_P_SPACE);
+ DECLARE_MTYPE(OSPF_Q_SPACE);
+ DECLARE_MTYPE(OSPF_LSA_LIST);
+ DECLARE_MTYPE(OSPF_LSDB_NODE);
++DECLARE_MTYPE(OSPF_LSA_POS);
+ 
+ #endif /* _QUAGGA_OSPF_MEMORY_H */
+diff --git a/ospfd/ospfd.c b/ospfd/ospfd.c
+index 32b01a17dd..3bcec84736 100644
+--- a/ospfd/ospfd.c
++++ b/ospfd/ospfd.c
+@@ -1001,6 +1001,7 @@ static void ospf_area_free(struct ospf_area *area)
+ 	route_table_finish(area->ranges);
+ 	route_table_finish(area->nssa_ranges);
+ 	list_delete(&area->oiflist);
++	XFREE(MTYPE_OSPF_LSA_POS, area->lsa_pos_oi);
+ 
+ 	if (EXPORT_NAME(area))
+ 		free(EXPORT_NAME(area));
+diff --git a/ospfd/ospfd.h b/ospfd/ospfd.h
+index 3130b7cc9d..af4064cb76 100644
+--- a/ospfd/ospfd.h
++++ b/ospfd/ospfd.h
+@@ -509,6 +509,14 @@ struct ospf_area {
+ 	/* Zebra interface list belonging to the area. */
+ 	struct list *oiflist;
+ 
++	/*
++	 * The interface of each link of the router-LSA last built, indexed
++	 * by the link's position (ospf_if_lookup_by_lsa_pos()).
++	 */
++	struct ospf_interface **lsa_pos_oi;
++	int lsa_pos_count; /* links in the router-LSA last built */
++	int lsa_pos_size;  /* allocated entries */
++
+ 	/* Area ID. */
+ 	struct in_addr area_id;
+ 

@@ -1,0 +1,25 @@
+From: CoreRouter <noreply@corerouter>
+Subject: [PATCH] net: no fallback tunnel devices by default
+
+With the tunnel drivers built in (=y), each one creates its catch-all
+device in the initial namespace while the initcalls run: gre0, gretap0,
+erspan0, ip6gre0, ip6tnl0, sit0, tunl0. The sysctl that turns them off
+(net.core.fb_tunnels_only_for_init_net=2) is applied from the command
+line only after the initcalls, too late. CoreRouter (G1.6m) creates
+every tunnel it uses through netlink and never relies on a catch-all
+device; they only showed up as "not managed" interfaces. Start the
+sysctl at 2 (no fallback devices in any namespace); it can still be
+set back to 0 or 1 at run time for namespaces created afterwards.
+
+---
+--- a/net/core/sysctl_net_core.c
++++ b/net/core/sysctl_net_core.c
+@@ -39,7 +39,7 @@
+ 
+ static int net_msg_warn;	/* Unused, but still a sysctl */
+ 
+-int sysctl_fb_tunnels_only_for_init_net __read_mostly = 0;
++int sysctl_fb_tunnels_only_for_init_net __read_mostly = 2;
+ EXPORT_SYMBOL(sysctl_fb_tunnels_only_for_init_net);
+ 
+ /* 0 - Keep current behavior:

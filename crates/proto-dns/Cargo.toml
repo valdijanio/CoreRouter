@@ -1,0 +1,69 @@
+[package]
+name = "corerouter-proto-dns"
+description = "L2: DNS over hickory-proto: the router's resolver (TTL cache, server failover, serve-stale) and the LAN forwarder's chain of stages (no sockets: the caller brings the transport)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+corerouter-model.workspace = true
+# Messages only: no async runtime, no resolver of its own (the daemon is
+# threads, docs/architecture.md "DNS").
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
+thiserror.workspace = true
+ipnet.workspace = true
+# `/ip dns static` regexp: linear time, no backtracking (hostile patterns
+# cannot stall the forwarder).
+# G4.1zd query log: block compression (pure Rust, as the daemon's), its
+# checksum, and the keyed hash of `client_address=hashed`.
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
+crc32fast = "1.5.3"
+siphasher = "1.0.4"
+regex = { version = "1.13.1", default-features = false, features = ["std", "perf", "unicode-case", "unicode-perl"] }
+# DNSSEC signing (G4.1c-2): ring, so only the daemon turns it on (the
+# engine, the GUI and wasm builds never link it).
+rustls-pki-types = { version = "1.15.1", optional = true }
+base64 = { workspace = true, optional = true }
+
+[features]
+dnssec = ["hickory-proto/dnssec-ring", "dep:rustls-pki-types", "dep:base64"]
+
+[dev-dependencies]
+serde_json.workspace = true
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "resolver"
+harness = false
+
+[[bench]]
+name = "forwarder"
+harness = false
+
+[[bench]]
+name = "zones"
+harness = false
+
+[[bench]]
+name = "dnssec"
+harness = false
+required-features = ["dnssec"]
+
+[[bench]]
+name = "adlist"
+harness = false
+
+[[bench]]
+name = "statistics"
+harness = false
+
+[[bench]]
+name = "querylog"
+harness = false
+
+[lints]
+workspace = true

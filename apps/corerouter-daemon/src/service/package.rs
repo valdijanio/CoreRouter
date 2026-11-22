@@ -1,0 +1,533 @@
+//! System › Packages (G1.6b): the A/B image's service.
+//!
+//! On its own thread. The session lock is taken only to take the queued
+//! job, to hand over status and progress (O(1) each) and, during a trial,
+//! to read the links once a second; the slot write, the read-back check
+//! and the boot variables run with the lock released.
+//!
+//! - **Image** (`--backend linux` under `corerouter-init`): the platform of
+//!   the disk (`corerouter_sysupdate::ab::discover`). On start it creates
+//!   missing boot entries; during a trial boot with `confirm=auto` it
+//!   confirms once the daemon has been up for [`GRACE`] and every
+//!   management interface runs again. Init reboots into the previous slot
+//!   if that does not happen in time.
+//! - **Virtual lab** (`--backend virtual --config-dir`): the same code on
+//!   `<config-dir>/lab-image/` (sparse files, a directory for the boot
+//!   variables), with the firmware's reboot simulated: a lab update boots
+//!   its trial on the spot, and an unconfirmed trial rolls back at its
+//!   deadline.
+//! - Anywhere else (a development machine with `--backend linux`): off, and
+//!   it says why. It never writes a host's boot variables or disks.
+//!
+//! G1.6zn: it keeps `system.boot`'s choice where the init reads it at the
+//! next boot, reports where this boot's root came from (`root`), and, once
+//! the init says the system disk went away, asks nothing more of it: the
+//! status is the last one with `system_disk_removed`, and no job runs.
+//!
+//! G1.6e: an upload job reads the chunks the control channel queues
+//! (`system.package.upload.chunk`) as a stream and installs (or checks) it
+//! like a file: header and signature first, then straight to the slot.
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use corerouter_engine::package::{self, Job, JobKind};
+use corerouter_engine::{Shared, lock};
+use corerouter_sysupdate::SlotId;
+use corerouter_sysupdate::ab::{Opts, Platform};
+use corerouter_sysupdate::package::load_keys;
+use corerouter_sysupdate::state::{Confirm, Reason, State};
+use corerouter_sysupdate::system_disk::{self, BootOptions};
+use corerouter_sysupdate::upload::ChunkReader;
+use serde_json::{Value, json};
+
+const TICK: Duration = Duration::from_millis(250);
+/// Status is re-read this often (a few small files and two signature
+/// checks: ~0.2 ms, **medido** in the lab test).
+const STATUS_EVERY: Duration = Duration::from_secs(2);
+/// A trial is confirmed only after the daemon has been up this long (it
+/// did not crash on its configuration). Flatcar waits ~2 min; ours is short
+/// because the deadline (default 300 s) bounds the risk anyway.
+const GRACE: Duration = Duration::from_secs(10);
+/// Between a slot-changing job's result and the reboot.
+const REBOOT_PAUSE: Duration = Duration::from_secs(2);
+/// The largest body a download takes (the package format's limit).
+const MAX_DOWNLOAD: usize = 4_430_233_600;
+/// The whole download (a slow link: 41 MiB at 1 Mbit/s is ~6 min).
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(1800);
+/// An upload with no chunk for this long is dropped (the client is gone).
+const UPLOAD_STALL: Duration = Duration::from_secs(60);
+const KEYS_DIR: &str = "/etc/corerouter/image-keys";
+/// Lab slots (sparse files).
+const LAB_SLOT: u64 = 256 << 20;
+const TUNING_KEYS: &[&str] = &[
+    "isolcpus",
+    "nohz_full",
+    "intel_idle.max_cstate",
+    "processor.max_cstate",
+    "pcie_aspm",
+    "iommu",
+    "mitigations",
+    "corerouter.sensors",
+];
+
+pub(crate) const SERVICE: super::Service = super::Service {
+    name: "package",
+    flags: &[super::Flag {
+        name: "--image-keys",
+        value: Some("<dir>"),
+        help: "Ed25519 public keys trusted for system packages (default /etc/corerouter/image-keys)",
+    }],
+    topic: "system",
+    enable: "always on (System › Packages)",
+    depends: &[],
+    start,
+};
+
+fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
+    let session = ctx.session.clone();
+    let keys_dir = PathBuf::from(ctx.flag("--image-keys").unwrap_or(KEYS_DIR));
+    let config_dir = ctx.config_dir.clone();
+    let lab = lock(&session).backend().starts_with("virtual lab");
+    // G1.6y: a live image has no slots of its own, and the disks it sees are
+    // not its to touch.
+    let live = ctx.flag("--live").is_some();
+    Ok(Box::new(move |health: &super::Health| {
+        let mut svc = Svc::new(&session, &keys_dir, config_dir.as_deref(), lab, live);
+        if let Some(e) = &svc.off {
+            health.disabled(Some(e));
+        }
+        while health.sleep(TICK) {
+            health.beat();
+            svc.tick(&session, health);
+        }
+        Ok(())
+    }))
+}
+
+struct Svc {
+    platform: Option<Platform>,
+    off: Option<String>,
+    started: Instant,
+    /// Unix time of the boot (deadline of a trial = boot + timeout).
+    boot_unix: u64,
+    status_at: Option<Instant>,
+    healthy_since: Option<Instant>,
+    /// G1.6zn: `/config` (the boot options), the runtime directory (the
+    /// init's files), what the options file holds, the last status and
+    /// whether the disk is known gone.
+    config: Option<PathBuf>,
+    runtime: Option<PathBuf>,
+    boot_saved: Option<bool>,
+    last: Option<Value>,
+    gone: bool,
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn uptime_s() -> u64 {
+    std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split('.').next()?.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+impl Svc {
+    fn new(session: &Shared, keys_dir: &Path, config: Option<&Path>, lab: bool, live: bool) -> Svc {
+        let made = match (lab, config) {
+            _ if live => Err("the live image is not installed: install it first (System › Install to disk)".into()),
+            (true, Some(c)) => Platform::lab(&c.join("lab-image"), c, load_keys(keys_dir), LAB_SLOT),
+            (true, None) => Err("virtual lab without --config-dir: nowhere to keep the lab image".into()),
+            (false, Some(c)) => discover(c, keys_dir),
+            (false, None) => Err("no --config-dir: no configuration to keep across an update".into()),
+        };
+        let made = made.and_then(|mut p| {
+            if p.lab.is_some() {
+                p.lab_seed(env!("CARGO_PKG_VERSION"), 1)?;
+            }
+            Ok(p)
+        });
+        let (platform, off) = match made {
+            Ok(p) => (Some(p), None),
+            Err(e) => (None, Some(e)),
+        };
+        if let Some(e) = &off {
+            package::feed_status(&mut lock(session), json!({"supported": false, "reason": e}));
+        }
+        let boot_unix = if lab { now_unix() } else { now_unix().saturating_sub(uptime_s()) };
+        let runtime = std::env::var_os("COREROUTER_RUNTIME_DIR").filter(|d| !d.is_empty()).map(PathBuf::from);
+        let boot_saved = config.and_then(|c| system_disk::load_options(c).ok()).map(|o| o.to_ram);
+        Svc {
+            platform,
+            off,
+            started: Instant::now(),
+            boot_unix,
+            status_at: None,
+            healthy_since: None,
+            config: config.map(Path::to_owned),
+            runtime,
+            boot_saved,
+            last: None,
+            gone: false,
+        }
+    }
+
+    fn tick(&mut self, session: &Shared, health: &super::Health) {
+        if self.platform.is_none() {
+            return;
+        }
+        // G1.6zn: the init's line, once the system disk is gone.
+        if let Some(line) = self.runtime.as_deref().and_then(system_disk::read_gone) {
+            if !self.gone {
+                self.gone = true;
+                health.error(line.clone());
+                self.status_at = None;
+            }
+            if self.status_at.is_none_or(|t| t.elapsed() >= STATUS_EVERY) {
+                let mut v = self.last.clone().unwrap_or_else(|| json!({"supported": true}));
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("system_disk_removed".into(), json!(line));
+                    o.insert("root".into(), self.root());
+                }
+                package::feed_status(&mut lock(session), v);
+                self.status_at = Some(Instant::now());
+            }
+            return;
+        }
+        self.save_boot_options(session, health);
+        let Some(p) = self.platform.as_mut() else { return };
+        if self.status_at.is_none() {
+            match p.provision(TUNING_KEYS) {
+                Ok(log) => log.iter().for_each(|l| {
+                    log::info!("package: {l}");
+                    health.event(l);
+                }),
+                Err(e) => health.error(format!("boot entries: {e}")),
+            }
+        }
+        let job = package::take_job(&mut lock(session));
+        if let Some(job) = job {
+            self.run(session, health, job);
+            self.status_at = None;
+        }
+        self.trial(session, health);
+        if self.status_at.is_none_or(|t| t.elapsed() >= STATUS_EVERY) {
+            self.feed(session);
+        }
+    }
+
+    fn feed(&mut self, session: &Shared) {
+        let Some(p) = self.platform.as_ref() else { return };
+        let (st, _) = State::load(&p.state_dir());
+        let mut v = p.status(&st);
+        if let (Some(t), Some(trial)) = (&st.trial, v.get_mut("trial").and_then(Value::as_object_mut))
+            && p.running() == Some(t.slot)
+        {
+            let deadline = self.boot_unix + t.timeout_s;
+            trial.insert("deadline_unix".into(), json!(deadline));
+            // The engine refines it with its clock when it has one (the lab's
+            // has none): at most STATUS_EVERY old.
+            trial.insert("remaining_s".into(), json!(deadline.saturating_sub(now_unix())));
+        }
+        if let Some(o) = v.as_object_mut() {
+            o.insert("root".into(), self.root());
+        }
+        self.last = Some(v.clone());
+        package::feed_status(&mut lock(session), v);
+        self.status_at = Some(Instant::now());
+    }
+
+    /// Where this boot's root came from (the init's `root.json`).
+    fn root(&self) -> Value {
+        self.runtime
+            .as_deref()
+            .and_then(system_disk::read_root)
+            .and_then(|r| serde_json::to_value(r).ok())
+            .unwrap_or(Value::Null)
+    }
+
+    /// G1.6zn: `system.boot` of the running configuration where the init
+    /// reads it at the next boot, when it changed (one comparison a tick).
+    fn save_boot_options(&mut self, session: &Shared, health: &super::Health) {
+        let Some(config) = &self.config else { return };
+        let want = lock(session).store().running().system.boot.to_ram;
+        if self.boot_saved == Some(want) {
+            return;
+        }
+        self.boot_saved = Some(want);
+        match system_disk::save_options(config, BootOptions { to_ram: want }) {
+            Ok(()) => {
+                let l = if want {
+                    "next boot: the system in RAM (system.boot to_ram=yes)"
+                } else {
+                    "next boot: the system read from the disk (system.boot to_ram=no)"
+                };
+                log::info!("package: {l}");
+                health.event(l);
+            }
+            Err(e) => health.error(format!("boot options: {e}")),
+        }
+    }
+
+    /// During a trial boot: confirm (auto) once healthy; in the lab, play
+    /// init's deadline.
+    fn trial(&mut self, session: &Shared, health: &super::Health) {
+        let Some(p) = self.platform.as_mut() else { return };
+        let (st, _) = State::load(&p.state_dir());
+        let Some(t) = st.trial else {
+            self.healthy_since = None;
+            return;
+        };
+        if p.running() != Some(t.slot) {
+            return;
+        }
+        if p.lab.is_some() && now_unix() >= self.boot_unix + t.timeout_s {
+            health.event(format!("lab: trial of slot {} not confirmed in {} s: rebooting", t.slot.as_str(), t.timeout_s));
+            if let Err(e) = p.lab_reboot() {
+                health.error(e);
+            }
+            self.status_at = None;
+            return;
+        }
+        if t.confirm != Confirm::Auto || self.started.elapsed() < GRACE {
+            return;
+        }
+        // G1.6ba: running *and* with an address again, the lease of a DHCP
+        // or PPPoE client included (a port that runs without its lease does
+        // not reach the operator).
+        let reachable = package::reachable_ports(&mut lock(session));
+        let down: Vec<&String> = t.mgmt.iter().filter(|m| !reachable.contains(m)).collect();
+        if !down.is_empty() {
+            self.healthy_since = None;
+            return;
+        }
+        let since = *self.healthy_since.get_or_insert_with(Instant::now);
+        if since.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        let detail = if t.mgmt.is_empty() {
+            "daemon up".to_owned()
+        } else {
+            format!("daemon up; management interfaces running with an address: {}", t.mgmt.join(", "))
+        };
+        match p.confirm(now_unix(), &detail) {
+            Ok(o) => {
+                log::info!("package: slot {} ({}) confirmed: {detail}", o.slot.as_str(), o.version);
+                health.event(format!("slot {} confirmed", o.slot.as_str()));
+            }
+            Err(e) => health.error(format!("confirm: {e}")),
+        }
+        self.status_at = None;
+    }
+
+    fn run(&mut self, session: &Shared, health: &super::Health, job: Job) {
+        let id = job.id;
+        let kind = job.kind.name();
+        let out = self.work(session, &job);
+        match &out {
+            Ok(_) => health.event(format!("{kind} done")),
+            Err(e) => {
+                log::warn!("package: {kind}: {e}");
+                health.error(format!("{kind}: {e}"));
+            }
+        }
+        let ok = out.is_ok();
+        package::finish(&mut lock(session), id, kind, out);
+        if ok && job.kind.arms_trial() && job.reboot {
+            self.feed(session);
+            self.reboot(session, health);
+        }
+    }
+
+    fn work(&mut self, session: &Shared, job: &Job) -> Result<Value, String> {
+        let p = self.platform.as_ref().ok_or("A/B updates are off")?;
+        let threads = std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(1);
+        let opts = |reason: Reason, drill: bool| Opts {
+            reason,
+            confirm: if job.confirm == "manual" { Confirm::Manual } else { Confirm::Auto },
+            timeout_s: job.timeout_s,
+            tuning: job.tuning.clone(),
+            mgmt: job.mgmt.clone(),
+            now: now_unix(),
+            pipelined: true,
+            threads,
+            config_format: job.config_format,
+            drill,
+        };
+        let phase = match job.kind {
+            JobKind::Upload { .. } => "receiving and writing",
+            JobKind::Download { .. } => "downloading and writing",
+            _ => "writing",
+        };
+        let mut last = Instant::now();
+        let mut progress = |done: u64, total: u64| {
+            if last.elapsed() >= Duration::from_millis(100) || done == total {
+                last = Instant::now();
+                package::feed_progress(&mut lock(session), phase, done, total);
+            }
+        };
+        let rep = match &job.kind {
+            JobKind::Update { path } => p.install(Path::new(path), false, &opts(Reason::Update, false), &mut progress)?,
+            JobKind::Downgrade { path: Some(path) } => {
+                p.install(Path::new(path), true, &opts(Reason::Downgrade, false), &mut progress)?
+            }
+            JobKind::Downgrade { path: None } => p.switch_back(&opts(Reason::Downgrade, false))?,
+            JobKind::BootParams { drill } => p.clone_running(&opts(Reason::BootParams, *drill), &mut progress)?,
+            JobKind::Confirm => {
+                let o = p.confirm(now_unix(), "confirmed by an operator")?;
+                return Ok(json!({"slot": o.slot.as_str(), "version": o.version}));
+            }
+            JobKind::Cancel => {
+                p.cancel()?;
+                return Ok(json!({}));
+            }
+            JobKind::Check { path } => return check(p, Path::new(path)),
+            JobKind::Download { url, verify, downgrade, check } => {
+                let reason = if *downgrade { Reason::Downgrade } else { Reason::Update };
+                let o = opts(reason, false);
+                return download(session, p, url, *verify, *check, *downgrade, &o, &mut progress);
+            }
+            JobKind::Upload { size, downgrade, check } => {
+                let rx = package::take_upload(&mut lock(session), job.id).ok_or("upload: its stream is gone (aborted)")?;
+                let mut src = ChunkReader::new(rx, *size, UPLOAD_STALL);
+                let t = Instant::now();
+                if *check {
+                    package::feed_progress(&mut lock(session), "receiving and checking", 0, *size);
+                    return corerouter_sysupdate::upload::check(&mut src, Some(*size), &p.keys);
+                }
+                let reason = if *downgrade { Reason::Downgrade } else { Reason::Update };
+                let rep = p.install_from(&mut src, Some(*size), *downgrade, &opts(reason, false), &mut progress)?;
+                log::info!(
+                    "package: upload of {size} bytes in {} ms, {} ms of it waiting for the network",
+                    t.elapsed().as_millis(),
+                    src.waited.as_millis()
+                );
+                let mut v = rep.json();
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("network_wait_ms".into(), json!(src.waited.as_millis() as u64));
+                }
+                return Ok(v);
+            }
+            JobKind::SnapshotRemove { names } => return p.remove_snapshots(names, false, false),
+            JobKind::Scrub { slot } => {
+                let s = SlotId::parse(slot).ok_or("slot must be a or b")?;
+                return p.scrub(s, threads);
+            }
+        };
+        log::info!(
+            "package: {} {} into slot {}: wrote {} bytes in {} ms, read back and verified in {} ms",
+            job.kind.name(),
+            rep.version,
+            rep.slot.map(SlotId::as_str).unwrap_or("?"),
+            rep.bytes,
+            rep.write_ms,
+            rep.verify_ms
+        );
+        Ok(rep.json())
+    }
+
+    fn reboot(&mut self, session: &Shared, health: &super::Health) {
+        let Some(p) = self.platform.as_mut() else { return };
+        if p.lab.is_some() {
+            match p.lab_reboot() {
+                Ok((_, log)) => log.iter().for_each(|l| health.event(l)),
+                Err(e) => health.error(e),
+            }
+            self.boot_unix = now_unix();
+            self.started = Instant::now();
+            self.feed(session);
+            return;
+        }
+        // A moment for whoever asked (an upload's client polls every
+        // 100 ms) to read the result before the connection goes.
+        std::thread::sleep(REBOOT_PAUSE);
+        log::warn!("package: rebooting into the trial slot");
+        reboot_image();
+    }
+}
+
+/// G1.6e: fetches `url` on a thread of its own, the body going through a
+/// bounded queue (as an upload's chunks) to the install or the check on
+/// this one: never whole in memory.
+#[allow(clippy::too_many_arguments)]
+fn download(
+    session: &Shared,
+    p: &Platform,
+    url: &str,
+    verify: bool,
+    check: bool,
+    downgrade: bool,
+    o: &Opts,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<Value, String> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(package::UPLOAD_QUEUE);
+    let t = Instant::now();
+    let fetch = {
+        let session = session.clone();
+        let url = url.to_owned();
+        std::thread::Builder::new()
+            .name("pkg-download".into())
+            .spawn(move || -> Result<(), String> {
+                let mut send = |b: &[u8]| tx.send(b.to_vec()).map_err(|_| "the install stopped reading".to_owned());
+                let resolve = |h: &str| super::dns::resolve(&session, h);
+                super::https::get_to(&url, verify, MAX_DOWNLOAD, DOWNLOAD_TIMEOUT, &resolve, Some(&mut send)).map(|_| ())
+            })
+            .map_err(|e| format!("thread: {e}"))?
+    };
+    let mut src = ChunkReader::new(rx, MAX_DOWNLOAD as u64, UPLOAD_STALL).named("download");
+    let out = if check {
+        corerouter_sysupdate::upload::check(&mut src, None, &p.keys)
+    } else {
+        p.install_from(&mut src, None, downgrade, o, progress).map(|rep| rep.json())
+    };
+    let got = src.received();
+    drop(src); // a fetch still sending (a longer body) stops here
+    let fetched = fetch.join().map_err(|_| "download thread panicked".to_owned())?;
+    let mut v = match (out, fetched) {
+        // The server's error explains a stream that ended early.
+        (Err(e), Err(f)) if e.contains("aborted") || e.contains("stalled") => return Err(format!("{url}: {f}")),
+        (Err(e), _) => return Err(e),
+        (Ok(v), _) => v,
+    };
+    log::info!("package: downloaded {got} bytes from {url} in {} ms", t.elapsed().as_millis());
+    if let Some(m) = v.as_object_mut() {
+        m.insert("url".into(), json!(url));
+        m.insert("download_ms".into(), json!(t.elapsed().as_millis() as u64));
+    }
+    Ok(v)
+}
+
+/// A package's header, signature and payload hashes, without installing.
+fn check(p: &Platform, path: &Path) -> Result<Value, String> {
+    let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let exact = f.metadata().ok().filter(|m| m.is_file()).map(|m| m.len());
+    corerouter_sysupdate::upload::check(&mut f, exact, &p.keys)
+}
+
+#[cfg(target_os = "linux")]
+fn discover(config: &Path, keys: &Path) -> Result<Platform, String> {
+    use corerouter_sysupdate::ab;
+    ab::discover(config, keys, Path::new(ab::ESP_MOUNT))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn discover(_: &Path, _: &Path) -> Result<Platform, String> {
+    Err("A/B updates run on the CoreRouter image (Linux) only".into())
+}
+
+/// Asks PID 1 (corerouter-init) for a clean reboot: it stops this daemon,
+/// syncs and unmounts `/config`.
+#[cfg(target_os = "linux")]
+fn reboot_image() {
+    if let Err(e) = rustix::process::kill_process(rustix::process::Pid::INIT, rustix::process::Signal::TERM) {
+        log::error!("package: cannot ask init to reboot: {e}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reboot_image() {}

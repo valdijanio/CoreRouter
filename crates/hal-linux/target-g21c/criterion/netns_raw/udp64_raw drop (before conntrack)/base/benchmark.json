@@ -1,0 +1,1 @@
+{"group_id":"netns_raw","function_id":"udp64/raw drop (before conntrack)","value_str":null,"throughput":{"Elements":20000},"full_id":"netns_raw/udp64/raw drop (before conntrack)","directory_name":"netns_raw/udp64_raw drop (before conntrack)","title":"netns_raw/udp64/raw drop (before conntrack)"}

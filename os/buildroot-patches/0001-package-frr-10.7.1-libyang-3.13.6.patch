@@ -1,0 +1,152 @@
+G1.6k: FRR 10.7.1 and libyang 3.13.6 in Buildroot 2025.02.19 (docs/os-image.md,
+"FRR na imagem"). A backport of Buildroot master's package/frr (34dfa10d "bump
+version to 10.7.0" and the commits before it: protobuf optional, ECMP option,
+staging headers) and package/libyang (c49e140b "bump to version 3.13.6"), with
+FRR moved on to 10.7.1, the version OSPF/LDP/SR/TI-LFA/BFD were validated
+against in the lab VM (libyang 3.13.6 there too). `cargo xtask os build`
+applies the files of os/buildroot-patches/ to the extracted Buildroot tree.
+
+Hashes: the github archive of tag frr-10.7.1 (commit f8c0b08d, in the
+archive's pax header); 10.7.0 and libyang 3.13.6 downloaded the same way give
+Buildroot master's hashes.
+
+--- a/package/frr/Config.in
++++ b/package/frr/Config.in
+@@ -1,19 +1,15 @@
+ config BR2_PACKAGE_FRR
+ 	bool "frr"
+-	depends on BR2_TOOLCHAIN_HAS_THREADS # protobuf-c
++	depends on BR2_TOOLCHAIN_HAS_THREADS # pthread
+ 	depends on !BR2_STATIC_LIBS # libyang
+ 	depends on BR2_USE_MMU # fork()
+ 	depends on BR2_TOOLCHAIN_HAS_SYNC_4 # json-c, libyang
+-	depends on BR2_INSTALL_LIBSTDCPP # protobuf-c
+-	depends on BR2_PACKAGE_HOST_PROTOBUF_ARCH_SUPPORTS # protobuf-c
+-	depends on BR2_HOST_GCC_AT_LEAST_7 # protobuf-c
+ 	select BR2_PACKAGE_BASH
+ 	select BR2_PACKAGE_BUSYBOX_SHOW_OTHERS # bash
+ 	select BR2_PACKAGE_LIBXCRYPT if BR2_TOOLCHAIN_USES_GLIBC
+ 	select BR2_PACKAGE_LIBYANG
+ 	select BR2_PACKAGE_READLINE
+ 	select BR2_PACKAGE_JSON_C
+-	select BR2_PACKAGE_PROTOBUF_C
+ 	help
+ 	  The FRRouting Protocol Suite.
+ 
+@@ -37,17 +33,38 @@
+ 	help
+ 	  Build BGP Monitoring Protocol daemon.
+ 
++config BR2_PACKAGE_FRR_MULTIPATH_MAX
++	int "maximum ECMP paths"
++	default 256
++	range 1 999
++	help
++	  Compile FRR with support for up to this many equal-cost
++	  next-hops (ECMP).
++
+ config BR2_PACKAGE_FRR_NHRPD
+ 	bool "NHRPD protocol"
+ 	select BR2_PACKAGE_C_ARES
+ 	help
+ 	  Build Next Hop Routing Protocol daemon.
+ 
++config BR2_PACKAGE_FRR_PROTOBUF
++	bool "Protobuf support (Binary-FPM and MLAG)"
++	default y
++	depends on BR2_INSTALL_LIBSTDCPP # protobuf-c
++	depends on BR2_PACKAGE_HOST_PROTOBUF_ARCH_SUPPORTS # protobuf-c
++	depends on BR2_HOST_GCC_AT_LEAST_7 # protobuf-c
++	select  BR2_PACKAGE_PROTOBUF_C
++	help
++	  Build FRR with protobuf-based Binary-FPM export and MLAG
++	  peer synchronization.
++
+ endif
+ 
+-comment "frr needs a toolchain w/ threads, dynamic library, C++, host gcc >= 7"
+-	depends on BR2_PACKAGE_HOST_PROTOBUF_ARCH_SUPPORTS
++comment "frr needs a toolchain w/ threads, dynamic library"
+ 	depends on BR2_TOOLCHAIN_HAS_SYNC_4
+ 	depends on BR2_USE_MMU
+-	depends on !BR2_TOOLCHAIN_HAS_THREADS || BR2_STATIC_LIBS || \
+-		!BR2_INSTALL_LIBSTDCPP || !BR2_HOST_GCC_AT_LEAST_7
++	depends on !BR2_TOOLCHAIN_HAS_THREADS || BR2_STATIC_LIBS
++
++comment "protobuf support for frr needs a toolchain w/ protobuf, C++, host gcc >= 7"
++	depends on BR2_PACKAGE_HOST_PROTOBUF_ARCH_SUPPORTS
++	depends on !BR2_INSTALL_LIBSTDCPP || !BR2_HOST_GCC_AT_LEAST_7
+--- a/package/frr/frr.hash
++++ b/package/frr/frr.hash
+@@ -1,5 +1,5 @@
+ # Locally calculated
+-sha256  0f10aca9074c773c12be8a07382c7560d625d4a2c842d82261d18bb8f4b26f6c  frr-10.3.tar.gz
++sha256  6aaf9d89deb94eeda6acceaa6fe48d8cd365d0908231e58f628538ff49696fc4  frr-10.7.1.tar.gz
+ sha256  7bf053957d6c38e39a06a112c60ff35b228d3bd03edbe8c9a03508b051128d16  COPYING
+ sha256  f9e0c21faf738da586281c0beaad3cd56204c19085a10fe05e4d3d7f8b5863d2  doc/licenses/BSD-2-Clause
+ sha256  aca297b8fd3a43e3bb200f1e2e043c0db6c897325f5ff7f23f7530302a6bf713  doc/licenses/BSD-3-Clause
+--- a/package/frr/frr.mk
++++ b/package/frr/frr.mk
+@@ -4,7 +4,7 @@
+ #
+ ################################################################################
+ 
+-FRR_VERSION = 10.3
++FRR_VERSION = 10.7.1
+ FRR_SITE = $(call github,FRRouting,frr,frr-$(FRR_VERSION))
+ FRR_LICENSE = GPL-2.0+
+ FRR_LICENSE_FILES = \
+@@ -23,9 +23,9 @@
+ FRR_CPE_ID_VENDOR = frrouting
+ FRR_CPE_ID_PRODUCT = frrouting
+ FRR_AUTORECONF = YES
++FRR_INSTALL_STAGING = YES
+ 
+ FRR_DEPENDENCIES = host-frr readline json-c libyang \
+-	protobuf-c \
+ 	$(if $(BR2_PACKAGE_C_ARES),c-ares) \
+ 	$(if $(BR2_PACKAGE_LIBXCRYPT),libxcrypt)
+ 
+@@ -41,7 +41,7 @@
+ 	--with-moduledir=/usr/lib/frr/modules \
+ 	--enable-configfile-mask=0640 \
+ 	--enable-logfile-mask=0640 \
+-	--enable-multipath=256 \
++	--enable-multipath=$(BR2_PACKAGE_FRR_MULTIPATH_MAX) \
+ 	--disable-ospfclient \
+ 	--enable-user=frr \
+ 	--enable-group=frr \
+@@ -89,6 +89,14 @@
+ FRR_CONF_OPTS += --disable-bfdd
+ endif
+ 
++# Optional protobuf support
++ifeq ($(BR2_PACKAGE_FRR_PROTOBUF),y)
++FRR_DEPENDENCIES += protobuf-c
++FRR_CONF_OPTS += --enable-protobuf
++else
++FRR_CONF_OPTS += --disable-protobuf
++endif
++
+ ifeq ($(BR2_TOOLCHAIN_HAS_LIBATOMIC),y)
+ FRR_CONF_ENV += LIBS=-latomic
+ endif
+--- a/package/libyang/libyang.hash
++++ b/package/libyang/libyang.hash
+@@ -1,3 +1,3 @@
+ # Locally calculated
+-sha256  77a0aaaeb3df720aeb70d6896e32e2c2be099d48df73e3cfb52567051af3e44b  libyang-2.1.148.tar.gz
+-sha256  0b7ec43747d211a1e49c53588b0822062947bab6bdcc95238578beab34cba5bb  LICENSE
++sha256  5cd5018f39c830f97d70616c003990287ce5e820ae2792763a49e2a1f63af8d6  libyang-3.13.6.tar.gz
++sha256  9fe5fa94b97504d1bc32b4221cc3d32a2bd10b2086583b980ce36a3207a88eab  LICENSE
+--- a/package/libyang/libyang.mk
++++ b/package/libyang/libyang.mk
+@@ -4,7 +4,7 @@
+ #
+ ################################################################################
+ 
+-LIBYANG_VERSION = 2.1.148
++LIBYANG_VERSION = 3.13.6
+ LIBYANG_SITE = $(call github,CESNET,libyang,v$(LIBYANG_VERSION))
+ LIBYANG_LICENSE = BSD-3-Clause
+ LIBYANG_LICENSE_FILES = LICENSE

@@ -1,0 +1,26 @@
+[package]
+name = "corerouter-storage-fs"
+description = "L4: ConfigStorage on a directory — atomic write (temp + fsync + rename), current + previous slot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+corerouter-engine.workspace = true
+corerouter-model.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+corerouter-hal.workspace = true
+criterion.workspace = true
+serde_json.workspace = true
+
+[[bench]]
+name = "commit"
+harness = false
+
+[lints]
+workspace = true

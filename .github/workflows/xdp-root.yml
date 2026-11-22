@@ -1,0 +1,59 @@
+# G2.5: só os testes do XDP com root (`cargo xtask xdp-root`), à mão numa branch (Actions →
+# xdp-root → Run workflow), sem o resto do CI: ~5 min em vez de ~15. O campo `tests` escolhe
+# os testes (vírgulas; vazio = todos): rode primeiro o que está corrigindo, depois todos. O CI
+# completo (ci.yml) continua rodando todos no lote da fila e na main.
+# Actions fixadas por SHA; o comentário diz a versão.
+
+name: xdp-root
+
+on:
+  workflow_dispatch:
+    inputs:
+      tests:
+        description: "Testes do xdp_root.rs, separados por vírgula (vazio = todos)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xdp-root-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  xdp-root:
+    name: xdp-root
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Dependências de sistema
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        with:
+          packages: nftables
+          version: "1"
+
+      - name: Toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: false
+
+      - name: cargo xtask xdp-root
+        env:
+          COREROUTER_REQUIRE_XDP: "1"
+          COREROUTER_XDP_TESTS: ${{ inputs.tests }}
+        run: |
+          sudo modprobe veth
+          cargo xtask xdp-root

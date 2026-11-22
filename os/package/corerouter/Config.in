@@ -1,0 +1,8 @@
+config BR2_PACKAGE_COREROUTER
+	bool "corerouter"
+	depends on BR2_x86_64
+	depends on BR2_TOOLCHAIN_USES_GLIBC
+	help
+	  corerouter-daemon (the router) and corerouter-init (PID 1),
+	  built from this workspace with the host's cargo and linked
+	  with the Buildroot toolchain against its glibc.

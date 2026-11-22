@@ -1,0 +1,474 @@
+# CoreRouter kernel (G1.6a), on top of the x86_64 defconfig of Linux 6.18 LTS.
+# Everything the router needs is built in (=y): no modules, no modprobe and
+# no udev in the image, and no probe waiting for a module on the rootfs.
+# `cargo xtask os build` checks that every `=y` here survived `olddefconfig`
+# (a symbol whose dependency is missing is dropped silently).
+
+# --- Boot: EFI stub (the kernel is BOOTX64.EFI, no bootloader), built-in
+# command line. The PARTUUID is rootfs-a in genimage.cfg (checked by xtask).
+# G1.6m: `bonding.max_bonds=0 dummy.numdummies=0`, so the built-in drivers
+# create no `bond0`/`dummy0` of their own (CoreRouter creates its bonds and
+# loopbacks through netlink); the tunnels' catch-all devices (`gre0`,
+# `sit0`…) are off by a patch (os/patches/linux/0002-…).
+CONFIG_EFI=y
+CONFIG_EFI_STUB=y
+CONFIG_EFI_PARTITION=y
+CONFIG_CMDLINE_BOOL=y
+CONFIG_CMDLINE="console=tty0 console=ttyS0,115200 root=PARTUUID=3e1088b8-5b4b-4fbb-b756-a271f641d018 rootfstype=squashfs rootwait ro bonding.max_bonds=0 dummy.numdummies=0 init=/usr/sbin/corerouter-init panic=10 quiet"
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+# --- A/B image (G1.6b, docs/os-image.md): each slot boots from a UEFI boot
+# entry whose options carry `dm-mod.create=` (dm-verity over the slot's
+# squashfs, built before the root is mounted: no initramfs), and the
+# updater writes Boot####/BootOrder/BootNext through efivarfs.
+CONFIG_MD=y
+CONFIG_BLK_DEV_DM=y
+CONFIG_DM_INIT=y
+CONFIG_DM_VERITY=y
+CONFIG_EFIVAR_FS=y
+CONFIG_CRYPTO_SHA256=y
+CONFIG_SQUASHFS=y
+CONFIG_SQUASHFS_ZSTD=y
+CONFIG_SQUASHFS_XATTR=y
+CONFIG_SQUASHFS_FILE_DIRECT=y
+CONFIG_SQUASHFS_COMPILE_DECOMP_MULTI_PERCPU=y
+CONFIG_EXT4_FS=y
+CONFIG_VFAT_FS=y
+CONFIG_TMPFS=y
+CONFIG_TMPFS_POSIX_ACL=y
+CONFIG_CGROUPS=y
+# G1.6zr: pressure stall information (/proc/pressure/{cpu,memory,io}).
+# System > Resources, the health check's memory pressure and system.metrics
+# read it; without it they were always empty. Kconfig: the cost is a few
+# instructions on the scheduler's wakeup and sleep paths, "too low to affect
+# common scheduling-intense workloads", visible only in hackbench; psi=0 on
+# the kernel command line turns it off.
+CONFIG_PSI=y
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+# G1.6zc: the screen console after a UEFI boot. UEFI leaves no VGA text mode,
+# only the firmware's framebuffer (GOP). With VGA_CONSOLE alone, tty1 was the
+# dummy console: the screen froze on the firmware's last frame and the
+# installer, the first-boot notices and a panic showed on the serial port
+# only (a notebook or a mini PC has none). simpledrm takes the framebuffer
+# the firmware left, fbcon draws tty1 on it, and the card's own driver
+# (i915, virtio-gpu) takes it over when it probes
+# (aperture_remove_conflicting_pci_devices). Under BIOS in text mode vgacon
+# stays. The 16x32 font is the kernel's choice above ~2560x1440
+# (lib/fonts/fonts.c, get_default_font); below that it stays 8x16.
+CONFIG_SYSFB_SIMPLEFB=y
+CONFIG_DRM_SIMPLEDRM=y
+CONFIG_DRM_FBDEV_EMULATION=y
+CONFIG_FRAMEBUFFER_CONSOLE=y
+CONFIG_FONTS=y
+CONFIG_FONT_8x16=y
+CONFIG_FONT_TER16x32=y
+# G1.6zd: a boot with nothing to say says nothing (the command line is
+# `quiet`: only errors reach the console). On a notebook (Lenovo LOQ 15IRH8,
+# 13th-gen Intel) two drivers of the x86_64 defconfig wrote error lines at
+# every boot:
+# - i915, built in, probed at 0.4 s, before / is mounted, and asked for its
+#   GuC firmware there: -ENOENT, "GuC initialization failed", "Failed to
+#   initialize GPU, declaring it wedged!". From Alder Lake-P on the GuC is
+#   not optional (drivers/gpu/drm/i915/gt/uc/intel_uc.c,
+#   uc_expand_default_options). Turning it off (i915.enable_guc=0) taints the
+#   kernel (i915_param_named_unsafe, kernel/params.c), so the driver is a
+#   module, like ice (G1.6j): corerouter-init loads it after / is up, after
+#   the network drivers and with the boot going on, and the firmware
+#   (GuC, HuC, DMC) is in the image (firmware.lock). Until it takes the
+#   screen the console is simpledrm's.
+# - snd_hda_intel: "Cannot probe codecs, giving up". A router plays no sound.
+CONFIG_DRM_I915=m
+# CONFIG_SOUND is not set
+CONFIG_HW_RANDOM=y
+CONFIG_HW_RANDOM_VIRTIO=y
+# ACPI power button and power-off (VMs, servers). The tiny driver signals
+# PID 1 itself (SIGUSR2: corerouter-init powers off cleanly), with no input
+# daemon. G1.6q: with ACPI_BUTTON the 6.18 kernel made no input device for
+# the fixed button of QEMU's q35 and nothing listened: `virsh shutdown`,
+# Proxmox's Shutdown and a server's front button did nothing.
+CONFIG_ACPI=y
+# CONFIG_ACPI_BUTTON is not set
+CONFIG_ACPI_TINY_POWER_BUTTON=y
+CONFIG_ACPI_TINY_POWER_BUTTON_SIGNAL=12
+
+# --- G1.6n: a card plugged in with the router running (hot-plug PCIe slot,
+# a card added to a running VM: QEMU's pcie-root-port, the ACPI slots of
+# the i440fx machine). PID 1 names it etherN like the ones found at boot.
+CONFIG_HOTPLUG_PCI_PCIE=y
+CONFIG_HOTPLUG_PCI_ACPI=y
+
+# --- Storage: NVMe, SATA/AHCI, virtio (VMs), SCSI disks.
+CONFIG_BLK_DEV_NVME=y
+CONFIG_ATA=y
+CONFIG_SATA_AHCI=y
+CONFIG_BLK_DEV_SD=y
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_PCI=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_CONSOLE=y
+# G1.6g: the controllers of old servers and of Proxmox's defaults for a BIOS
+# guest (LSI 53C895A, emulated MegaRAID): a kernel without the driver stops at
+# "waiting for device" whatever the bootloader did.
+CONFIG_SCSI_LOWLEVEL=y
+CONFIG_SCSI_SYM53C8XX_2=y
+CONFIG_SCSI_MPT3SAS=y
+CONFIG_SCSI_MPT2SAS=y
+CONFIG_MEGARAID_SAS=y
+CONFIG_SCSI_HPSA=y
+CONFIG_SCSI_AACRAID=y
+# LSI SAS1068 and 53C1030 (Fusion MPT): old servers, and VMware's LSI Logic.
+CONFIG_FUSION=y
+CONFIG_FUSION_SPI=y
+CONFIG_FUSION_SAS=y
+
+# --- Sensors (G1.6zf, docs/os-image.md): what System › Health reads from
+# /sys/class/hwmon. Built in: the drivers that only bind to a device the
+# machine enumerates (CPUID, PCI, the NVMe controller, a SATA disk, the
+# PHY), so they cost nothing where the chip is not. CPU: Intel (coretemp)
+# and AMD (k10temp); disks: NVMe and SATA; the Intel chipset; the Realtek
+# 2.5G ports of the mini-PCs.
+CONFIG_SENSORS_CORETEMP=y
+CONFIG_SENSORS_K10TEMP=y
+CONFIG_NVME_HWMON=y
+CONFIG_SENSORS_DRIVETEMP=y
+CONFIG_INTEL_PCH_THERMAL=y
+CONFIG_REALTEK_PHY_HWMON=y
+# G4.8g: the SPD hub of DDR5 modules (temperature). The SMBus driver lists
+# it from the SMBIOS memory devices (i2c_register_spd, i2c-smbus.c): an
+# enumerated device. Its probe only reads (it writes the page register only
+# when a page other than 0 is selected, spd5118_i2c_init).
+CONFIG_SENSORS_SPD5118=y
+# The motherboard's Super-I/O (fans, voltages, board temperatures): modules.
+# These chips are not enumerated: each driver writes its unlock key to ports
+# 0x2e/0x4e to see who answers. PID 1 loads them after the ports and the
+# screen, never in a virtual machine, and `corerouter.sensors=off` keeps
+# them out (apps/corerouter-init/src/modules.rs, SENSOR_MODULES).
+CONFIG_SENSORS_NCT6775=m
+CONFIG_SENSORS_NCT6683=m
+CONFIG_SENSORS_IT87=m
+CONFIG_SENSORS_F71882FG=m
+CONFIG_SENSORS_W83627EHF=m
+# G4.8g: the JC42.4 sensor of DDR3/DDR4 modules (servers' RDIMMs): found by
+# reading SMBus addresses 0x18-0x1f, so it loads with the Super-I/O ones.
+# The AMD chipsets' SMBus (Intel's, i801, is built in): loaded with them
+# where it is (VMware's virtual one writes an error line at boot).
+CONFIG_SENSORS_JC42=m
+CONFIG_I2C_PIIX4=m
+# The defconfig's module nobody loaded: the package sensor coretemp shows.
+# CONFIG_X86_PKG_TEMP_THERMAL is not set
+
+# --- Every core of a big machine (G1.6zi). The defconfig stops at 64 CPUs
+# ("CPU limit of 64 reached. Ignoring further CPUs"). MAXSMP is what the
+# distributions ship: 8192 CPUs, CPU masks allocated instead of on the stack
+# (above 512 they would not fit). A mask is sized by the machine's CPUs at
+# run time, so a small router pays 1.6 MiB of RAM and nothing per packet
+# (docs/os-image.md has the numbers against 64 and 512).
+CONFIG_MAXSMP=y
+# Interrupt remapping (VT-d, AMD-Vi). Without it a real machine cannot use
+# x2APIC (arch/x86/kernel/apic/apic.c, try_to_enable_x2apic) and the CPUs
+# with an APIC id of 255 or more never start. Remapping of DMA stays as it
+# was: off on Intel unless asked (intel_iommu=on).
+CONFIG_IRQ_REMAP=y
+# CONFIG_INTEL_IOMMU_DEFAULT_ON is not set
+
+# --- Disks a router boots from, beyond the storage above (G1.6zi). Built
+# in: there is no initramfs, the root is mounted by the kernel alone.
+# eMMC and SD: the soldered disk of mini-PCs and x86 appliances (Atom,
+# Celeron, N-series), on PCI or named by ACPI.
+CONFIG_MMC=y
+CONFIG_MMC_BLOCK=y
+CONFIG_MMC_SDHCI=y
+CONFIG_MMC_SDHCI_PCI=y
+CONFIG_MMC_SDHCI_ACPI=y
+# Intel VMD: with it on in the firmware (the factory default of many Intel
+# notebooks and servers) the NVMe disks sit behind it, on a PCI domain of
+# their own, and do not exist for a kernel without this driver.
+CONFIG_VMD=y
+# HPE Smart Array of Gen10 and later (aacraid and hpsa do not drive them),
+# Broadcom MPI3 (SAS4 HBAs and RAID, Dell PERC 12).
+CONFIG_SCSI_SMARTPQI=y
+CONFIG_SCSI_MPI3MR=y
+# A USB 3 disk enclosure at its speed (without it: the slower mass-storage
+# mode).
+CONFIG_USB_UAS=y
+
+# --- Hypervisors beyond KVM and VMware (G1.6zi). Each one is found by
+# CPUID: on a real machine none of this runs. Disk and port built in: the
+# root is on them, and PID 1 loads modules for PCI and USB devices only.
+CONFIG_PARAVIRT_SPINLOCKS=y
+# A VM cloned from a template or brought back from a snapshot gets a new
+# random state (it would repeat keys and nonces).
+CONFIG_VIRT_DRIVERS=y
+CONFIG_VMGENID=y
+# Hyper-V and Azure: a Generation 2 VM has VMBus devices only (no IDE, no
+# emulated card, no i8042 keyboard).
+CONFIG_HYPERV=y
+CONFIG_HYPERV_VMBUS=y
+CONFIG_HYPERV_STORAGE=y
+CONFIG_HYPERV_NET=y
+CONFIG_HYPERV_KEYBOARD=y
+CONFIG_HYPERV_UTILS=y
+# Xen HVM with paravirtual drivers (XCP-ng, XenServer). Both front ends or
+# none: with them the kernel unplugs the emulated disk and card
+# (arch/x86/xen/platform-pci-unplug.c). No classic PV guest (PARAVIRT_XXL),
+# no balloon (a router's memory is not the host's to take), none of the
+# tool stack's devices.
+CONFIG_XEN=y
+# CONFIG_XEN_PV is not set
+CONFIG_XEN_PVHVM_GUEST=y
+CONFIG_XEN_BLKDEV_FRONTEND=y
+CONFIG_XEN_NETDEV_FRONTEND=y
+# CONFIG_XEN_BALLOON is not set
+# CONFIG_XEN_GNTDEV is not set
+# CONFIG_XEN_GRANT_DEV_ALLOC is not set
+# CONFIG_XEN_DEV_EVTCHN is not set
+# CONFIG_XENFS is not set
+# CONFIG_XEN_PRIVCMD is not set
+# CONFIG_INPUT_XEN_KBDDEV_FRONTEND is not set
+
+# --- What went wrong, said in the kernel log (G1.6zi). Reported, never
+# acted on: no panic of its own (the defaults), no page taken out of use.
+# A CPU stuck in the kernel for 20 s, one stuck with interrupts off for
+# 10 s (each CPU watches its neighbour: no PMU counter, works in a VM), a
+# task blocked for 120 s: each leaves a stack trace.
+CONFIG_SOFTLOCKUP_DETECTOR=y
+CONFIG_HARDLOCKUP_DETECTOR=y
+CONFIG_HARDLOCKUP_DETECTOR_PREFER_BUDDY=y
+CONFIG_DETECT_HUNG_TASK=y
+# The end of the log of a panic, kept across the reboot (/sys/fs/pstore):
+# in the server firmware's own store (ACPI ERST, below), else in UEFI
+# variables (G1.6zx). Those share the NVRAM the A/B update writes its boot
+# entries to: the daemon saves each record to /config/crash and erases it
+# at the next boot, and turns efi_pstore off for the boot when the NVRAM is
+# short (apps/corerouter-daemon/src/service/crash_log.rs, docs/os-image.md).
+CONFIG_PSTORE=y
+CONFIG_PSTORE_COMPRESS=y
+CONFIG_EFI_VARS_PSTORE=y
+# CONFIG_EFI_VARS_PSTORE_DEFAULT_DISABLE is not set
+# PCIe errors (a bad riser, cable or card) and their containment.
+CONFIG_PCIEAER=y
+CONFIG_PCIE_DPC=y
+# Errors the server's firmware reports (memory, PCIe), and which DIMM an
+# ECC error is on. Only the controllers whose driver says nothing where
+# there is no ECC memory (igen6 and pnd2 write an error line there).
+CONFIG_RAS=y
+CONFIG_ACPI_APEI=y
+CONFIG_ACPI_APEI_GHES=y
+CONFIG_ACPI_APEI_PCIEAER=y
+CONFIG_ACPI_EXTLOG=y
+CONFIG_EDAC=y
+CONFIG_EDAC_DECODE_MCE=y
+CONFIG_EDAC_AMD64=y
+CONFIG_EDAC_SKX=y
+CONFIG_EDAC_I10NM=y
+CONFIG_EDAC_SBRIDGE=y
+CONFIG_EDAC_IE31200=y
+# CONFIG_EDAC_LEGACY_SYSFS is not set
+# CONFIG_RAS_FMPM is not set
+# Memory errors (G1.6zy). The two controllers whose driver writes an error
+# line where there is no ECC: modules, loaded by PID 1 only when the
+# firmware says the memory has ECC (SMBIOS type 16) or with
+# corerouter.edac=on (apps/corerouter-init/src/modules.rs, EDAC_MODULES).
+CONFIG_EDAC_IGEN6=m
+CONFIG_EDAC_PND2=m
+# An uncorrectable error in a page of a process kills that process (the init
+# restarts the daemon) instead of a kernel panic; a page that keeps giving
+# corrected errors is taken out of use before it fails (RAS_CEC, quiet
+# without ECC). Kernel defaults: recovery on, early kill off.
+CONFIG_MEMORY_FAILURE=y
+CONFIG_RAS_CEC=y
+
+# --- eBPF and XDP (G2.5): JIT always on, BTF for CO-RE, AF_XDP.
+CONFIG_BPF=y
+CONFIG_BPF_SYSCALL=y
+CONFIG_BPF_JIT=y
+CONFIG_BPF_JIT_ALWAYS_ON=y
+CONFIG_BPF_EVENTS=y
+CONFIG_CGROUP_BPF=y
+CONFIG_XDP_SOCKETS=y
+CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
+CONFIG_DEBUG_INFO_BTF=y
+CONFIG_NET_CLS_BPF=y
+CONFIG_NET_ACT_BPF=y
+CONFIG_NET_SCH_INGRESS=y
+CONFIG_FTRACE=y
+CONFIG_KPROBES=y
+
+# --- Routing: policy routing, ECMP, VRF (G1.14), MPLS, tunnels.
+CONFIG_IP_ADVANCED_ROUTER=y
+CONFIG_IP_MULTIPLE_TABLES=y
+CONFIG_IP_ROUTE_MULTIPATH=y
+CONFIG_IP_MROUTE=y
+CONFIG_IPV6=y
+CONFIG_IPV6_MULTIPLE_TABLES=y
+CONFIG_IPV6_SUBTREES=y
+CONFIG_IPV6_ROUTER_PREF=y
+CONFIG_IPV6_MROUTE=y
+CONFIG_NET_VRF=y
+CONFIG_LWTUNNEL=y
+CONFIG_MPLS=y
+CONFIG_NET_MPLS_GSO=y
+CONFIG_MPLS_ROUTING=y
+CONFIG_MPLS_IPTUNNEL=y
+CONFIG_NET_IPGRE_DEMUX=y
+CONFIG_NET_IPGRE=y
+CONFIG_NET_IPIP=y
+CONFIG_IPV6_GRE=y
+CONFIG_IPV6_SIT=y
+CONFIG_VXLAN=y
+CONFIG_WIREGUARD=y
+CONFIG_TUN=y
+CONFIG_VETH=y
+CONFIG_DUMMY=y
+CONFIG_MACVLAN=y
+CONFIG_IPVLAN=y
+
+# --- L2: bridge with VLAN filtering, 802.1Q, bonding (G1.1, G1.8).
+CONFIG_BRIDGE=y
+CONFIG_BRIDGE_VLAN_FILTERING=y
+CONFIG_VLAN_8021Q=y
+CONFIG_BONDING=y
+
+# --- PPPoE (G4.3): kernel PPP + PPPoE session sockets.
+CONFIG_PPP=y
+CONFIG_PPPOE=y
+CONFIG_L2TP=y
+
+# --- nftables (G2.1), conntrack and NAT (G2.3 CGNAT), flowtable fast path.
+CONFIG_NETFILTER=y
+CONFIG_NETFILTER_ADVANCED=y
+CONFIG_NETFILTER_NETLINK_QUEUE=y
+CONFIG_NETFILTER_NETLINK_LOG=y
+CONFIG_NF_CONNTRACK=y
+CONFIG_NF_CONNTRACK_MARK=y
+CONFIG_NF_CONNTRACK_ZONES=y
+CONFIG_NF_CONNTRACK_EVENTS=y
+CONFIG_NF_CONNTRACK_TIMEOUT=y
+CONFIG_NF_CONNTRACK_FTP=y
+CONFIG_NF_CT_NETLINK=y
+# G2.7c: the conntrack of a queued packet (NFQA_CFG_F_CONNTRACK, NFQA_CT).
+# The CGNAT exhaustion queues (cgnat-icmp, RFC 6888 REQ-11b) ask for it;
+# without this option nfnetlink_queue refuses the flag with EOPNOTSUPP
+# (net/netfilter/nfnetlink_queue.c, `nfnl_ct_hook` is never set) and no
+# subscriber out of ports gets the ICMP. A bool, `default n`.
+CONFIG_NETFILTER_NETLINK_GLUE_CT=y
+CONFIG_NF_NAT=y
+CONFIG_NF_TABLES=y
+CONFIG_NF_TABLES_INET=y
+CONFIG_NF_TABLES_NETDEV=y
+CONFIG_NF_TABLES_IPV4=y
+CONFIG_NF_TABLES_IPV6=y
+CONFIG_NF_TABLES_ARP=y
+CONFIG_NF_TABLES_BRIDGE=y
+CONFIG_NFT_NUMGEN=y
+CONFIG_NFT_CT=y
+CONFIG_NFT_FLOW_OFFLOAD=y
+CONFIG_NFT_CONNLIMIT=y
+CONFIG_NFT_LOG=y
+CONFIG_NFT_LIMIT=y
+CONFIG_NFT_MASQ=y
+CONFIG_NFT_REDIR=y
+CONFIG_NFT_NAT=y
+CONFIG_NFT_TUNNEL=y
+CONFIG_NFT_QUEUE=y
+CONFIG_NFT_QUOTA=y
+CONFIG_NFT_REJECT=y
+CONFIG_NFT_COMPAT=y
+CONFIG_NFT_HASH=y
+CONFIG_NFT_FIB_INET=y
+CONFIG_NFT_FIB_IPV4=y
+CONFIG_NFT_FIB_IPV6=y
+CONFIG_NFT_SOCKET=y
+CONFIG_NFT_TPROXY=y
+CONFIG_NFT_SYNPROXY=y
+CONFIG_NFT_DUP_NETDEV=y
+CONFIG_NFT_FWD_NETDEV=y
+CONFIG_NF_FLOW_TABLE=y
+CONFIG_NF_FLOW_TABLE_INET=y
+
+# --- Queues and shaping (G4.x QoS): HTB, fq_codel, cake, flower.
+CONFIG_NET_SCHED=y
+CONFIG_NET_SCH_HTB=y
+CONFIG_NET_SCH_FQ=y
+CONFIG_NET_SCH_FQ_CODEL=y
+CONFIG_NET_SCH_CAKE=y
+CONFIG_NET_SCH_TBF=y
+CONFIG_NET_CLS_FLOWER=y
+CONFIG_NET_CLS_U32=y
+CONFIG_NET_CLS_ACT=y
+CONFIG_NET_ACT_MIRRED=y
+CONFIG_NET_ACT_GACT=y
+CONFIG_NET_ACT_POLICE=y
+
+# --- NICs: Intel 10/25/40/100G, Mellanox ConnectX-4+, virtio, the common 1G.
+# G1.6j: a built-in driver probes before / is mounted, so one that asks for
+# its firmware while probing never finds the file. ice is such a driver, and
+# without its DDP package it runs in Safe Mode (one queue, no RSS, no XDP, no
+# offloads): it is a module, which corerouter-init loads after / is up.
+# e100 and pcnet32 are modules for the image's tests: QEMU emulates them
+# (boot-test: one at boot, one plugged in later), and e100 reads its firmware
+# from the root, the path no other emulated card exercises.
+CONFIG_NETDEVICES=y
+CONFIG_ETHERNET=y
+CONFIG_PCI=y
+CONFIG_PCI_MSI=y
+CONFIG_VIRTIO_NET=y
+CONFIG_NET_VENDOR_INTEL=y
+CONFIG_E1000=y
+CONFIG_E1000E=y
+CONFIG_IGB=y
+CONFIG_IGC=y
+CONFIG_IXGBE=y
+CONFIG_IXGBEVF=y
+CONFIG_I40E=y
+CONFIG_I40EVF=y
+CONFIG_ICE=m
+CONFIG_E100=m
+CONFIG_PCNET32=m
+CONFIG_MODULES=y
+CONFIG_FW_LOADER=y
+CONFIG_NET_VENDOR_MELLANOX=y
+CONFIG_MLX5_CORE=y
+CONFIG_MLX5_CORE_EN=y
+CONFIG_NET_VENDOR_REALTEK=y
+CONFIG_R8169=y
+
+# --- G1.6c: installer and VM images. The installer is a second kernel
+# (same config, its own built-in command line and an embedded initramfs,
+# os/package/corerouter-installer) booted from a CD (El Torito: SATA/IDE
+# CD-ROM) or a USB stick; it reads its payload from that medium. fw_cfg
+# carries the QEMU-only unattended-install flag (the test's). VMware and
+# VirtualBox (OVA): e1000/vmxnet3, AHCI/PIIX/PVSCSI.
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_RD_ZSTD=y
+CONFIG_BLK_DEV_SR=y
+CONFIG_ATA_PIIX=y
+CONFIG_SCSI_VIRTIO=y
+CONFIG_VMWARE_PVSCSI=y
+CONFIG_VMXNET3=y
+CONFIG_USB_SUPPORT=y
+CONFIG_USB=y
+CONFIG_USB_XHCI_HCD=y
+CONFIG_USB_EHCI_HCD=y
+CONFIG_USB_STORAGE=y
+
+# --- G1.29a: USB Ethernet adapters. r8152 (Realtek RTL8152/8153/8156, the
+# common gigabit and 2.5G dongles), ASIX AX88179/178A and AX88772, Microchip
+# LAN78xx and the class drivers (CDC ECM, NCM) the rest speak.
+# G1.29h: r8152 is a module. Built in, it probes an adapter plugged at boot
+# before the root holds /lib/firmware and asks for its rtl_nic patch there
+# (drivers/net/usb/r8152.c, rtl_hw_phy_work_func_t): -ENOENT, no retry, and
+# the chip runs without Realtek's fixes. As a module the init loads it from
+# the root (apps/corerouter-init/src/modules.rs), and the file is found.
+# cdc_ether still leaves the RTL8153 to it (IS_ENABLED covers =m).
+CONFIG_USB_NET_DRIVERS=y
+CONFIG_USB_RTL8152=m
+CONFIG_USB_USBNET=y
+CONFIG_USB_NET_AX8817X=y
+CONFIG_USB_NET_AX88179_178A=y
+CONFIG_USB_NET_CDCETHER=y
+CONFIG_USB_NET_CDC_NCM=y
+CONFIG_USB_LAN78XX=y
+
+CONFIG_FW_CFG_SYSFS=y

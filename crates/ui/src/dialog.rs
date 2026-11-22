@@ -1,0 +1,458 @@
+//! What every dialog window has in common (properties, "New …", Comment):
+//! the title with a dot ([`UNSAVED`]) while edited, the error line, the OK / Cancel / Apply
+//! row and the keyboard, so each dialog only draws its fields.
+//!
+//! Keys, as in Windows, macOS, GNOME and WinBox: Enter = OK (apply, close
+//! once the router accepts), Ctrl+Enter = Apply (stay open), Esc = Cancel
+//! (close, dropping the edits). While a request is out (a remote router
+//! answers later) OK says "Saving…" and nothing applies a second time. An
+//! error stays in the dialog and puts the cursor in the field it names.
+//!
+//! A dialog belongs to the list window it was opened from ([`Head::parent`],
+//! see [`crate::float`]): it opens over it, stays above it and closes with
+//! it. Asking for an open dialog again ([`Status::bring_to_front`]) raises it.
+
+use egui::{Button, Context, Id, Rect, RichText, TextEdit, Ui};
+use serde_json::Value;
+
+use crate::float::{Floats, Keyed, Takes};
+
+/// After the title of a dialog with edits not saved yet. "•", not "●":
+/// egui's bundled fonts have no U+25CF and would draw a missing-glyph box.
+pub(crate) const UNSAVED: char = '•';
+
+/// What the operator asked of a dialog this frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Press<B> {
+    Ok,
+    Apply,
+    Cancel,
+    /// A button of the dialog's own (Disable, Remove, Add Port …).
+    Other(B),
+}
+
+/// Request bookkeeping of one open dialog.
+#[derive(Default)]
+pub(crate) struct Status {
+    /// Last engine error, shown at the bottom like WinBox does.
+    pub error: Option<String>,
+    /// What the last command applied with a warning (its reply's
+    /// `warnings`, G1.5d): above the error line, each with the amber
+    /// "warning" chip, until the next command is sent.
+    pub warnings: Vec<String>,
+    /// Commands sent and not answered yet: OK, Apply and the dialog's own
+    /// buttons do nothing meanwhile (never apply twice).
+    pub waiting: usize,
+    /// Close once every reply is in and none failed (OK, Remove, "New …").
+    pub close_on_success: bool,
+    /// Put the cursor in the field the new error names, once.
+    focus_error: bool,
+    /// Asked for again: come to the front when next drawn.
+    bring: bool,
+}
+
+impl Status {
+    /// The dialog was asked for again (double click, Enter, menu): bring
+    /// it to the front with a flash instead of opening a second one.
+    pub(crate) fn bring_to_front(&mut self) {
+        self.bring = true;
+    }
+
+    pub(crate) fn busy(&self) -> bool {
+        self.waiting > 0
+    }
+
+    /// A command of this dialog is about to be sent.
+    pub(crate) fn sent(&mut self) {
+        self.error = None;
+        self.warnings.clear();
+        self.waiting += 1;
+    }
+
+    /// One reply arrived. Returns whether the dialog closes now.
+    pub(crate) fn replied(&mut self, result: &Result<Value, String>) -> bool {
+        self.waiting = self.waiting.saturating_sub(1);
+        if let Err(e) = result {
+            self.error = Some(e.clone());
+            self.focus_error = true;
+        }
+        self.waiting == 0 && self.close_on_success && self.error.is_none()
+    }
+
+    /// [`Self::replied`], and keep the reply's `warnings`: a dialog that
+    /// was to close stays open while there is one to read (OK again, with
+    /// nothing changed, closes it).
+    pub(crate) fn replied_warned(&mut self, result: &Result<Value, String>) -> bool {
+        let close = self.replied(result);
+        self.warn(warnings_of(result));
+        close && self.warnings.is_empty()
+    }
+
+    /// Show `warnings` (repeats dropped).
+    pub(crate) fn warn(&mut self, warnings: Vec<String>) {
+        for w in warnings {
+            if !self.warnings.contains(&w) {
+                self.warnings.push(w);
+            }
+        }
+    }
+}
+
+/// The `warnings` of a successful reply (`{…, warnings: [string]}`).
+pub(crate) fn warnings_of(result: &Result<Value, String>) -> Vec<String> {
+    result
+        .as_ref()
+        .ok()
+        .and_then(|v| v.get("warnings"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The buttons under the fields.
+pub(crate) enum Buttons {
+    /// OK, Cancel and, with `apply`, Apply.
+    Edit { apply: bool },
+    /// Read only: a single OK that closes.
+    View,
+}
+
+/// What a dialog body hands back to [`show`].
+pub(crate) struct Footer<B> {
+    pub buttons: Buttons,
+    /// Whether the router can run what OK / Apply send
+    /// ([`crate::CoreRouterUi::can`]): `Err` greys them out with the reason,
+    /// and Enter / Ctrl+Enter do nothing.
+    pub ok: Result<(), String>,
+    /// Extra buttons after OK / Cancel / Apply, each with whether the
+    /// router can run what it sends.
+    pub extra: Vec<(&'static str, B, Result<(), String>)>,
+    /// A button inside the fields was pressed.
+    pub pressed: Option<B>,
+}
+
+impl<B> Footer<B> {
+    pub(crate) fn edit(apply: bool, ok: Result<(), String>) -> Self {
+        Self {
+            buttons: Buttons::Edit { apply },
+            ok,
+            extra: Vec::new(),
+            pressed: None,
+        }
+    }
+}
+
+/// Field helper handed to a dialog body: text fields get ids named after
+/// the command parameter they fill, so an error can point at one.
+pub(crate) struct Form {
+    id: Id,
+    /// The parameter whose field takes the cursor this frame.
+    focus: Option<String>,
+}
+
+/// The text field of `param` in the dialog window `window`.
+pub(crate) fn field_id(window: Id, param: &str) -> Id {
+    window.with(("field", param))
+}
+
+impl Form {
+    /// The dialog window this form is in (for ids of custom fields).
+    pub(crate) fn window(&self) -> Id {
+        self.id
+    }
+
+    fn field_id(&self, param: &str) -> Id {
+        field_id(self.id, param)
+    }
+
+    /// A labelled one-line text field in a two-column grid.
+    pub(crate) fn text(
+        &self,
+        ui: &mut Ui,
+        label: &str,
+        param: &str,
+        value: &mut String,
+        hint: &str,
+    ) {
+        ui.label(label);
+        self.field(ui, param, value, hint);
+    }
+
+    /// The field of [`Form::text`] alone, after a label drawn by the
+    /// caller (one with an ⓘ).
+    pub(crate) fn field(&self, ui: &mut Ui, param: &str, value: &mut String, hint: &str) {
+        let resp = ui.add(
+            TextEdit::singleline(value)
+                .id(self.field_id(param))
+                .hint_text(hint)
+                .desired_width(180.0),
+        );
+        if self.focus.as_deref() == Some(param) {
+            resp.request_focus();
+        }
+        ui.end_row();
+    }
+}
+
+/// The parameter an engine error is about: `parameter 'mtu': …`.
+pub(crate) fn error_param(error: &str) -> Option<&str> {
+    let (_, rest) = error.split_once("parameter '")?;
+    let (name, _) = rest.split_once('\'')?;
+    Some(name).filter(|n| !n.is_empty())
+}
+
+/// Where and how a dialog window is drawn.
+pub(crate) struct Head<'a> {
+    pub id: Id,
+    pub title: &'a str,
+    /// Edits not saved yet: [`UNSAVED`] after the title.
+    pub dirty: bool,
+    /// Where it opens when it has no parent open.
+    pub pos: egui::Pos2,
+    /// The window it was opened from: it opens over it, stays above it
+    /// and closes with it.
+    pub parent: Option<Id>,
+}
+
+/// Room for the error line and the buttons before a resizable dialog drew
+/// them once.
+const FOOTER_ROOM: f32 = 44.0;
+
+/// Draw one dialog: its fields (`body`), the error line, the buttons, and
+/// read the keyboard. Returns what the operator asked for; the window's ✕
+/// is Cancel. While a request is out only Cancel gets through. A dialog
+/// whose parent closed returns Cancel without drawing.
+pub(crate) fn show<B>(
+    floats: &mut Floats,
+    ctx: &Context,
+    area: Rect,
+    head: Head<'_>,
+    status: &mut Status,
+    body: impl FnOnce(&mut Ui, &Form) -> Footer<B>,
+) -> Option<Press<B>> {
+    if floats.take_close(head.id) {
+        return Some(Press::Cancel);
+    }
+    if std::mem::take(&mut status.bring) {
+        floats.raise(head.id);
+    }
+    floats.set_dirty(head.id, head.dirty);
+    let pos = floats.adopt(ctx, head.id, head.parent).unwrap_or(head.pos);
+    let title = if head.dirty {
+        format!("{} {UNSAVED}", head.title)
+    } else {
+        head.title.to_owned()
+    };
+    let form = Form {
+        id: head.id,
+        focus: status
+            .focus_error
+            .then(|| status.error.as_deref().and_then(error_param))
+            .flatten()
+            .map(str::to_owned),
+    };
+    status.focus_error = false;
+    let busy = status.busy();
+    let error = status.error.as_deref();
+    let warnings = status.warnings.as_slice();
+    let mut open = true;
+    let resizable = floats.resizable(head.id);
+    let room_id = head.id.with("footer-room");
+    let mut view = false;
+    let mut can_ok = true;
+    let pressed = floats
+        .show(
+            ctx,
+            area,
+            head.id,
+            &title,
+            &mut open,
+            |w| w.default_pos(pos).resizable(resizable).collapsible(false),
+            |ui| {
+                // G1.30g: a resizable dialog gives its body the window less
+                // the footer as drawn last frame (the error line comes and
+                // goes): the body fills the window, and the window does not
+                // grow a little more every frame.
+                let footer = if resizable {
+                    let room = ui
+                        .ctx()
+                        .data(|d| d.get_temp::<f32>(room_id))
+                        .unwrap_or(FOOTER_ROOM);
+                    let size = egui::vec2(
+                        ui.available_width(),
+                        (ui.available_height() - room).max(0.0),
+                    );
+                    ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Min), |ui| {
+                        body(ui, &form)
+                    })
+                    .inner
+                } else {
+                    body(ui, &form)
+                };
+                view = matches!(footer.buttons, Buttons::View);
+                can_ok = footer.ok.is_ok();
+                let top = ui.cursor().top();
+                let pressed = buttons(ui, footer, warnings, error, busy);
+                if resizable {
+                    let used = ui.min_rect().bottom() - top + ui.spacing().item_spacing.y;
+                    ui.ctx().data_mut(|d| d.insert_temp(room_id, used));
+                }
+                pressed
+            },
+        )
+        .flatten();
+    let keyed = floats
+        .keys(ctx, head.id, Takes::Dialog)
+        .map(|k| match k {
+            Keyed::Enter => Press::Ok,
+            Keyed::CtrlEnter => Press::Apply,
+            Keyed::Escape => Press::Cancel,
+        })
+        .filter(|_| pressed.is_none());
+    let press = if open {
+        pressed.or(keyed)
+    } else {
+        Some(Press::Cancel)
+    };
+    match press {
+        // A read-only window has nothing to apply: OK closes it.
+        Some(Press::Ok) if view => Some(Press::Cancel),
+        Some(Press::Apply) if view => None,
+        // Its own children (if any) close with it, or ask first.
+        Some(Press::Cancel) => floats.close_family(ctx, head.id).then_some(Press::Cancel),
+        Some(_) if busy => None,
+        // OK / Apply greyed out: the router cannot run what they send.
+        Some(Press::Ok | Press::Apply) if !can_ok => None,
+        other => other,
+    }
+}
+
+/// The warnings, the error line and the button row. OK is the default
+/// button (Enter), drawn in the accent colour.
+fn buttons<B>(ui: &mut Ui, footer: Footer<B>, warnings: &[String], error: Option<&str>, busy: bool) -> Option<Press<B>> {
+    for w in warnings {
+        ui.horizontal_wrapped(|ui| {
+            crate::chip::chip(ui, "warning", crate::chip::AMBER.tone(ui.visuals()));
+            ui.label(w.as_str());
+        });
+    }
+    if let Some(e) = error {
+        ui.colored_label(ui.visuals().error_fg_color, e);
+    }
+    ui.separator();
+    let mut pressed = footer.pressed.map(Press::Other);
+    ui.horizontal(|ui| {
+        let apply = match footer.buttons {
+            Buttons::View => {
+                if default_button(ui, "OK", true, "Enter").clicked() {
+                    pressed = Some(Press::Ok);
+                }
+                return;
+            }
+            Buttons::Edit { apply } => apply,
+        };
+        let ok = if busy { "Saving…" } else { "OK" };
+        let can = &footer.ok;
+        if default_button(ui, ok, !busy && can.is_ok(), why(can, "Enter")).clicked() {
+            pressed = Some(Press::Ok);
+        }
+        if hinted(ui, "Cancel", true, "Esc").clicked() {
+            pressed = Some(Press::Cancel);
+        }
+        if apply && hinted(ui, "Apply", !busy && can.is_ok(), why(can, "Ctrl+Enter")).clicked() {
+            pressed = Some(Press::Apply);
+        }
+        for (text, b, can) in footer.extra {
+            let resp = ui.add_enabled(!busy && can.is_ok(), Button::new(text));
+            if let Err(why) = &can {
+                resp.on_disabled_hover_text(why.as_str());
+            } else if resp.clicked() {
+                pressed = Some(Press::Other(b));
+            }
+        }
+    });
+    pressed
+}
+
+/// The tooltip of a button: its key, or why the router cannot run it.
+fn why<'a>(can: &'a Result<(), String>, key: &'a str) -> &'a str {
+    match can {
+        Ok(()) => key,
+        Err(why) => why,
+    }
+}
+
+fn hinted(ui: &mut Ui, text: &str, enabled: bool, key: &str) -> egui::Response {
+    ui.add_enabled(enabled, Button::new(text))
+        .on_hover_text(key)
+        .on_disabled_hover_text(key)
+}
+
+/// The button Enter presses, filled with the selection colour.
+fn default_button(ui: &mut Ui, text: &str, enabled: bool, key: &str) -> egui::Response {
+    let v = ui.visuals();
+    let label = RichText::new(text).color(v.selection.stroke.color);
+    let button = Button::new(label).fill(v.selection.bg_fill);
+    let button = if enabled { button } else { Button::new(text) };
+    ui.add_enabled(enabled, button)
+        .on_hover_text(key)
+        .on_disabled_hover_text(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_names_its_parameter() {
+        assert_eq!(
+            error_param("parameter 'mtu': must be 68..=9216"),
+            Some("mtu")
+        );
+        assert_eq!(
+            error_param("batch step 1 failed: parameter 'vlan_id': is required"),
+            Some("vlan_id")
+        );
+        assert_eq!(
+            error_param("unknown parameter 'x' (did you mean y?)"),
+            Some("x")
+        );
+        assert_eq!(error_param("validation failed: …"), None);
+        assert_eq!(error_param("parameter '"), None);
+        assert_eq!(error_param("parameter '': x"), None);
+    }
+
+    #[test]
+    fn the_unsaved_mark_has_a_glyph() {
+        let ctx = Context::default();
+        ctx.run_ui(egui::RawInput::default(), |_| {})
+            .drop_without_applying_deltas();
+        let font = egui::TextStyle::Heading.resolve(&ctx.global_style());
+        assert!(ctx.fonts_mut(|f| f.has_glyph(&font, UNSAVED)));
+    }
+
+    #[test]
+    fn status_closes_only_when_every_reply_succeeded() {
+        let mut s = Status {
+            close_on_success: true,
+            ..Status::default()
+        };
+        s.sent();
+        s.sent();
+        assert!(s.busy());
+        assert!(!s.replied(&Err("parameter 'mtu': bad".into())));
+        assert!(!s.replied(&Ok(Value::Null)), "one failed: stays open");
+        assert!(!s.busy());
+        s.sent();
+        assert!(s.error.is_none(), "a new try clears the old error");
+        assert!(s.replied(&Ok(Value::Null)));
+        // A reply nobody waits for does not underflow.
+        s.waiting = 0;
+        s.replied(&Ok(Value::Null));
+        assert_eq!(s.waiting, 0);
+    }
+}

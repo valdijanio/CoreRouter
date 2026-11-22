@@ -1,0 +1,20 @@
+From: CoreRouter <noreply@corerouter>
+Subject: [PATCH] kbuild: btf: ask pahole for a reproducible BTF
+
+pahole -j encodes BTF in parallel and, without the reproducible_build
+feature (pahole >= 1.26), the order of the types depends on thread
+scheduling: two builds of the same tree give different vmlinux and
+bzImage. CoreRouter (G1.6a) wants a bit-for-bit reproducible image.
+
+---
+--- a/scripts/Makefile.btf	2026-10-27 12:59:26.959963892 -0300
++++ b/scripts/Makefile.btf	2026-10-27 12:59:26.960631016 -0300
+@@ -21,7 +21,7 @@
+ else
+ 
+ # Switch to using --btf_features for v1.26 and later.
+-pahole-flags-$(call test-ge, $(pahole-ver), 126)  = -j$(JOBS) --btf_features=encode_force,var,float,enum64,decl_tag,type_tag,optimized_func,consistent_func,decl_tag_kfuncs
++pahole-flags-$(call test-ge, $(pahole-ver), 126)  = -j$(JOBS) --btf_features=encode_force,var,float,enum64,decl_tag,type_tag,optimized_func,consistent_func,decl_tag_kfuncs,reproducible_build
+ 
+ pahole-flags-$(call test-ge, $(pahole-ver), 130) += --btf_features=attributes
+ 

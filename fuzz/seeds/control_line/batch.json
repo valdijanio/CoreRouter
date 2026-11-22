@@ -1,0 +1,1 @@
+{"id":3,"method":"engine.batch","params":{"steps":[{"command":"interface.vlan.add","params":{"name":"v9","vlan_id":9,"parent":"ether2"}},{"command":"ip.address.add","params":{"address":"10.9.0.1/24","interface":"$1.name"}}],"atomic":true}}

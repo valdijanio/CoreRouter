@@ -1,0 +1,192 @@
+[package]
+name = "corerouter-engine"
+description = "L3: Session, command registry (CommandSpec), guard, commit/rollback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+corerouter-model.workspace = true
+corerouter-hal.workspace = true
+corerouter-firewall.workspace = true
+corerouter-proto-bgp.workspace = true
+corerouter-proto-ospf.workspace = true
+corerouter-proto-mpls.workspace = true
+# G3.6b: the BFD commit checks (profiles named by BGP, OSPF and peers).
+corerouter-proto-bfd.workspace = true
+corerouter-proto-cgnat.workspace = true
+corerouter-proto-dns.workspace = true
+corerouter-proto-dhcp.workspace = true
+corerouter-proto-discovery.workspace = true
+corerouter-proto-iperf.workspace = true
+corerouter-proto-flow.workspace = true
+corerouter-proto-radius.workspace = true
+corerouter-proto-pppoe.workspace = true
+corerouter-netsim.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+ipnet.workspace = true
+base64.workspace = true
+argon2.workspace = true
+aes-gcm.workspace = true
+# G1.31: WireGuard keys (pure Rust, builds for wasm32 too).
+x25519-dalek.workspace = true
+# G1.6zs: `/certificate` reads certificates (pure Rust, builds for wasm32).
+x509-parser = { version = "0.18.1", default-features = false }
+sha2 = { version = "0.11.0", default-features = false }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom.workspace = true
+# G1.6zs: make self-signed certificates and check a key against its
+# certificate the way the TLS servers will load it (ring: not in the
+# browser lab, which makes no keys).
+rcgen.workspace = true
+rustls.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+# G6.6 tests build DNS replies.
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
+proptest.workspace = true
+
+# G4.6c: an allow list that names a big address list.
+[[bench]]
+name = "log_disk"
+harness = false
+
+[[bench]]
+name = "log_grouped"
+harness = false
+
+[[bench]]
+name = "ntp_sources"
+harness = false
+
+[[bench]]
+name = "cgnat_pba_storm"
+harness = false
+
+[[bench]]
+name = "mpls_page"
+harness = false
+
+[[bench]]
+name = "wireguard_list"
+harness = false
+
+[[bench]]
+name = "execute"
+harness = false
+
+[[bench]]
+name = "lock_hold"
+harness = false
+
+[[bench]]
+name = "package_upload"
+harness = false
+
+[[bench]]
+name = "bgp"
+harness = false
+
+[[bench]]
+name = "neighbors"
+harness = false
+
+[[bench]]
+name = "neigh_table"
+harness = false
+
+[[bench]]
+name = "gateway_check"
+harness = false
+
+[[bench]]
+name = "firewall_commit"
+harness = false
+
+[[bench]]
+name = "scale"
+harness = false
+
+[[bench]]
+name = "routes_full"
+harness = false
+
+[[bench]]
+name = "dhcp_round"
+harness = false
+
+[[bench]]
+name = "graph"
+harness = false
+
+[[bench]]
+name = "batch_import"
+harness = false
+
+[[bench]]
+name = "route_scale"
+harness = false
+
+[[bench]]
+name = "transactional"
+harness = false
+
+[[bench]]
+name = "config_store"
+harness = false
+
+[[bench]]
+name = "cgnat_who_was"
+harness = false
+
+[[bench]]
+name = "cgnat_capacity"
+harness = false
+
+[[bench]]
+name = "notice"
+harness = false
+
+[[bench]]
+name = "queue_live"
+harness = false
+
+[[bench]]
+name = "torch"
+harness = false
+
+[[bench]]
+name = "health"
+harness = false
+
+[[bench]]
+name = "framed_routes"
+harness = false
+
+[[bench]]
+name = "ipv6_nd"
+harness = false
+
+[[bench]]
+name = "wifi_spectrum"
+harness = false
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "wifi_snoop"
+harness = false
+
+# G3.4n: the OSPF query commands on a large network.
+[[bench]]
+name = "ospf_queries"
+harness = false

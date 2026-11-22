@@ -1,0 +1,106 @@
+From: CoreRouter <noreply@corerouter.invalid>
+Subject: [PATCH] wpa_supplicant: Request a new scan after a scan aborted
+ outside wpa_supplicant
+
+Since hostap commit cb5bb8168 ("Do not use aborted scan results for new
+operations", in 2.12) the results of an aborted scan are not used for
+network selection, and nothing else requests another scan: a station whose
+scan for a connection is aborted by something else than wpa_supplicant
+stays in WPA_SCANNING for good. In CoreRouter this happens when a
+station-bridge radio is added to a bond while it scans (bonding takes its
+slaves down and up): "nl80211: Scan aborted", then nothing.
+
+Remember when wpa_supplicant itself asked for the abort (ABORT_SCAN, a
+disconnection: wpas_abort_ongoing_scan()), and request a new scan a second
+later only when it did not. An abort wpa_supplicant asked for keeps the
+upstream behavior (test_scan_aborted_on_connect_no_reselect).
+
+Upstream: the same change against hostap main, with a hwsim test
+(test_scan_aborted_externally_on_connect), is ready for
+hostap@lists.infradead.org; the project's owner sends it.
+---
+--- a/wpa_supplicant/events.c
++++ b/wpa_supplicant/events.c
+@@ -2647,8 +2647,24 @@
+ 	}
+ 
+ 	if (data && data->scan_info.aborted) {
++		bool requested = wpa_s->scan_abort_requested;
++
++		wpa_s->scan_abort_requested = false;
+ 		wpa_dbg(wpa_s, MSG_DEBUG,
+ 			"Scan was aborted - do not use the incomplete scan results to trigger new operations");
++		/*
++		 * A scan for a connection that was aborted by something else
++		 * than wpa_supplicant (e.g., the interface was taken down and up
++		 * while it was scanning) would otherwise leave wpa_state at
++		 * WPA_SCANNING with nothing to request another scan.
++		 */
++		if (!requested && own_request &&
++		    wpa_s->wpa_state == WPA_SCANNING &&
++		    !wpa_s->scan_res_handler) {
++			wpa_dbg(wpa_s, MSG_DEBUG,
++				"Scan was not aborted by wpa_supplicant - request a new scan");
++			wpa_supplicant_req_new_scan(wpa_s, 1, 0);
++		}
+ 		goto scan_work_done;
+ 	}
+ 
+Somente em b/wpa_supplicant: events.c.orig
+--- a/wpa_supplicant/p2p_supplicant.c
++++ b/wpa_supplicant/p2p_supplicant.c
+@@ -387,8 +387,10 @@
+ 		wpas_p2p_scan_freqs(wpa_s, params, params->p2p_include_6ghz);
+ 
+ 	ret = wpa_drv_scan(wpa_s, params);
+-	if (ret == 0)
++	if (ret == 0) {
+ 		wpa_s->curr_scan_cookie = params->scan_cookie;
++		wpa_s->scan_abort_requested = false;
++	}
+ 	wpa_scan_free_params(params);
+ 	work->ctx = NULL;
+ 	if (ret) {
+--- a/wpa_supplicant/scan.c
++++ b/wpa_supplicant/scan.c
+@@ -239,8 +239,10 @@
+ 	 * Revisit this logic if concurrent scan operations per interface
+ 	 * is supported.
+ 	 */
+-	if (ret == 0)
++	if (ret == 0) {
+ 		wpa_s->curr_scan_cookie = params->scan_cookie;
++		wpa_s->scan_abort_requested = false;
++	}
+ 	wpa_scan_free_params(params);
+ 	work->ctx = NULL;
+ 	if (ret) {
+@@ -4199,7 +4201,10 @@
+ 		     os_strcmp(work->type, "p2p-scan") != 0))
+ 			continue;
+ 		wpa_dbg(wpa_s, MSG_DEBUG, "Abort an ongoing scan");
+-		return wpa_drv_abort_scan(wpa_s, wpa_s->curr_scan_cookie);
++		if (wpa_drv_abort_scan(wpa_s, wpa_s->curr_scan_cookie) < 0)
++			return -1;
++		wpa_s->scan_abort_requested = true;
++		return 0;
+ 	}
+ 
+ 	wpa_dbg(wpa_s, MSG_DEBUG, "No ongoing scan/p2p-scan found to abort");
+Somente em b/wpa_supplicant: scan.c.orig
+--- a/wpa_supplicant/wpa_supplicant_i.h
++++ b/wpa_supplicant/wpa_supplicant_i.h
+@@ -978,6 +978,12 @@
+ 	 * pending vendor scan request.
+ 	 */
+ 	u64 curr_scan_cookie;
++	/*
++	 * Whether wpa_supplicant itself asked the driver to abort the ongoing
++	 * scan (ABORT_SCAN, a disconnection request). Cleared when a new scan
++	 * is started.
++	 */
++	bool scan_abort_requested;
+ #define MAX_SCAN_ID 16
+ 	int scan_id[MAX_SCAN_ID];
+ 	unsigned int scan_id_count;
+Somente em b/wpa_supplicant: wpa_supplicant_i.h.orig

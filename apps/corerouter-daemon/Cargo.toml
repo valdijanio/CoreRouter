@@ -1,0 +1,124 @@
+[package]
+name = "corerouter-daemon"
+description = "L6: router daemon — owns the Session and the platform backend, serves the control channel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+corerouter-buildinfo.workspace = true
+corerouter-engine.workspace = true
+corerouter-hal.workspace = true
+corerouter-hal-linux.workspace = true
+# Firewall diagnosis (G2.1c): kernel rules back to ours (`nft::rule_of`).
+corerouter-firewall.workspace = true
+# service/frr.rs (G3.1): routing commits and state through FRR.
+corerouter-hal-frr.workspace = true
+corerouter-proto-bgp.workspace = true
+corerouter-control.workspace = true
+corerouter-storage-fs.workspace = true
+corerouter-discovery.workspace = true
+corerouter-model.workspace = true
+# G1.27d: the SHA-256 of the IEEE listing a vendor table came from.
+sha2 = { version = "0.11.0", default-features = false }
+corerouter-proto-lldp.workspace = true
+corerouter-proto-mndp.workspace = true
+# Signs zones (G4.1c-2): ring stays out of the engine and the GUI.
+corerouter-proto-dns = { workspace = true, features = ["dnssec"] }
+corerouter-proto-ntp.workspace = true
+# service/bfd.rs (G3.6): CoreRouter's own BFD engine.
+corerouter-proto-bfd.workspace = true
+# Tools › Bandwidth Test (G6.4b): the iperf3 protocol; socket2 for the UDP
+# stream sockets that share the server port (SO_REUSEADDR/SO_REUSEPORT).
+corerouter-proto-iperf.workspace = true
+socket2 = { version = "0.6.5", features = ["all"] }
+# G4.1zf: DNS over TLS, one event loop per core instead of a thread per
+# connection (already in the graph through tokio).
+mio = { version = "1.2.4", features = ["os-poll", "net"] }
+corerouter-proto-syslog.workspace = true
+corerouter-proto-flow.workspace = true
+# service/radius.rs (G4.3j): the AAA service drives the RADIUS client.
+corerouter-proto-radius.workspace = true
+# service/pppoe.rs (G4.3d): the BNG drives the PPPoE server.
+corerouter-proto-pppoe.workspace = true
+# service/ppp_ha.rs (G4.3h): the pair's role machine and session sync.
+corerouter-proto-ha.workspace = true
+# service/pppoe_bng6.rs (G4.3e): the DHCPv6 server of each PPP session;
+# service/ipoe_bng.rs (G4.3f): the DHCP server's grants and leases.
+corerouter-proto-dhcp.workspace = true
+corerouter-sysupdate.workspace = true
+ipnet.workspace = true
+getrandom.workspace = true
+log.workspace = true
+env_logger.workspace = true
+signal-hook.workspace = true
+serde_json.workspace = true
+# service/https.rs: adlist downloads (G4.1d) without a system resolver or CA
+# store: the router's resolver and the Mozilla roots compiled in.
+rustls.workspace = true
+webpki-roots = "1.0.10"
+httparse = "1.10.1"
+# service/analytics_queue.rs (G4.4f): gzip of the INSERT bodies, pure Rust
+# (miniz_oxide), no C library.
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
+# ip.dns.resolve (G4.1d): record types by name.
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# service/dns_server.rs: IP_PKTINFO / IPV6_RECVPKTINFO (answer from the
+# address the query went to), which std and socket2 lack.
+# service/bfd.rs (G3.6): `signal` for ppoll (µs timeouts; poll's ms cost
+# ~1 ms of transmit jitter, docs/bfd.md).
+nix = { version = "0.30.1", default-features = false, features = ["socket", "uio", "net", "poll", "signal"] }
+# service/package.rs: ask PID 1 (corerouter-init) to reboot into the trial slot.
+rustix = { version = "1.1.5", default-features = false, features = ["std", "process", "fs"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+# dns_doh.rs (G4.1zf): hostile HTTP and DoH input never panics.
+proptest.workspace = true
+# package_upload.rs (G1.6e): chunks go base64 over the control channel.
+base64.workspace = true
+# service/https.rs: a local TLS server with a self-signed certificate.
+rcgen.workspace = true
+# benches/radius_aaa.rs (G4.3j).
+criterion.workspace = true
+# netns_dns.rs: a test DNS server (service/dns.rs uses it as a normal
+# dependency too).
+# netns_dhcp.rs: a DHCP server thread inside another network namespace
+# (proto-dhcp is a normal dependency too).
+nix = { version = "0.30.1", default-features = false, features = ["sched", "net"] }
+# netns_ipoe.rs (G4.3f): the simulated DHCP clients read the server's
+# message types.
+dhcproto = { version = "0.15.0", default-features = false }
+
+[[bench]]
+name = "radius_aaa"
+harness = false
+
+[[bench]]
+name = "pppoe_bng"
+harness = false
+
+[[bench]]
+name = "ipoe_bng"
+harness = false
+
+# G0.31c: the conntrack queries' time under the session lock.
+[[bench]]
+name = "netns_conntrack"
+harness = false
+
+[[bench]]
+name = "netns_link_poll"
+harness = false
+
+[[bench]]
+name = "netns_tick_io"
+harness = false
+
+[lints]
+workspace = true

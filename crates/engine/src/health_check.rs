@@ -1,0 +1,2104 @@
+//! Health checks of System › Resources (G4.8a): rules over the readings
+//! (`crate::system_resource`) and the state other features keep (NTP,
+//! services, CGNAT), each with a severity, the reason and what to do, in
+//! Portuguese for people and with stable English keys for scripts and the
+//! MCP (`cpu`, `memory.pressure`…).
+//!
+//! The rules are a pure function of [`Inputs`] ([`evaluate`]), tested by a
+//! table. The thresholds follow what operators use elsewhere: Juniper's
+//! `show system alarms`, Cockpit's health overview, the PSI guidance of
+//! the kernel (`Documentation/accounting/psi.rst`: sustained `full`
+//! pressure is thrashing).
+//!
+//! Alerts ([`Session::health_alerts`]): a check that turns warning or
+//! error, or back to ok, writes one line to the router's log (topics
+//! `system` + level, origin `health`) — the path of the G4.5 bandwidth
+//! alerts, so the logging rules send it to syslog or ClickHouse. A state
+//! must hold for two readings in a row before it is logged (a value on the
+//! threshold does not flap the log).
+
+use std::collections::BTreeMap;
+
+use corerouter_model::ntp::{ClockState, NtpState};
+use corerouter_model::routing_state::{BgpSession, RoutingStatus};
+use corerouter_model::service::{ServiceState, ServiceTable};
+use serde::Serialize;
+
+use crate::Session;
+use crate::cgnat_blocks::CgnatRuntime;
+use crate::system_resource::{Level, ResourceMonitor, memory_used, percent, sensor_level};
+
+/// Severity of a check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    /// No data to judge (no daemon, no sensor).
+    Unknown,
+    Ok,
+    Warning,
+    Error,
+}
+
+impl Severity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Ok => "ok",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
+impl From<Level> for Severity {
+    fn from(l: Level) -> Self {
+        match l {
+            Level::Ok => Self::Ok,
+            Level::Warning => Self::Warning,
+            Level::Error => Self::Error,
+        }
+    }
+}
+
+/// One check's verdict.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Check {
+    /// Stable id (`cpu`, `disk`, `nic.errors`…).
+    pub key: &'static str,
+    /// Short English name (the GUI's label).
+    pub name: &'static str,
+    pub severity: Severity,
+    /// The measured value, for people (`92 %`, `ether4: 17/s`).
+    pub value: Option<String>,
+    /// Why, in Portuguese.
+    pub reason: String,
+    /// What to do, in Portuguese (`None` when ok).
+    pub action: Option<String>,
+}
+
+/// What the NTP check needs beyond the client's state (G1.6zh).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NtpClock {
+    /// The last round had nobody to ask: no server configured, none from DHCP.
+    pub no_server: bool,
+    pub clock: ClockState,
+    /// A step above 1000 s waiting for `system.ntp.client.confirm-step`.
+    pub pending_step_ms: Option<f64>,
+    /// Server clock minus ours.
+    pub offset_ms: Option<f64>,
+    /// Why the clock cannot be changed.
+    pub clock_error: Option<String>,
+}
+
+/// 2026-01-01 00:00:00 UTC: a clock before it was never set (a dead RTC
+/// battery starts in 1970 or at the board's build date). The NTP client's
+/// `MIN_VALID_UNIX` (proto-ntp, `discipline.rs`).
+pub const CLOCK_MIN_VALID_UNIX: u64 = 1_767_225_600;
+/// An offset the NTP client measures and nobody corrects is a warning above
+/// this (the client's own `WARN_OFFSET_MS`).
+pub const CLOCK_OFF_MS: f64 = 1000.0;
+
+/// `3 h 12 min`, `45 s`: how far the clock is off, for people.
+fn off_text(ms: f64) -> String {
+    let s = (ms.abs() / 1000.0).round() as u64;
+    let sign = if ms < 0.0 { "adiantado" } else { "atrasado" };
+    let size = match s {
+        0..=119 => format!("{s} s"),
+        120..=7199 => format!("{} min", s / 60),
+        7200..=172_799 => format!("{} h {} min", s / 3600, s % 3600 / 60),
+        _ => format!("{} dias", s / 86_400),
+    };
+    format!("{size} {sign}")
+}
+
+// Thresholds (warning, error).
+pub const CPU: (f32, f32) = (80.0, 95.0);
+/// PSI memory `some` avg60, % (tasks waited for memory this share of time).
+pub const PSI_SOME: (f32, f32) = (10.0, 40.0);
+/// PSI memory `full` avg60, %: everyone stalled — thrashing.
+pub const PSI_FULL_ERROR: f32 = 5.0;
+pub const MEM_USED: (f32, f32) = (90.0, 97.0);
+pub const SWAP_USED: (f32, f32) = (50.0, 90.0);
+/// Pages swapped in per second that mean the working set does not fit.
+pub const SWAP_IN_RATE: f64 = 100.0;
+/// Free space below this %.
+pub const DISK_FREE: (f32, f32) = (15.0, 5.0);
+pub const CONNTRACK: (f32, f32) = (80.0, 95.0);
+/// Drops per second on one link.
+pub const DROPS: (f64, f64) = (100.0, 10_000.0);
+/// Errors per second on one link (any is a warning: cables and optics).
+pub const ERRORS_ERROR: f64 = 100.0;
+/// OOM kills this recent (s) are reported.
+pub const OOM_WINDOW: u64 = 3600;
+
+/// G1.6qj: a process the OOM killer took, dated by its kernel line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OomVictim {
+    pub comm: String,
+    pub pid: u32,
+    /// Seconds ago.
+    pub age_s: u64,
+    pub anon_rss_kb: Option<u64>,
+}
+
+/// FRR's daemons, as the kernel names them.
+const FRR_COMMS: &[&str] = &["mgmtd", "zebra", "staticd", "bgpd", "ospfd", "ospf6d", "ldpd", "bfdd", "watchfrr"];
+
+/// "corerouter-daemon (o próprio daemon, há 12 min, 410 MiB)".
+fn victim_text(v: &OomVictim) -> String {
+    // The kernel keeps 15 bytes of the name.
+    let who = if "corerouter-daemon".starts_with(v.comm.as_str()) && v.comm.len() >= 10 {
+        "corerouter-daemon, o próprio daemon (o init o reiniciou)".to_owned()
+    } else if FRR_COMMS.contains(&v.comm.as_str()) {
+        format!("{}, do FRR", v.comm)
+    } else {
+        v.comm.clone()
+    };
+    let age = match v.age_s {
+        0..60 => format!("há {} s", v.age_s),
+        _ => format!("há {} min", v.age_s / 60),
+    };
+    match v.anon_rss_kb {
+        Some(kb) => format!("{who} (pid {}, {age}, {} MiB)", v.pid, kb / 1024),
+        None => format!("{who} (pid {}, {age})", v.pid),
+    }
+}
+/// RSS: one CPU taking this share of the receive softirqs, with at least
+/// [`RSS_MIN_CPUS`] CPUs and [`RSS_MIN_RATE`] softirqs a second.
+pub const RSS_SHARE: f64 = 50.0;
+pub const RSS_MIN_CPUS: usize = 4;
+pub const RSS_MIN_RATE: f64 = 2000.0;
+/// History points (5 s apart) the CPU check averages: 5 min.
+pub const CPU_POINTS: usize = 60;
+/// At least this many points before the CPU check judges (1 min).
+pub const CPU_MIN_POINTS: usize = 12;
+
+/// Receive buffers of the daemon's burst-prone sockets (RADIUS, the PPPoE
+/// access ports), as the services opened them: name → (bytes the kernel
+/// gave, bytes asked for). Short = `net.core.rmem_max` capped it and the
+/// daemon has no CAP_NET_ADMIN to pass it (G4.3g).
+#[derive(Debug, Default)]
+pub struct SocketBuffers {
+    pub sockets: BTreeMap<String, (usize, usize)>,
+}
+
+/// The first ECMP warning: its prefix with the paths, and the fix.
+pub type EcmpFirst = (String, Option<String>);
+
+/// G1.6zn: where the root runs from and whether the system disk is still
+/// there, from the package service's status.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SystemDisk {
+    pub in_ram: bool,
+    pub bytes: u64,
+    pub copy_ms: u64,
+    pub disk: Option<String>,
+    /// Why the root stayed on the disk although the RAM was asked for.
+    pub note: Option<String>,
+    /// The line of a system disk that went away during this boot.
+    pub removed: Option<String>,
+}
+
+/// What the rules look at, gathered from the session.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Inputs {
+    /// Average CPU load of the history window, and how many points.
+    pub cpu_avg: Option<(f32, usize)>,
+    pub psi_some60: Option<f32>,
+    pub psi_full60: Option<f32>,
+    pub mem_used: Option<f32>,
+    /// Swap in use, % (`None`: no swap).
+    pub swap_used: Option<f32>,
+    pub swap_in_rate: Option<f64>,
+    /// (mount, free %).
+    pub disks: Vec<(String, f32)>,
+    /// (sensor, °C, crit, level).
+    pub temps: Vec<(String, f64, Option<f64>, Level)>,
+    /// (interface, errors/s, drops/s).
+    pub nics: Vec<(String, f64, f64)>,
+    pub conntrack: Option<(u64, u64)>,
+    /// CGNAT: subscribers above their pool's alert percent, and new
+    /// connections that found no free port since the start.
+    pub cgnat: Option<(usize, u64)>,
+    /// G2.7d: subscribers refused lately because their blocks-mode pool had
+    /// no free block (the pool is out, not the subscriber).
+    pub cgnat_pool_full: usize,
+    /// G2.3h: `nf_conntrack_max` (the kernel's, now) against the running
+    /// pools' subscribers × connections each; `None` without CGNAT.
+    pub cgnat_conntrack: Option<crate::cgnat_conntrack::Fit>,
+    /// OOM kills seen in the last [`OOM_WINDOW`] seconds.
+    pub oom_recent: Option<u64>,
+    /// G1.6qj: the deaths of the last [`OOM_WINDOW`] seconds the kernel
+    /// log dated, newest first (even those from before this daemon).
+    pub oom_victims: Vec<OomVictim>,
+    /// NTP client enabled and its state.
+    pub ntp: Option<(bool, NtpState)>,
+    /// Something configured depends on the clock (RADIUS servers in use):
+    /// a disabled NTP client is then a warning, not just a choice.
+    pub ntp_needed: bool,
+    /// G1.6zh: what the client is doing to the clock, to say why it is not
+    /// set and what to do.
+    pub ntp_clock: NtpClock,
+    /// The router's clock (Unix seconds), when it has one.
+    pub clock_unix: Option<u64>,
+    /// Supervised services by state (`None`: no supervisor — lab).
+    pub services: Option<Vec<(String, ServiceState)>>,
+    /// (busiest CPU, its share of NET_RX %, CPUs, NET_RX/s).
+    pub rss: Option<(usize, f64, usize, f64)>,
+    /// (socket, bytes given, bytes asked) of [`SocketBuffers`] (`None`:
+    /// no service reported one).
+    pub sockbuf: Option<Vec<(String, usize, usize)>>,
+    /// ECMP groups of the routing table (G1.27j): warnings (origins mixed
+    /// or the default route), infos, and the first warning's prefix with
+    /// its paths and the fix. `None`: not looked at.
+    pub ecmp: Option<(usize, usize, Option<EcmpFirst>)>,
+    /// Enabled accounts of group full without a password (G0.3d): the
+    /// router takes an empty password from the network for them.
+    pub no_password: Vec<String>,
+    /// The running slot of the A/B image and whether its root is the
+    /// dm-verity device of its signed root hash (G1.6qb). `None`: not on
+    /// the image (lab, browser, the package service has not reported).
+    pub root_verity: Option<(String, bool)>,
+    /// The running slot's header has no signature of a key this image
+    /// trusts (a package signed by a key the installed image does not
+    /// carry). The root is then not checked against a signed hash, and a
+    /// reboot does not change that.
+    pub root_untrusted: bool,
+    /// G1.6zn: `None` off the image (or before the service reported).
+    pub system_disk: Option<SystemDisk>,
+    /// G1.6u: configuration snapshots in `/config` and the bytes of their
+    /// own (partial copies are named `config-<slot>.new`), from the
+    /// package service's status.
+    pub config_snapshots: Vec<(String, u64)>,
+    /// G1.6w: how the histories share `/config` (`None`: no disk measured).
+    pub config_disk: Option<crate::config_disk::Usage>,
+    /// G3.9fj: BGP sessions where we restart gracefully toward a neighbor
+    /// that announces graceful restart (RFC 4724), and those of them
+    /// established for [`EOR_GRACE_SECS`] that never sent End-of-RIB.
+    /// `None`: no routing daemon reported.
+    pub bgp_no_eor: Option<(usize, Vec<String>)>,
+    /// G3.9fj, RFC 8538: established sessions with the N bit on both sides
+    /// where one side restarts gracefully, and those of them without BFD.
+    /// `None`: no routing daemon reported.
+    pub bgp_gr_no_bfd: Option<(usize, Vec<String>)>,
+    /// G1.29b: USB Ethernet adapters and, for each, the alert of a port
+    /// slower than the adapter. Empty: no USB adapter (no check then).
+    pub usb: Vec<(String, Option<String>)>,
+    /// G1.29d: (adapter, watchdog actions in the last hour, gave up, the
+    /// last stall's reason).
+    pub usb_watchdog: Vec<(String, usize, bool, Option<String>)>,
+    /// G1.3b: ports of the running config not on this machine (and the
+    /// VLANs on them). Empty: every port is there (no check then).
+    pub absent_ports: Vec<String>,
+    /// G1.6ja: the network cards and what is wrong with them (`None`: nobody
+    /// looked at this machine's cards).
+    pub nic_hardware: Option<crate::nic_problems::NicHealth>,
+    /// G1.3e: (section, why) of the restored config the data plane refused
+    /// at boot. Empty: everything is in (no check then).
+    pub boot_apply: Vec<(String, String)>,
+    /// G1.6zx: what the crash-log service found (`None`: no service, the
+    /// lab or the browser).
+    pub crash: Option<CrashInput>,
+    /// G1.6zy: (module, corrected, uncorrected) of each ECC module, the
+    /// errors of no known module, the memory taken out of use (KiB).
+    /// `None`: no EDAC driver and nothing taken out (no ECC: no check).
+    pub memory: Option<MemoryInput>,
+    /// G1.31b: WireGuard peers the router tries that have not answered
+    /// for `NO_HANDSHAKE_ALERT_SECS` or more: (peer, interface, seconds,
+    /// had a handshake once). A peer that only waits or idles is not here.
+    pub wireguard_stale: Vec<(String, String, u64, bool)>,
+    /// G3.4r: each running OSPF instance's database and LSDB protection, as
+    /// the routing daemon reads them. `None`: no routing daemon.
+    pub ospf_lsdb: Option<Vec<OspfLsdbInput>>,
+    /// G3.4z: the open management sessions (not loopback) and the learned
+    /// routes that cover their peers. `None`: nothing watches (the lab).
+    pub mgmt_route: Option<(usize, Vec<crate::mgmt_guard::Finding>)>,
+    /// The RAM, bytes (`None`: not read yet).
+    pub ram_bytes: Option<u64>,
+    /// Whether any reading exists at all.
+    pub readings: bool,
+}
+
+/// G3.4r: one OSPF instance for the `ospf.lsdb` check.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OspfLsdbInput {
+    pub instance: String,
+    /// LSAs in its databases (this router's included).
+    pub lsas: u64,
+    /// Of other routers (the patched ospfd).
+    pub others: Option<u64>,
+    /// The configured limit and its warning threshold (LSAs).
+    pub limit: Option<(u64, u64)>,
+    pub protection: Option<corerouter_model::ospf_state::MaxLsaState>,
+}
+
+/// G3.4r: the share of the RAM the OSPF databases may take (estimated for
+/// ospfd + zebra) before the check warns, and before it is an error: the
+/// memory of a flood does not come back after it (glibc, **medido**).
+pub const OSPF_LSDB_RAM_WARN: u64 = 25;
+pub const OSPF_LSDB_RAM_ERROR: u64 = 50;
+
+/// G1.6zy: what the memory check looks at.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MemoryInput {
+    pub dimms: Vec<(String, u64, u64)>,
+    pub ce_noinfo: u64,
+    pub ue_noinfo: u64,
+    pub corrupted_kib: u64,
+}
+
+/// G1.6zx: the previous boot's end and where the next dump would go.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CrashInput {
+    /// (reason, summary, time) of the dump the previous boot left.
+    pub last_boot: Option<(String, String, Option<u64>)>,
+    /// The kernel's backend now (`erst`, `efi_pstore`; `None`: nowhere).
+    pub backend: Option<String>,
+    /// Free NVRAM, when the service turned `efi_pstore` off for lack of it.
+    pub efi_low: Option<u64>,
+}
+
+/// How long an established session may go without End-of-RIB before the
+/// health check names it: a full table (1 M routes) takes minutes to send.
+pub const EOR_GRACE_SECS: u64 = 300;
+
+/// Sessions with graceful restart on both sides (we restart, the neighbor
+/// announces it), established: the ones whose End-of-RIB the best path
+/// waits for after a `bgpd` start (RFC 4724 §4.1, FRR `select-defer-time`).
+fn bgp_gr_sessions(st: &RoutingStatus) -> impl Iterator<Item = &BgpSession> {
+    st.bgp_sessions.iter().filter(|b| {
+        b.established
+            && b.gr_local.as_deref() == Some("restart")
+            && matches!(b.gr_remote.as_deref(), Some("restart" | "helper"))
+    })
+}
+
+/// G3.9fj, RFC 8538 §4: sessions where a hold timer expiry is graceful
+/// (the N bit both ways, one side restarting with its forwarding state):
+/// a silent failure keeps the routes for the hold time plus the Restart
+/// Time. `n_off`: the instances that do not announce the N bit.
+fn bgp_n_bit_sessions<'a>(st: &'a RoutingStatus, n_off: &'a [String]) -> impl Iterator<Item = &'a BgpSession> {
+    st.bgp_sessions.iter().filter(move |b| {
+        b.established
+            && b.n_bit
+            && !n_off.contains(&b.instance)
+            && (b.gr_local.as_deref() == Some("restart") || b.gr_remote.as_deref() == Some("restart"))
+    })
+}
+
+/// G3.9fj: of [`bgp_gr_sessions`], the ones established for
+/// [`EOR_GRACE_SECS`] that never sent End-of-RIB (§2; the receiving
+/// speaker MUST send it after its initial update, §4.2). RouterOS 7.25 is
+/// one (**medido**, G3.9ff).
+pub(crate) fn bgp_without_eor(st: &RoutingStatus) -> impl Iterator<Item = &BgpSession> {
+    bgp_gr_sessions(st)
+        .filter(|b| b.end_of_rib_received.is_empty() && b.uptime_secs.is_some_and(|u| u >= EOR_GRACE_SECS))
+}
+
+fn level<T: PartialOrd>(v: T, warn: T, err: T, higher_is_worse: bool) -> Severity {
+    let (w, e) = if higher_is_worse {
+        (v >= warn, v >= err)
+    } else {
+        (v <= warn, v <= err)
+    };
+    if e {
+        Severity::Error
+    } else if w {
+        Severity::Warning
+    } else {
+        Severity::Ok
+    }
+}
+
+fn pct(v: f32) -> String {
+    format!("{v:.0} %")
+}
+
+/// Every check, in a fixed order.
+pub fn evaluate(i: &Inputs) -> Vec<Check> {
+    let mut out = Vec::new();
+    let mut push = |key, name, severity, value: Option<String>, reason: String, action: Option<&str>| {
+        out.push(Check {
+            key,
+            name,
+            severity,
+            value,
+            reason,
+            action: if matches!(severity, Severity::Warning | Severity::Error) {
+                action.map(str::to_owned)
+            } else {
+                None
+            },
+        });
+    };
+    let no_data = || "sem leitura da máquina".to_owned();
+
+    // CPU sustained.
+    match i.cpu_avg {
+        Some((avg, n)) if n >= CPU_MIN_POINTS => {
+            let s = level(avg, CPU.0, CPU.1, true);
+            let reason = match s {
+                Severity::Ok => format!("CPU média de {} nos últimos {} min", pct(avg), n * 5 / 60),
+                _ => format!("CPU alta por {} min (média {})", n * 5 / 60, pct(avg)),
+            };
+            push("cpu", "CPU", s, Some(pct(avg)), reason,
+                Some("Veja a aba Processes (quem consome) e a aba CPU (softirq concentrado numa CPU indica RSS/IRQ mal distribuídos)."));
+        }
+        Some((avg, _)) => push("cpu", "CPU", Severity::Unknown, Some(pct(avg)),
+            "menos de 1 min de histórico para julgar".into(), None),
+        None => push("cpu", "CPU", Severity::Unknown, None, no_data(), None),
+    }
+
+    // Memory pressure (PSI), falling back on the share in use.
+    match (i.psi_some60, i.psi_full60, i.mem_used) {
+        (Some(some), full, used) => {
+            let mut s = level(some, PSI_SOME.0, PSI_SOME.1, true);
+            if full.is_some_and(|f| f >= PSI_FULL_ERROR) {
+                s = Severity::Error;
+            }
+            let reason = match s {
+                Severity::Ok => format!("pressão de memória baixa (PSI some {some:.1} %)"),
+                _ => format!(
+                    "processos esperando memória {some:.1} % do tempo no último minuto{}",
+                    full.filter(|f| *f > 0.0).map(|f| format!(", todos parados {f:.1} %")).unwrap_or_default()
+                ),
+            };
+            push("memory.pressure", "Memory pressure", s,
+                Some(used.map_or_else(|| format!("PSI {some:.1} %"), |u| format!("{} em uso, PSI {some:.1} %", pct(u)))),
+                reason, Some("Veja quem usa memória na aba Processes; tabelas grandes (BGP full table, conntrack, cache DNS) pedem mais RAM."));
+        }
+        (None, _, Some(used)) => {
+            let s = level(used, MEM_USED.0, MEM_USED.1, true);
+            push("memory.pressure", "Memory pressure", s, Some(pct(used)),
+                format!("{} da memória em uso (este kernel não tem PSI)", pct(used)),
+                Some("Veja quem usa memória na aba Processes."));
+        }
+        _ => push("memory.pressure", "Memory pressure", Severity::Unknown, None, no_data(), None),
+    }
+
+    // Swap.
+    match i.swap_used {
+        None if i.readings => push("swap", "Swap", Severity::Ok, None, "sem swap configurado".into(), None),
+        None => push("swap", "Swap", Severity::Unknown, None, no_data(), None),
+        Some(used) => {
+            let mut s = level(used, SWAP_USED.0, SWAP_USED.1, true);
+            let thrash = i.swap_in_rate.is_some_and(|r| r >= SWAP_IN_RATE);
+            if thrash && s < Severity::Warning {
+                s = Severity::Warning;
+            }
+            let reason = if thrash {
+                format!("lendo do swap ({:.0} páginas/s): a memória não basta", i.swap_in_rate.unwrap_or(0.0))
+            } else {
+                format!("{} do swap em uso", pct(used))
+            };
+            push("swap", "Swap", s, Some(pct(used)), reason,
+                Some("Um roteador não deve viver no swap: libere memória ou acrescente RAM."));
+        }
+    }
+
+    // Disk.
+    match i.disks.iter().min_by(|a, b| a.1.total_cmp(&b.1)) {
+        None => push("disk", "Disk", Severity::Unknown, None, "nenhum disco com dados".into(), None),
+        Some((mount, free)) => {
+            let s = level(*free, DISK_FREE.0, DISK_FREE.1, false);
+            let snaps = config_reclaim(mount, &i.config_snapshots);
+            push("disk", "Disk", s, Some(format!("{mount}: {} livre", pct(*free))),
+                format!("{mount} com {} livre", pct(*free)),
+                Some(snaps.as_deref().unwrap_or("Apague logs e capturas antigos, ou reduza o histórico de gráficos (system.graph.set) e de logs em disco.")));
+        }
+    }
+
+    // G1.6w: the histories under their shares of /config.
+    match &i.config_disk {
+        None => push("config_disk", "Config disk", Severity::Unknown, None, "sem disco medido (sem --config-dir)".into(), None),
+        Some(u) => {
+            use crate::config_disk::mib;
+            let mut cut = Vec::new();
+            if u.revisions_not_saved > 0 {
+                cut.push(format!(
+                    "{} revisões mais antigas fora do disco (ficam {}; teto {})",
+                    u.revisions_not_saved,
+                    u.revisions_saved,
+                    mib(u.history_budget)
+                ));
+            }
+            if u.graph_refused > 0 {
+                cut.push(format!("{} gráficos não guardados (teto {})", u.graph_refused, mib(u.graph_budget)));
+            }
+            if u.graph_removed > 0 {
+                cut.push(format!("{} arquivos antigos de gráfico apagados", u.graph_removed));
+            }
+            if u.log_dropped > 0 {
+                cut.push(format!("{} linhas de log não chegaram ao disco", u.log_dropped));
+            }
+            if let Some(e) = &u.log_error {
+                cut.push(format!("log em disco: {e}"));
+            }
+            let value = format!("revisões {} de {}, gráficos {} de {}, log {} de {}", mib(u.history_bytes), mib(u.history_budget), mib(u.graph_bytes), mib(u.graph_budget), mib(u.log_bytes), mib(u.log_budget));
+            if cut.is_empty() {
+                push("config_disk", "Config disk", Severity::Ok, Some(value), format!("históricos dentro da cota de {} do /config", mib(u.capacity)), None);
+            } else {
+                push("config_disk", "Config disk", Severity::Warning, Some(value), cut.join("; "),
+                    Some("A configuração ativa e a revisão anterior nunca saem. Para guardar mais: um /config maior, menos interfaces nos gráficos (system.graph.set exclude), menos log em disco (system.logging) ou uma configuração menor; veja system.config-disk.print."));
+            }
+        }
+    }
+
+    // Temperature.
+    match i.temps.iter().max_by(|a, b| a.3.cmp(&b.3).then(a.1.total_cmp(&b.1))) {
+        None => push("temperature", "Temperature", Severity::Unknown, None, "nenhum sensor de temperatura".into(), None),
+        Some((name, t, crit, lvl)) => {
+            let reason = match crit {
+                Some(c) => format!("{name} a {t:.0} °C (crítico em {c:.0} °C)"),
+                None => format!("{name} a {t:.0} °C"),
+            };
+            push("temperature", "Temperature", (*lvl).into(), Some(format!("{t:.0} °C")), reason,
+                Some("Confira ventilação, ventoinhas e poeira; perto do crítico o hardware reduz o clock ou desliga."));
+        }
+    }
+
+    // NIC errors and drops.
+    let worst = i
+        .nics
+        .iter()
+        .map(|(n, e, d)| {
+            let s = if *e >= ERRORS_ERROR || *d >= DROPS.1 {
+                Severity::Error
+            } else if *e > 0.0 || *d >= DROPS.0 {
+                Severity::Warning
+            } else {
+                Severity::Ok
+            };
+            (s, n, *e, *d)
+        })
+        .max_by(|a, b| a.0.cmp(&b.0).then(a.2.total_cmp(&b.2)).then(a.3.total_cmp(&b.3)));
+    match worst {
+        None => push("nic.errors", "NIC errors", Severity::Unknown, None, "sem taxas de interface ainda".into(), None),
+        Some((Severity::Ok, ..)) => push("nic.errors", "NIC errors", Severity::Ok, None, "nenhum erro ou descarte subindo".into(), None),
+        Some((s, n, e, d)) => push("nic.errors", "NIC errors", s, Some(format!("{n}: {e:.1} erros/s, {d:.0} descartes/s")),
+            if e > 0.0 { format!("{n} com erros subindo ({e:.1}/s)") } else { format!("{n} descartando {d:.0} pacotes/s") },
+            Some("Erros: cabo, conector, óptica ou duplex. Descartes: fila cheia (anel, netdev_max_backlog) ou CPU sem fôlego — veja System › Tuning.")),
+    }
+
+    // Conntrack.
+    match i.conntrack {
+        Some((count, max)) if max > 0 => {
+            let p = percent(count, max).unwrap_or(0.0);
+            push("conntrack", "Conntrack", level(p, CONNTRACK.0, CONNTRACK.1, true),
+                Some(format!("{count}/{max}")), format!("tabela de conexões {} cheia", pct(p)),
+                Some("Cheia, conexões novas são descartadas: aumente nf_conntrack_max (System › Tuning) ou reduza os timeouts."));
+        }
+        _ => push("conntrack", "Conntrack", Severity::Unknown, None, "sem conntrack neste sistema".into(), None),
+    }
+
+    // CGNAT ports.
+    match i.cgnat {
+        None => push("cgnat.ports", "CGNAT ports", Severity::Ok, None, "sem CGNAT por blocos".into(), None),
+        // G2.7d: the pool without a free block first: more public addresses
+        // (or fewer ports per block) is the cure, not more ports.
+        Some(_) if i.cgnat_pool_full > 0 => {
+            let n = i.cgnat_pool_full;
+            push("cgnat.ports", "CGNAT ports", Severity::Error, Some(format!("{n} sem bloco")),
+                format!("{n} assinante(s) recusado(s): o pool não tem bloco livre"),
+                Some("O pool em blocos esgotou: mais endereços públicos no outside, ou menos portas por bloco (IP › Firewall › CGNAT › Capacity sugere)."));
+        }
+        Some((above, failed)) => {
+            let s = if failed > 0 { Severity::Error } else if above > 0 { Severity::Warning } else { Severity::Ok };
+            let reason = match s {
+                Severity::Error => format!("{failed} conexões novas sem porta livre no NAT"),
+                Severity::Warning => format!("{above} assinante(s) acima do alerta de portas do pool"),
+                _ => "portas dos pools com folga".into(),
+            };
+            push("cgnat.ports", "CGNAT ports", s, Some(format!("{above} acima, {failed} falhas")), reason,
+                Some("Veja IP › Firewall › CGNAT: mais portas por assinante, mais blocos ou mais endereços públicos."));
+        }
+    }
+
+    // G2.3h: the conntrack table against the CGNAT pools (only with pools).
+    if let Some(f) = &i.cgnat_conntrack {
+        let value = Some(format!("{}/{}", f.needed, f.max));
+        if f.fits() {
+            push("cgnat.conntrack", "CGNAT conntrack", Severity::Ok, value,
+                format!("o conntrack comporta os assinantes do CGNAT ({} de {} entradas)", f.needed, f.max), None);
+        } else {
+            let action = match f.profile {
+                Some((p, v)) => format!(
+                    "Aplique o perfil {} em System › Tuning (nf_conntrack_max {v}) ou aumente o max_entries: ip.firewall.connection.tracking.set max_entries={}.",
+                    p.id(), f.max_entries),
+                None if f.ram_ok => format!("Aumente o max_entries: ip.firewall.connection.tracking.set max_entries={}.", f.max_entries),
+                None => "A RAM desta máquina não comporta a tabela: menos assinantes por roteador ou menos conexões por assinante (ip.firewall.cgnat.set connections_per_subscriber).".into(),
+            };
+            push("cgnat.conntrack", "CGNAT conntrack", Severity::Warning, value,
+                format!("conntrack pequeno para o CGNAT: {} assinantes × {} conexões = {} entradas, acima do nf_conntrack_max {}; com a tabela cheia, conexões novas são descartadas",
+                    f.subscribers, f.per_subscriber, f.needed, f.max),
+                Some(action.as_str()));
+        }
+    }
+
+    // OOM kills.
+    // G1.6qj: the kernel log dates deaths the count of /proc/vmstat cannot
+    // (from before this daemon, on a machine up for more than the window).
+    let dated = u64::try_from(i.oom_victims.len()).unwrap_or(u64::MAX);
+    let recent = match i.oom_recent {
+        Some(n) => Some(n.max(dated)),
+        None if dated > 0 => Some(dated),
+        None => None,
+    };
+    match recent {
+        None => push("oom", "OOM kills", Severity::Unknown, None, no_data(), None),
+        Some(0) => push("oom", "OOM kills", Severity::Ok, None, "nenhum processo morto por falta de memória na última hora".into(), None),
+        Some(n) => {
+            let mut reason = format!("{n} processo(s) morto(s) por falta de memória na última hora");
+            if !i.oom_victims.is_empty() {
+                let names: Vec<String> = i.oom_victims.iter().take(3).map(victim_text).collect();
+                reason.push_str(": ");
+                reason.push_str(&names.join("; "));
+                if i.oom_victims.len() > 3 {
+                    reason.push_str(&format!(" e mais {}", i.oom_victims.len() - 3));
+                }
+            }
+            push("oom", "OOM kills", Severity::Error, Some(n.to_string()), reason,
+                Some("O kernel matou processos para liberar memória: veja o OS Log (filtro «Killed process») e quem cresce na aba Processes."))
+        }
+    }
+
+    // NTP and the clock (G1.6zh: "relógio não ajustado" with what to do).
+    let unset = "relógio não ajustado";
+    let c = &i.ntp_clock;
+    match i.ntp {
+        Some((false, _)) if i.ntp_needed => push("ntp", "NTP", Severity::Warning, Some("disabled".into()),
+            "cliente NTP desligado, mas há servidores RADIUS configurados: o horário errado quebra Event-Timestamp e a contabilidade".into(),
+            Some("Ligue o cliente NTP: system.ntp.client.set enabled=yes servers=…")),
+        // Off and the clock was never set (no RTC battery): every log line,
+        // certificate check and TLS login runs on a wrong date.
+        Some((false, _)) if i.clock_unix.is_some_and(|t| t < CLOCK_MIN_VALID_UNIX) => push("ntp", "NTP", Severity::Warning, Some("disabled".into()),
+            format!("{unset}: a data do roteador é anterior a 2026 (placa sem bateria no relógio?) e o cliente NTP está desligado; log, certificados e TLS dependem dela"),
+            Some("Ligue o cliente NTP: system.ntp.client.set enabled=yes (System › NTP Client); sem servidor configurado ele usa o que o DHCP entregar.")),
+        // Off is the operator's choice (or a config saved before G1.6zh,
+        // when off was the first-boot default): not a warning by itself.
+        Some((false, _)) => push("ntp", "NTP", Severity::Ok, Some("disabled".into()),
+            "cliente NTP desligado: o relógio segue o da placa (RTC); ligue em System › NTP Client se logs e certificados precisarem do horário certo".into(),
+            None),
+        Some((true, NtpState::Synchronized)) => match c.clock {
+            ClockState::AwaitingConfirmation => push("ntp", "NTP", Severity::Warning, Some("awaiting-confirmation".into()),
+                format!("{unset}: está {} em relação ao servidor; acima de 1000 s o acerto espera confirmação",
+                    c.pending_step_ms.or(c.offset_ms).map_or_else(|| "mais de 1000 s fora".to_owned(), off_text)),
+                Some("Confira a hora do servidor e confirme: system.ntp.client.confirm-step (botão Confirm Step em System › NTP Client).")),
+            ClockState::Refused => push("ntp", "NTP", Severity::Warning, Some("refused".into()),
+                format!("{unset}: a resposta do servidor levaria o relógio para antes de 2026 e foi recusada"),
+                Some("O servidor NTP está com a hora errada: troque-o em System › NTP Client.")),
+            // Measured, not corrected (set_system_clock=no, no CAP_SYS_TIME,
+            // the virtual lab): a warning only when it is really off.
+            ClockState::NotSet if c.offset_ms.is_some_and(|o| o.abs() > CLOCK_OFF_MS) => push("ntp", "NTP", Severity::Warning, Some("not-set".into()),
+                format!("{unset}: está {} e não está sendo corrigido: {}", c.offset_ms.map_or_else(String::new, off_text),
+                    c.clock_error.as_deref().unwrap_or("set_system_clock=no")),
+                Some("Ligue set_system_clock (System › NTP Client), ou acerte o relógio por quem cuida dele nesta máquina.")),
+            _ => push("ntp", "NTP", Severity::Ok, Some("synchronized".into()), "relógio sincronizado".into(), None),
+        },
+        Some((true, NtpState::UsingLocalClock)) => push("ntp", "NTP", Severity::Warning, Some("using-local-clock".into()),
+            "sem resposta dos servidores: o servidor NTP está dando a hora do relógio local".into(),
+            Some("Confira os servidores do cliente; o relógio local deriva sem correção.")),
+        Some((true, NtpState::Waiting)) if c.no_server => push("ntp", "NTP", Severity::Warning, Some("no-server".into()),
+            format!("{unset}: o cliente NTP não tem a quem perguntar (nenhum servidor configurado e nenhum cliente DHCP entregou um: opção 42 do DHCPv4, 56 do DHCPv6)"),
+            Some("Defina um servidor: system.ntp.client.set servers=… (System › NTP Client), ou use um cliente DHCP (IPv4 ou IPv6) com use_peer_ntp numa rede que entregue a opção 42 ou a 56.")),
+        Some((true, NtpState::Waiting)) => push("ntp", "NTP", Severity::Warning, Some("waiting".into()),
+            format!("{unset}: cliente NTP sem resposta dos servidores"),
+            Some("Confira os servidores e se a porta UDP 123 sai (System › NTP Client mostra o último erro).")),
+        Some((true, NtpState::Stopped)) | None => push("ntp", "NTP", Severity::Unknown, None, "sem daemon rodando o cliente NTP".into(), None),
+    }
+
+    // Accounts without a password (G0.3d): logins from any network with an
+    // empty password are accepted, as on a RouterOS CHR; the operator's
+    // choice, so a warning, never an error.
+    if i.no_password.is_empty() {
+        push("auth.no_password", "Admin password", Severity::Ok, None,
+            "todas as contas do grupo full têm senha".into(), None);
+    } else {
+        let names = i.no_password.iter().map(|n| n.chars().take(64).collect::<String>()).collect::<Vec<_>>().join(", ");
+        push("auth.no_password", "Admin password", Severity::Warning, Some(names.clone()),
+            format!("conta(s) {names} do grupo full sem senha: qualquer um que alcance o roteador pela rede entra com a senha vazia e o controla"),
+            Some("Defina a senha: botão \"Set password\" na barra da GUI, `/user set admin password=…` no terminal ou user.set."));
+    }
+
+    // The root file system checked block by block against the signed root
+    // hash (G1.6qb). The first boot of a qcow2/OVA or of a disk written with
+    // dd goes through the built-in fallback `root=PARTUUID=`, without
+    // verity, and writes the slot's boot entry: the next boot is verified.
+    // A VM of the 2026-10-29 test ran a whole day like that unnoticed.
+    match &i.root_verity {
+        None => push("root.verity", "Root verity", Severity::Unknown, None,
+            "fora da imagem A/B (laboratório, ou o serviço de pacotes não respondeu)".into(), None),
+        Some((slot, true)) => push("root.verity", "Root verity", Severity::Ok, Some(format!("slot {slot}")),
+            format!("o slot {slot} roda pela raiz dm-verity, conferida contra o hash assinado"), None),
+        Some((slot, false)) if i.root_untrusted => push("root.verity", "Root verity", Severity::Warning, Some(format!("slot {slot}")),
+            format!("o slot {slot} rodando não tem cabeçalho assinado por uma chave em que esta imagem confia (pacote assinado por uma chave que a imagem instalada não traz, ou cabeçalho danificado): a raiz não é conferida contra um hash assinado"),
+            Some("Reiniciar não resolve. Instale um pacote assinado por uma das chaves que esta imagem aceita (System › Packages mostra as chaves; campo `keys` de system.package.print). O outro slot aparece como `invalid` pelo mesmo motivo quando foi assinado pela chave antiga.")),
+        Some((slot, false)) => push("root.verity", "Root verity", Severity::Warning, Some(format!("slot {slot}")),
+            format!("o slot {slot} rodando não está em dm-verity: a raiz não é conferida contra o hash assinado (primeiro boot de qcow2/OVA ou de disco gravado com dd pelo caminho reserva, ou NVRAM apagada)"),
+            Some("Reinicie uma vez (`/system reboot confirm=yes` no terminal, ou system.reboot): este boot já gravou a entrada de boot do slot e o próximo sobe pela raiz verificada. Se o aviso voltar, confira em System › Packages a entrada de boot e a linha de comando do slot.")),
+    }
+
+    // G1.6zn: the disk the system and its configuration are on.
+    if let Some(d) = &i.system_disk {
+        let (key, name) = ("system.disk", "System disk");
+        let disk = d.disk.clone().unwrap_or_else(|| "?".into());
+        if d.removed.is_some() {
+            let reason = if d.in_ram {
+                format!("o disco do sistema ({disk}) saiu com o roteador ligado: ele segue rodando da RAM, mas a configuração não é mais gravada (todo commit é recusado)")
+            } else {
+                format!("o disco do sistema ({disk}) saiu com o roteador ligado e o sistema roda desse disco: o roteador pode parar a qualquer momento, e a configuração não é mais gravada (todo commit é recusado)")
+            };
+            push(key, name, Severity::Error, Some(disk), reason,
+                Some("Recoloque o disco e reinicie (System › Reboot): sem ele o roteador não volta depois de desligado. Para mudar algo agora sem gravar, use o Safe Mode. Num pendrive ou SSD USB, ligue o sistema na RAM (system.boot.set to_ram=yes) para o roteador seguir rodando se o disco sair."));
+        } else if let Some(note) = &d.note {
+            push(key, name, Severity::Warning, Some(disk),
+                format!("o sistema na RAM foi pedido, mas este boot ficou no disco: {note}"),
+                Some("Com pouca RAM, ponha mais memória ou desligue a opção (system.boot.set to_ram=no); outro motivo aparece no log do boot (tópico system)."));
+        } else if d.in_ram {
+            push(key, name, Severity::Ok, Some(disk.clone()),
+                format!("sistema na RAM ({} MiB, copiado e conferido pelo dm-verity em {} ms): o disco {disk} só guarda a configuração", d.bytes >> 20, d.copy_ms), None);
+        } else {
+            push(key, name, Severity::Ok, Some(disk.clone()), format!("sistema lido do disco {disk} conforme é usado"), None);
+        }
+    }
+
+    // Supervised services.
+    match &i.services {
+        None => push("services", "Services", Severity::Unknown, None, "sem supervisor de serviços (laboratório)".into(), None),
+        Some(rows) => {
+            let failed: Vec<&str> = rows.iter().filter(|r| r.1 == ServiceState::Failed).map(|r| r.0.as_str()).collect();
+            let down: Vec<&str> = rows.iter().filter(|r| matches!(r.1, ServiceState::Restarting | ServiceState::Stopped)).map(|r| r.0.as_str()).collect();
+            let (s, reason) = if !failed.is_empty() {
+                (Severity::Error, format!("serviço(s) em falha: {}", failed.join(", ")))
+            } else if !down.is_empty() {
+                (Severity::Warning, format!("serviço(s) parado(s) ou reiniciando: {}", down.join(", ")))
+            } else {
+                (Severity::Ok, format!("{} serviços rodando", rows.len()))
+            };
+            push("services", "Services", s, None, reason,
+                Some("Abra System › Services: o último erro de cada serviço diz por que caiu."));
+        }
+    }
+
+    // RSS / IRQ distribution.
+    match i.rss {
+        Some((cpu, share, cpus, rate)) if cpus >= RSS_MIN_CPUS && rate >= RSS_MIN_RATE => {
+            let s = if share >= RSS_SHARE { Severity::Warning } else { Severity::Ok };
+            push("rss", "RSS balance", s, Some(format!("CPU{cpu}: {share:.0} %")),
+                match s {
+                    Severity::Ok => format!("recepção espalhada entre as CPUs (a mais carregada: CPU{cpu}, {share:.0} %)"),
+                    _ => format!("CPU{cpu} recebe {share:.0} % dos softirqs de rede de {cpus} CPUs"),
+                },
+                Some("Distribua: mais filas na placa (RSS), RPS/XPS e afinidade das IRQs em System › Tuning › Interface."));
+        }
+        Some(_) => push("rss", "RSS balance", Severity::Ok, None, "pouco tráfego ou poucas CPUs para julgar".into(), None),
+        None => push("rss", "RSS balance", Severity::Unknown, None, no_data(), None),
+    }
+
+    // Receive buffers of the sockets that take bursts.
+    match &i.sockbuf {
+        None => push("sockbuf", "Socket buffers", Severity::Unknown, None,
+            "nenhum serviço com rajada aberto (RADIUS, PPPoE)".into(), None),
+        Some(v) => {
+            let short: Vec<String> = v
+                .iter()
+                .filter(|(_, got, want)| got < want)
+                .map(|(n, got, want)| format!("{n} {} de {} KiB", got / 1024, want / 1024))
+                .collect();
+            if short.is_empty() {
+                push("sockbuf", "Socket buffers", Severity::Ok, None,
+                    format!("{} socket(s) com o buffer de recepção pedido", v.len()), None);
+            } else {
+                push("sockbuf", "Socket buffers", Severity::Warning, Some(short.join(", ")),
+                    format!("buffer de recepção menor que o pedido: {}", short.join(", ")),
+                    Some("Suba net.core.rmem_max (System › Tuning, recomendação sockbuf) ou rode o daemon com CAP_NET_ADMIN. Uma rajada depois de uma queda (respostas do RADIUS, PADIs de milhares de CPEs) transborda o buffer e vira retransmissão."));
+            }
+        }
+    }
+
+    // ECMP in the routing table (G1.27j): mixed uplinks split traffic per
+    // connection between public addresses without anyone asking for it.
+    match &i.ecmp {
+        None => push("routes.ecmp", "Route ECMP", Severity::Unknown, None, "tabela de rotas não consultada".into(), None),
+        Some((0, 0, _)) => push("routes.ecmp", "Route ECMP", Severity::Ok, None, "nenhuma rota dividindo o tráfego (ECMP)".into(), None),
+        Some((0, info, _)) => push("routes.ecmp", "Route ECMP", Severity::Ok, Some(format!("{info} grupo(s)")),
+            format!("{info} grupo(s) ECMP de uma origem só (ex.: dois gateways estáticos), em geral intencional"), None),
+        Some((warn, info, first)) => {
+            let (text, fix) = first.clone().unwrap_or_default();
+            let action = match fix {
+                Some(f) => format!("Torne uma das saídas reserva subindo a distância: {f} (IP › Routes mostra o grupo). Se a divisão por conexão é intencional (balanceamento), o aviso pode ficar."),
+                None => "Suba a distância de uma das rotas para ela virar reserva (IP › Routes mostra o grupo).".into(),
+            };
+            out.push(Check {
+                key: "routes.ecmp",
+                name: "Route ECMP",
+                severity: Severity::Warning,
+                value: Some(format!("{warn} aviso(s), {info} info")),
+                reason: format!("{warn} grupo(s) ECMP dividindo o tráfego por conexão entre saídas com IPs diferentes (origens misturadas ou rota padrão), como {text}"),
+                action: Some(action),
+            });
+        }
+    }
+
+    // BGP neighbors that never send End-of-RIB (G3.9fj): with graceful
+    // restart on, their routes wait the instance's Defer Time after every
+    // bgpd start, and the session window is the only other place it shows.
+    match &i.bgp_no_eor {
+        None => out.push(Check {
+            key: "bgp.end-of-rib",
+            name: "BGP End-of-RIB",
+            severity: Severity::Unknown,
+            value: None,
+            reason: "nenhum daemon de roteamento informou as sessões".into(),
+            action: None,
+        }),
+        Some((n, quiet)) if quiet.is_empty() => out.push(Check {
+            key: "bgp.end-of-rib",
+            name: "BGP End-of-RIB",
+            severity: Severity::Ok,
+            value: None,
+            reason: match n {
+                0 => "nenhuma sessão BGP com graceful restart dos dois lados".into(),
+                n => format!("{n} sessão(ões) com graceful restart; todos os vizinhos mandaram End-of-RIB"),
+            },
+            action: None,
+        }),
+        Some((n, quiet)) => {
+            let shown: Vec<&str> = quiet.iter().take(3).map(String::as_str).collect();
+            let more = quiet.len().saturating_sub(shown.len());
+            let names = if more > 0 { format!("{} e mais {more}", shown.join(", ")) } else { shown.join(", ") };
+            out.push(Check {
+                key: "bgp.end-of-rib",
+                name: "BGP End-of-RIB",
+                severity: Severity::Warning,
+                value: Some(format!("{} de {n}", quiet.len())),
+                reason: format!(
+                    "vizinho(s) BGP sem End-of-RIB depois de {} min estabelecido(s): {names}; depois de um reinício do bgpd as rotas dele(s) esperam o Defer Time inteiro (RFC 4724 §4.1)",
+                    EOR_GRACE_SECS / 60
+                ),
+                action: Some("O RouterOS 7.25 anuncia graceful restart e não manda End-of-RIB (nem guarda as nossas rotas). Mantenha o Defer Time curto (Routing › BGP › Instances, padrão 10 s) ou desligue o graceful restart dessa conexão (graceful_restart=no).".into()),
+            });
+        }
+    }
+
+    ospf_lsdb(i, &mut out);
+
+    // G3.9fj, RFC 8538: graceful restart with the N bit and no BFD.
+    let (key, name) = ("bgp.gr-bfd", "BGP GR without BFD");
+    match &i.bgp_gr_no_bfd {
+        None => out.push(Check { key, name, severity: Severity::Unknown, value: None, reason: "nenhum daemon de roteamento informou as sessões".into(), action: None }),
+        Some((n, bare)) if bare.is_empty() => out.push(Check {
+            key,
+            name,
+            severity: Severity::Ok,
+            value: None,
+            reason: match n {
+                0 => "nenhuma sessão BGP com graceful restart e o bit N".into(),
+                n => format!("{n} sessão(ões) com graceful restart e o bit N, todas com BFD"),
+            },
+            action: None,
+        }),
+        Some((n, bare)) => {
+            let shown: Vec<&str> = bare.iter().take(3).map(String::as_str).collect();
+            let more = bare.len().saturating_sub(shown.len());
+            let names = if more > 0 { format!("{} e mais {more}", shown.join(", ")) } else { shown.join(", ") };
+            out.push(Check {
+                key,
+                name,
+                severity: Severity::Warning,
+                value: Some(format!("{} de {n}", bare.len())),
+                reason: format!("sessão(ões) BGP com graceful restart e o bit N (RFC 8538) sem BFD: {names}; numa queda silenciosa (energia, link cortado) as rotas ficam o hold time e depois o Restart Time"),
+                action: Some("Ligue um perfil BFD na conexão (Routing › BGP › Connections, BFD Profile): uma queda do BFD é Hard Reset e tira as rotas na hora. Ou desligue o bit N na instância (graceful_notification=no).".into()),
+            });
+        }
+    }
+    // G1.3b: a port of the config that is not there (unplugged, a USB
+    // adapter that fell off, a card that burned): the rest runs, its own
+    // configuration waits for it.
+    if !i.absent_ports.is_empty() {
+        let list = i.absent_ports.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+        out.push(Check { key: "interface.absent", name: "Absent ports", severity: Severity::Warning,
+            value: Some(i.absent_ports.len().to_string()),
+            reason: format!("interface(s) da configuração sem a placa nesta máquina (flag I): {list}; o resto da configuração está aplicado e a delas volta sozinha quando a placa voltar"),
+            action: Some("Confira o cabo/adaptador USB ou a placa; se ela saiu de vez, tire a configuração dela (ou troque a interface dos itens que a usam).".into()) });
+    }
+    // G3.4z: a learned route more specific than the connected network an
+    // operator manages from: the replies leave by another port.
+    match &i.mgmt_route {
+        Some((_, f)) if !f.is_empty() => {
+            let sessions: usize = f.iter().map(|f| f.sessions.len()).sum();
+            let list: Vec<String> = f.iter().take(3).map(crate::mgmt_guard::describe).collect();
+            let unguarded: Vec<String> = f
+                .iter()
+                .filter(|f| !f.guarded)
+                .map(|f| crate::mgmt_guard::protect_command(&f.vrf, &f.connected))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let action = if unguarded.is_empty() {
+                "A guarda já cobre a rede e a rota continua no kernel: confira o FRR (routing.backend.get) e se outro programa instalou a rota.".to_owned()
+            } else {
+                format!(
+                    "Proteja a rede de gerência ({}; Routing › Management Guard) ou filtre o prefixo no vizinho que o anuncia. Sessão que já caiu: entre por outra rede ou pelo console.",
+                    unguarded.join(", ")
+                )
+            };
+            out.push(Check { key: "management.route", name: "Management route", severity: Severity::Warning,
+                value: Some(sessions.to_string()),
+                reason: list.join("; "),
+                action: Some(action) });
+        }
+        Some((n, _)) if *n > 0 => out.push(Check { key: "management.route", name: "Management route", severity: Severity::Ok,
+            value: Some(n.to_string()),
+            reason: format!("{n} sessão(ões) de gerência pela rede; nenhuma rota aprendida cobre o par delas"),
+            action: None }),
+        _ => {}
+    }
+    // G1.31b: a WireGuard peer the router keeps calling without an answer.
+    if !i.wireguard_stale.is_empty() {
+        let list = i
+            .wireguard_stale
+            .iter()
+            .take(5)
+            .map(|(p, w, secs, once)| {
+                let min = secs / 60;
+                if *once {
+                    format!("{p} ({w}) sem handshake há {min} min")
+                } else {
+                    format!("{p} ({w}) nunca respondeu, tentando há {min} min")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        out.push(Check { key: "wireguard.handshake", name: "WireGuard peers", severity: Severity::Warning,
+            value: Some(i.wireguard_stale.len().to_string()),
+            reason: format!("o roteador chama e o par não responde: {list}"),
+            action: Some("Confira as chaves públicas dos dois lados e se o UDP chega ao par (firewall dele, NAT no caminho); em Interfaces › WireGuard › Peers a linha do par diz o que falta. Par que só espera ou fica ocioso não entra aqui.".into()) });
+    }
+    // G1.6ja: a card the kernel could not bring up in full.
+    if let Some(n) = &i.nic_hardware {
+        let (key, name) = ("interface.hardware", "Network card drivers");
+        if !n.warn.is_empty() {
+            let list = n.warn.iter().take(5).cloned().collect::<Vec<_>>().join("; ");
+            out.push(Check { key, name, severity: Severity::Warning, value: Some(format!("{} de {}", n.warn.len(), n.devices)),
+                reason: list,
+                action: Some(n.actions.iter().take(3).cloned().collect::<Vec<_>>().join(" ")) });
+        } else if !n.expected.is_empty() {
+            out.push(Check { key, name, severity: Severity::Ok, value: Some(n.devices.to_string()),
+                reason: format!("na ISO, sem firmware até instalar (é o esperado): {}", n.expected.iter().take(5).cloned().collect::<Vec<_>>().join("; ")), action: None });
+        } else if n.kernel_log {
+            out.push(Check { key, name, severity: Severity::Ok, value: Some(n.devices.to_string()),
+                reason: format!("{} placa(s) de rede, todas com driver e sem firmware faltando", n.devices), action: None });
+        } else {
+            out.push(Check { key, name, severity: Severity::Ok, value: Some(n.devices.to_string()),
+                reason: format!("{} placa(s) de rede com driver; o log do kernel não pode ser lido, então firmware faltando não aparece aqui", n.devices), action: None });
+        }
+    }
+    // G1.3e: the boot left part of the config out (the rest, management
+    // included, is up). Only while it lasts.
+    if !i.boot_apply.is_empty() {
+        let list = i
+            .boot_apply
+            .iter()
+            .take(5)
+            .map(|(s, e)| format!("{s}: {}", e.trim_start_matches("backend rejected the change: ").chars().take(300).collect::<String>()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let core = i.boot_apply.iter().any(|(s, _)| s == "core");
+        // G1.3g: "firewall *5" / "routes *3" is one item out, the rest of
+        // its section in.
+        let items_only = i.boot_apply.iter().all(|(s, _)| s.contains(' '));
+        let whole_firewall = i.boot_apply.iter().any(|(s, _)| s == "firewall");
+        out.push(Check { key: "boot.apply", name: "Boot apply", severity: Severity::Error,
+            value: Some(i.boot_apply.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(", ")),
+            reason: if core {
+                format!("a configuração salva não entrou no kernel, nem interfaces e endereços: {list}; nova tentativa com espera crescente (até 60 s)")
+            } else if items_only {
+                format!("regra(s) de firewall ou rota(s) recusada(s) pelo kernel no boot e fora (flag I); o resto da seção, gerência inclusive, está aplicado: {list}; nova tentativa com espera crescente (até 10 min)")
+            } else {
+                format!("seção(ões) da configuração salva recusada(s) pelo kernel no boot e fora do ar (o resto, gerência inclusive, está aplicado): {list}; nova tentativa com espera crescente (até 60 s)")
+            },
+            action: Some(if whole_firewall {
+                "Corrija ou tire o item recusado (o motivo é o erro do kernel acima) e faça commit, ou carregue o que falta no kernel (módulo, recurso); um commit que mexe na seção a aplica inteira. O firewall inteiro está de fora: o roteador está sem filtro."
+            } else {
+                "Corrija ou tire o item recusado (o motivo é o erro do kernel acima) e faça commit, ou carregue o que falta no kernel (módulo, recurso); um commit que mexe na seção a aplica inteira, menos a regra ou rota recusada que ele não muda."
+            }.into()) });
+    }
+    // G1.6zx: the previous boot ended in a kernel panic or oops (the dump
+    // pstore kept), and whether the next one has somewhere to go.
+    if let Some(c) = &i.crash {
+        let (key, name) = ("kernel.crash", "Previous boot");
+        match &c.last_boot {
+            Some((reason, summary, time)) => out.push(Check { key, name, severity: Severity::Warning,
+                value: Some(format!("{reason}{}", time.map(|t| format!(" {}", crate::crash_log::utc(t))).unwrap_or_default())),
+                reason: format!("o boot anterior terminou num {} do kernel: {}", if reason == "oops" { "oops" } else { "pânico" }, summary.chars().take(300).collect::<String>()),
+                action: Some("O registro inteiro (o fim do log do kernel daquele boot) está em system.crash.print {\"lines\": true} e em /config/crash/. Repetindo, mande o registro para o suporte; depois de uma atualização, compare com o slot anterior.".into()) }),
+            None => out.push(Check { key, name, severity: Severity::Ok, value: c.backend.clone(),
+                reason: match &c.backend {
+                    Some(b) => format!("o boot anterior não terminou em pânico; um pânico agora fica registrado ({b})"),
+                    None => "o boot anterior não deixou registro de pânico; esta máquina não tem onde guardar um (nem ERST nem variáveis UEFI)".into(),
+                }, action: None }),
+        }
+        if let Some(free) = c.efi_low {
+            out.push(Check { key: "kernel.crash-store", name: "Crash store", severity: Severity::Warning,
+                value: Some(format!("{free} B livres")),
+                reason: format!("a NVRAM do UEFI tem {free} bytes livres, menos que os {} que um registro de pânico e as entradas de boot do A/B precisam: o registro de pânico nas variáveis UEFI foi desligado", crate::crash_log::EFI_MIN_FREE),
+                action: Some("Apague no setup do firmware as entradas de boot que sobraram de outros sistemas, ou restaure os padrões da NVRAM; no boot seguinte o registro volta a ligar sozinho.".into()) });
+        }
+    }
+    // G1.6zy: ECC memory: an uncorrected error, or a module that corrects
+    // errors (it is wearing out), or pages the kernel took out of use.
+    if let Some(m) = &i.memory {
+        let (key, name) = ("memory.ecc", "Memory errors");
+        let ue: u64 = m.dimms.iter().map(|d| d.2).sum::<u64>().saturating_add(m.ue_noinfo);
+        let ce: u64 = m.dimms.iter().map(|d| d.1).sum::<u64>().saturating_add(m.ce_noinfo);
+        let worst = |pick: fn(&(String, u64, u64)) -> u64| {
+            m.dimms.iter().filter(|d| pick(d) > 0).take(3).map(|d| format!("{} ({})", d.0, pick(d))).collect::<Vec<_>>().join(", ")
+        };
+        let action = "Programe a troca do pente indicado (o rótulo é o da placa, ou canal e slot); System › Health › Memory mostra a contagem por pente, e system.health.memory.print o mesmo pelo terminal e pelo MCP.";
+        if ue > 0 {
+            out.push(Check { key, name, severity: Severity::Error, value: Some(format!("{ue} UE")),
+                reason: format!("{ue} erro(s) de memória que o ECC não corrigiu desde o boot{}: um processo ou o kernel pode ter lido dado errado", if worst(|d| d.2).is_empty() { String::new() } else { format!(", em {}", worst(|d| d.2)) }),
+                action: Some(action.into()) });
+        } else if ce > 0 || m.corrupted_kib > 0 {
+            let mut why = Vec::new();
+            if ce > 0 {
+                why.push(format!("{ce} erro(s) corrigido(s) pelo ECC desde o boot{}", if worst(|d| d.1).is_empty() { String::new() } else { format!(", em {}", worst(|d| d.1)) }));
+            }
+            if m.corrupted_kib > 0 {
+                why.push(format!("{} KiB de memória retirados de uso pelo kernel por erro", m.corrupted_kib));
+            }
+            out.push(Check { key, name, severity: Severity::Warning, value: Some(format!("{ce} CE")),
+                reason: format!("{}: o pente está se desgastando", why.join("; ")),
+                action: Some(action.into()) });
+        } else {
+            out.push(Check { key, name, severity: Severity::Ok, value: Some(format!("{} pente(s)", m.dimms.len())),
+                reason: format!("{} pente(s) com ECC vigiado(s), nenhum erro desde o boot", m.dimms.len()), action: None });
+        }
+    }
+    // G1.29b: a USB adapter behind a port slower than itself caps the
+    // traffic with no error anywhere. Only on routers that have one.
+    if !i.usb.is_empty() {
+        let slow: Vec<&(String, Option<String>)> = i.usb.iter().filter(|(_, a)| a.is_some()).collect();
+        let (key, name) = ("interface.usb", "USB adapters");
+        if slow.is_empty() {
+            out.push(Check { key, name, severity: Severity::Ok, value: Some(i.usb.len().to_string()),
+                reason: format!("{} adaptador(es) USB, cada um numa porta da velocidade dele", i.usb.len()), action: None });
+        } else {
+            let list = slow.iter().take(3).map(|(n, a)| format!("{n}: {}", a.as_deref().unwrap_or(""))).collect::<Vec<_>>().join("; ");
+            out.push(Check { key, name, severity: Severity::Warning, value: Some(format!("{} de {}", slow.len(), i.usb.len())),
+                reason: format!("adaptador USB numa porta mais lenta que ele, o tráfego fica limitado sem erro nenhum: {list}"),
+                action: Some("Ligue o adaptador numa porta USB 3 (azul ou marcada SS), direto, com cabo USB 3; a aba Hardware da interface mostra a velocidade negociada.".into()) });
+        }
+        // G1.29d: what the watchdog did in the last hour.
+        let (key, name) = ("interface.usb.watchdog", "USB watchdog");
+        let gave: Vec<&str> = i.usb_watchdog.iter().filter(|w| w.2).map(|w| w.0.as_str()).collect();
+        let acted: Vec<String> = i
+            .usb_watchdog
+            .iter()
+            .filter(|w| w.1 > 0 && !w.2)
+            .take(3)
+            .map(|(n, k, _, why)| format!("{n} recuperado {k}× ({})", why.as_deref().unwrap_or("travou")))
+            .collect();
+        if !gave.is_empty() {
+            out.push(Check { key, name, severity: Severity::Error, value: Some(gave.join(", ")),
+                reason: format!("adaptador USB que continua travando depois de várias recuperações na última hora: {}; o vigia parou de agir", gave.join(", ")),
+                action: Some("Confira o cabo, a alimentação da porta (hub com fonte) e o adaptador; troque de porta. O log (tópico interface) tem cada travamento e o motivo.".into()) });
+        } else if !acted.is_empty() {
+            out.push(Check { key, name, severity: Severity::Warning, value: Some(acted.len().to_string()),
+                reason: format!("o vigia recuperou adaptador USB travado na última hora: {}", acted.join("; ")),
+                action: Some("Veja a aba Hardware (Tx Timeouts, Recoveries) e o log; travamentos repetidos pedem outra porta, outro cabo ou uma placa PCIe.".into()) });
+        } else {
+            out.push(Check { key, name, severity: Severity::Ok, value: None,
+                reason: "nenhum adaptador USB travou na última hora".into(), action: None });
+        }
+    }
+    out
+}
+
+/// G1.6u: on a full `/config`, what to remove: the snapshots and partial
+/// copies, biggest first, and the command (dry run first).
+fn config_reclaim(mount: &str, snaps: &[(String, u64)]) -> Option<String> {
+    if mount != "/config" || snaps.iter().all(|(_, b)| *b == 0) {
+        return None;
+    }
+    let mut v: Vec<&(String, u64)> = snaps.iter().filter(|(_, b)| *b > 0).collect();
+    v.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let list: Vec<String> = v
+        .iter()
+        .map(|(n, b)| format!("{n} {:.1} MB{}", *b as f64 / 1e6, if n.ends_with(".new") { " (cópia parcial)" } else { "" }))
+        .collect();
+    Some(format!(
+        "Snapshots da configuração no /config: {}. Veja o que sai com system.package.snapshot.remove {{all: true, dry_run: true}} e apague com system.package.snapshot.remove {{name: \"…\"}}; o snapshot de um teste em andamento nunca sai.",
+        list.join(", ")
+    ))
+}
+
+/// The snapshots of the package service's status, with their own bytes.
+fn config_snapshots(st: &serde_json::Value) -> Vec<(String, u64)> {
+    use serde_json::Value;
+    ["snapshots", "partials"]
+        .iter()
+        .filter_map(|k| st.get(*k).and_then(Value::as_array))
+        .flatten()
+        .filter_map(|r| Some((r.get("name")?.as_str()?.to_owned(), r.get("own_bytes")?.as_u64()?)))
+        .collect()
+}
+
+/// (running slot, on dm-verity) from the package service's status, or
+/// `None` off the image (and in its lab, which has no real root).
+fn root_verity(st: &serde_json::Value) -> Option<(String, bool)> {
+    use serde_json::Value;
+    let on = |v: &Value, k: &str| v.get(k).and_then(Value::as_bool) == Some(true);
+    if !on(st, "supported") || on(st, "lab") {
+        return None;
+    }
+    let slot = st.get("slots")?.as_array()?.iter().find(|s| on(s, "running"))?;
+    Some((slot.get("slot")?.as_str()?.to_owned(), on(slot, "verity")))
+}
+
+/// G1.6zn: the `root` and `system_disk_removed` of the package status.
+fn system_disk(st: &serde_json::Value) -> Option<SystemDisk> {
+    use serde_json::Value;
+    let removed = st.get("system_disk_removed").and_then(Value::as_str).map(str::to_owned);
+    let root = st.get("root").filter(|r| r.is_object());
+    if root.is_none() && removed.is_none() {
+        return None;
+    }
+    let r = root.cloned().unwrap_or(Value::Null);
+    let text = |k: &str| r.get(k).and_then(Value::as_str).map(str::to_owned);
+    Some(SystemDisk {
+        in_ram: r.get("in_ram").and_then(Value::as_bool) == Some(true),
+        bytes: r.get("bytes").and_then(Value::as_u64).unwrap_or(0),
+        copy_ms: r.get("copy_ms").and_then(Value::as_u64).unwrap_or(0),
+        disk: text("disk"),
+        note: text("note"),
+        removed,
+    })
+}
+
+/// The running slot says its header is not verified (`verified: false`; a
+/// status without the field, from an older service, is not judged).
+fn root_untrusted(st: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    st.get("slots")
+        .and_then(Value::as_array)
+        .and_then(|slots| slots.iter().find(|s| s.get("running").and_then(Value::as_bool) == Some(true)))
+        .and_then(|s| s.get("verified"))
+        .and_then(Value::as_bool)
+        == Some(false)
+}
+
+/// The worst severity of `checks` (unknown counts as ok).
+pub fn overall(checks: &[Check]) -> Severity {
+    checks
+        .iter()
+        .map(|c| c.severity)
+        .filter(|s| *s != Severity::Unknown)
+        .max()
+        .unwrap_or(Severity::Ok)
+}
+
+/// What the alert part remembers.
+#[derive(Debug, Default)]
+pub struct HealthAlerts {
+    /// Logged severity per check.
+    logged: BTreeMap<&'static str, Severity>,
+    /// A new severity seen once, waiting for a second reading.
+    pending: BTreeMap<&'static str, Severity>,
+    /// (uptime s, oom_kill count) of each rise.
+    oom_rises: Vec<(u64, u64)>,
+    oom_last: Option<u64>,
+}
+
+impl HealthAlerts {
+    /// OOM kills in the last [`OOM_WINDOW`] seconds, after a reading of
+    /// the kernel's count since boot (`oom_kill` of `/proc/vmstat`) at
+    /// uptime `t` seconds. A rise between two readings is dated by the
+    /// second one. The first reading of this process counts what the
+    /// kernel already counted when the machine came up less than the
+    /// window ago: those kills are recent, and the usual victim is the
+    /// daemon itself, which the init restarts with a fresh count (the VM of
+    /// 2026-10-29 said "ok" ten minutes after its daemon was killed). On a
+    /// machine up for longer they cannot be dated and are not counted.
+    fn oom_seen(&mut self, t: u64, kills: u64) -> u64 {
+        match self.oom_last {
+            Some(prev) if kills > prev => self.oom_rises.push((t, kills - prev)),
+            None if kills > 0 && t < OOM_WINDOW => self.oom_rises.push((t, kills)),
+            _ => {}
+        }
+        self.oom_last = Some(kills);
+        self.oom_rises.retain(|(at, _)| t.saturating_sub(*at) < OOM_WINDOW && *at <= t);
+        self.oom_rises.iter().map(|r| r.1).sum()
+    }
+}
+
+/// G3.4r: the OSPF databases: an instance down by its LSDB protection
+/// (error), one past its limit with warning-only or its threshold, and
+/// the memory the databases take against the RAM even with no limit (the
+/// alert that would have caught the flood of the gap with nothing
+/// configured).
+fn ospf_lsdb(i: &Inputs, out: &mut Vec<Check>) {
+    use corerouter_model::ospf_state::lsdb_memory_bytes;
+    let (key, name) = ("ospf.lsdb", "OSPF LSDB");
+    let Some(insts) = &i.ospf_lsdb else {
+        out.push(Check { key, name, severity: Severity::Unknown, value: None, reason: "nenhum daemon de roteamento informou o OSPF".into(), action: None });
+        return;
+    };
+    if insts.is_empty() {
+        out.push(Check { key, name, severity: Severity::Ok, value: None, reason: "nenhuma instância OSPF rodando".into(), action: None });
+        return;
+    }
+    let find = "Ache quem injeta: a coluna Originator de Routing › OSPF › LSDB (routing.ospf.lsa.list), aqui fora do ignore ou num vizinho, e corrija a redistribuição dele";
+    // The worst instance speaks; the rest are counted.
+    let mut worst: Option<Check> = None;
+    let mut keep = |c: Check| {
+        if worst.as_ref().is_none_or(|w| c.severity > w.severity) {
+            worst = Some(c);
+        }
+    };
+    let mut total = 0u64;
+    for o in insts {
+        total = total.saturating_add(o.lsas);
+        let others = o.others.unwrap_or(o.lsas);
+        if let Some(p) = &o.protection {
+            match p.state.as_str() {
+                "ignore" => keep(Check { key, name, severity: Severity::Error,
+                    value: Some(format!("{}: ignore", o.instance)),
+                    reason: format!("{} em ignore (LSDB protection): acima de {} LSAs de outros roteadores, adjacências derrubadas; nova tentativa em {} ({} de {} períodos)",
+                        o.instance, p.limit, p.ignore_remaining_secs.map_or("instantes".into(), |t| format!("{}m{:02}s", t / 60, t % 60)), p.ignore_entries, p.ignore_count),
+                    action: Some(format!("{find}; depois do último período ela fica isolada até o Clear LSDB Protection (routing.ospf.instance.clear-lsdb-protection).")) }),
+                "isolated" => keep(Check { key, name, severity: Severity::Error,
+                    value: Some(format!("{}: isolated", o.instance)),
+                    reason: format!("{} isolada (LSDB protection): passou de {} LSAs de outros roteadores em {} períodos seguidos; sem adjacência até alguém liberar", o.instance, p.limit, p.ignore_count),
+                    action: Some(format!("{find}, e então Clear LSDB Protection (routing.ospf.instance.clear-lsdb-protection).")) }),
+                "exceeded" => keep(Check { key, name, severity: Severity::Warning,
+                    value: Some(format!("{others} / {}", p.limit)),
+                    reason: format!("{}: {others} LSAs de outros roteadores, acima do limite de {} (warning-only: a instância segue)", o.instance, p.limit),
+                    action: Some(format!("{find}, ou suba o limite (Max LSA) se o crescimento é legítimo.")) }),
+                "warning" => keep(Check { key, name, severity: Severity::Warning,
+                    value: Some(format!("{others} / {}", p.limit)),
+                    reason: format!("{}: {others} LSAs de outros roteadores, {} % do limite de {}; acima dele a instância cai", o.instance, others.saturating_mul(100) / p.limit.max(1), p.limit),
+                    action: Some(format!("{find}, ou suba o limite (Max LSA) com folga se o crescimento é legítimo.")) }),
+                _ => {}
+            }
+        }
+    }
+    let used = lsdb_memory_bytes(total);
+    let mib = used.div_ceil(1 << 20);
+    if let Some(ram) = i.ram_bytes.filter(|r| *r > 0) {
+        let share = used.saturating_mul(100) / ram;
+        let severity = if share >= OSPF_LSDB_RAM_ERROR { Severity::Error } else if share >= OSPF_LSDB_RAM_WARN { Severity::Warning } else { Severity::Ok };
+        let limited = insts.iter().all(|o| o.limit.is_some());
+        if severity != Severity::Ok {
+            keep(Check { key, name, severity,
+                value: Some(format!("{share} % da RAM")),
+                reason: format!("{total} LSAs nas bases do OSPF: ~{mib} MiB no ospfd + zebra (estimado, 2,1 KiB por LSA), {share} % da RAM; a memória de uma enxurrada não volta depois"),
+                action: Some(if limited {
+                    format!("{find}; e baixe o Max LSA para caber na RAM.")
+                } else {
+                    format!("{find}; e ponha um limite (Routing › OSPF › Instances › LSDB Protection, Max LSA) que caiba na RAM.")
+                }) });
+        }
+    }
+    out.push(worst.unwrap_or_else(|| Check { key, name, severity: Severity::Ok,
+        value: Some(format!("{total} LSAs")),
+        reason: format!("{} instância(s), {total} LSAs, ~{mib} MiB no ospfd + zebra (estimado)", insts.len()),
+        action: None }));
+}
+
+impl Session {
+    /// G1.6qj: the OOM deaths of the last [`OOM_WINDOW`] the OS Log read
+    /// from the kernel, newest first; none without a wall clock (a line's
+    /// time is the boot's wall time plus its kernel stamp).
+    fn oom_victims(&self) -> Vec<OomVictim> {
+        let (Some(now), Some(book)) = (self.now(), self.ext::<crate::oslog::OsLogBook>()) else {
+            return Vec::new();
+        };
+        let now_us = now.saturating_mul(1_000_000);
+        book.oom_kills
+            .iter()
+            .rev()
+            .filter(|d| d.time_us != 0 && d.time_us <= now_us.saturating_add(60_000_000))
+            .map(|d| (d, now_us.saturating_sub(d.time_us) / 1_000_000))
+            .filter(|(_, age)| *age < OOM_WINDOW)
+            .map(|(d, age_s)| OomVictim {
+                comm: d.kill.comm.clone(),
+                pid: d.kill.pid,
+                age_s,
+                anon_rss_kb: d.kill.anon_rss_kb,
+            })
+            .collect()
+    }
+
+    /// The rules' inputs now.
+    pub(crate) fn health_inputs(&mut self) -> Inputs {
+        let mut i = Inputs::default();
+        // OOM bookkeeping first (needs `&mut`).
+        let reading = self.ext::<ResourceMonitor>().and_then(|m| m.last.as_ref()).map(|l| (l.uptime_ms / 1000, l.oom_kills));
+        if let (Some((t, Some(kills))), Some(a)) = (reading, self.ext_mut::<HealthAlerts>()) {
+            i.oom_recent = Some(a.oom_seen(t, kills));
+        }
+        i.oom_victims = self.oom_victims();
+        if let Some(m) = self.ext::<ResourceMonitor>()
+            && let Some(l) = &m.last
+        {
+            i.readings = true;
+            let recent = m.recent(CPU_POINTS);
+            let cpus: Vec<f32> = recent.iter().filter_map(|p| p.cpu).collect();
+            if !cpus.is_empty() {
+                i.cpu_avg = Some((cpus.iter().sum::<f32>() / cpus.len() as f32, cpus.len()));
+            } else if let Some(c) = m.cpu() {
+                i.cpu_avg = Some((c.load, 1));
+            }
+            i.psi_some60 = l.pressure.memory.map(|p| p.some60);
+            i.psi_full60 = l.pressure.memory.and_then(|p| p.full60);
+            i.mem_used = memory_used(l);
+            i.swap_used = (l.memory.swap_total > 0)
+                .then(|| percent(l.memory.swap_total.saturating_sub(l.memory.swap_free), l.memory.swap_total))
+                .flatten();
+            i.swap_in_rate = m.rate(|s| s.swap_in);
+            i.disks = l
+                .disks
+                .iter()
+                .filter_map(|d| Some((d.mount.clone(), percent(d.available, d.total)?)))
+                .collect();
+            i.temps = crate::system_resource::temperatures(l)
+                .map(|s| (format!("{} {}", s.chip, s.label), s.value, s.crit, sensor_level(s)))
+                .collect();
+            if m.pair().is_some() {
+                i.nics = l
+                    .net
+                    .iter()
+                    .filter(|d| d.name != "lo")
+                    .filter_map(|d| {
+                        let find = |s: &corerouter_hal::system_resource::Sample| s.net.iter().find(|y| y.name == d.name).cloned();
+                        let e = m.rate(|s| find(s).map(|y| y.rx_errors.saturating_add(y.tx_errors)))?;
+                        let dr = m.rate(|s| find(s).map(|y| y.rx_dropped.saturating_add(y.tx_dropped)))?;
+                        Some((d.name.clone(), e, dr))
+                    })
+                    .collect();
+                let rates: Vec<f64> = (0..l.irqs.len())
+                    .map(|c| m.rate(|s| s.irqs.get(c).map(|x| x.net_rx)).unwrap_or(0.0))
+                    .collect();
+                let total: f64 = rates.iter().sum();
+                if let Some((cpu, top)) = rates.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)) {
+                    i.rss = Some((cpu, if total > 0.0 { top * 100.0 / total } else { 0.0 }, rates.len(), total));
+                }
+            }
+            i.conntrack = l.conntrack.zip(l.conntrack_max);
+            i.ram_bytes = Some(l.memory.total).filter(|t| *t > 0);
+            let e = &l.memory_errors;
+            let corrupted = e.hardware_corrupted_kib.unwrap_or(0);
+            i.memory = (e.controllers > 0 || corrupted > 0).then(|| MemoryInput {
+                dimms: e
+                    .dimms
+                    .iter()
+                    .map(|d| (if d.label.is_empty() { format!("{} {}", d.controller, d.name) } else { d.label.clone() }, d.ce, d.ue))
+                    .collect(),
+                ce_noinfo: e.ce_noinfo,
+                ue_noinfo: e.ue_noinfo,
+                corrupted_kib: corrupted,
+            });
+        }
+        let demand = crate::cgnat_conntrack::demand(self.store().running());
+        // The kernel's limit: what holds the connections now.
+        i.cgnat_conntrack = crate::cgnat_conntrack::fit(self, (demand.0, demand.1, None));
+        if self.cgnat_has_blocks() {
+            i.cgnat = self.ext::<CgnatRuntime>().map(|c| (c.alerts().values().filter(|a| a.above).count(), c.insert_failed()));
+            let now = self.now().unwrap_or(0);
+            i.cgnat_pool_full = self.ext::<CgnatRuntime>().map_or(0, |c| c.pool_full_recent(now));
+        }
+        let ntp = &self.store().running().system.ntp_client;
+        let enabled = ntp.enabled;
+        i.ntp_needed = self.store().running().radius.servers.iter().any(|r| !r.service.is_empty());
+        let status = self.ntp_status();
+        i.ntp = Some((enabled, status.status));
+        i.ntp_clock = NtpClock {
+            no_server: status.last_error.as_deref() == Some(corerouter_model::ntp::NO_SERVER),
+            clock: status.clock,
+            pending_step_ms: status.pending_step_ms,
+            offset_ms: status.system_offset_ms,
+            clock_error: status.clock_error,
+        };
+        i.clock_unix = self.now();
+        i.sockbuf = self
+            .ext::<SocketBuffers>()
+            .filter(|b| !b.sockets.is_empty())
+            .map(|b| b.sockets.iter().map(|(n, (g, w))| (n.clone(), *g, *w)).collect());
+        let (_, routes, _) = self.cached_routes();
+        i.ecmp = Some((routes.ecmp_warning, routes.ecmp_info, routes.ecmp_first.clone()));
+        i.services = self
+            .ext::<ServiceTable>()
+            .filter(|t| t.supervised)
+            .map(|t| t.rows.iter().map(|r| (r.name.clone(), r.state)).collect());
+        i.no_password = self.admins_without_password();
+        // G1.29b: one link dump, then a few sysfs reads per USB adapter.
+        let live = self.hal_mut().poll();
+        i.usb = live
+            .iter()
+            .filter(|l| l.bus.as_deref() == Some("usb"))
+            .take(crate::usb_nic::MAX_LISTED)
+            .map(|l| {
+                let alert = crate::usb_nic::summary(self, &l.name)
+                    .and_then(|v| v.get("alert").and_then(|a| a.as_str()).map(str::to_owned));
+                (l.name.to_string(), alert)
+            })
+            .collect();
+        i.usb_watchdog = self.usb_watchdog_health();
+        i.absent_ports = self.invalid_interfaces(&live).into_keys().map(|n| n.to_string()).collect();
+        i.wireguard_stale = self.wireguard_stale();
+        if self.mgmt_guard_watching() {
+            i.mgmt_route = Some((self.mgmt_guard_sessions().iter().filter(|w| w.open).count(), self.mgmt_guard_findings()));
+        }
+        i.nic_hardware = self.nic_health();
+        i.boot_apply = self.boot_failures().into_iter().map(|f| (f.label(), f.error)).collect();
+        i.bgp_no_eor = self.routing_status().map(|st| {
+            let quiet = bgp_without_eor(st)
+                .map(|b| b.connection.clone().unwrap_or_else(|| b.remote_address.clone()))
+                .collect();
+            (bgp_gr_sessions(st).count(), quiet)
+        });
+        let n_off: Vec<String> = self
+            .store()
+            .running()
+            .routing
+            .bgp
+            .values()
+            .filter(|i| i.graceful_notification == Some(false))
+            .map(|i| i.name.clone())
+            .collect();
+        i.bgp_gr_no_bfd = self.routing_status().map(|st| {
+            let all: Vec<&BgpSession> = bgp_n_bit_sessions(st, &n_off).collect();
+            let bare = all
+                .iter()
+                .filter(|b| b.bfd.is_none())
+                .map(|b| b.connection.clone().unwrap_or_else(|| b.remote_address.clone()))
+                .collect();
+            (all.len(), bare)
+        });
+        // G3.4r: the routing daemon's last poll (the lab floods nothing).
+        i.ospf_lsdb = self.has_routing().then(|| {
+            let (live, _) = self.ospf_stub_live();
+            let insts = &self.store().running().routing.ospf.instances;
+            live.into_iter()
+                .filter_map(|st| {
+                    let limit = insts.get(&st.instance).and_then(|c| c.max_lsa).map(|m| (u64::from(m.limit), m.warn_at()));
+                    Some(OspfLsdbInput { lsas: st.lsas?, others: st.lsas_other, limit, protection: st.max_lsa, instance: st.instance })
+                })
+                .collect()
+        });
+        let pkg = self.ext::<crate::package::Packages>().and_then(|p| p.status.as_ref());
+        i.root_verity = pkg.and_then(root_verity);
+        i.root_untrusted = pkg.is_some_and(root_untrusted);
+        i.system_disk = pkg.and_then(system_disk);
+        i.config_snapshots = pkg.map(config_snapshots).unwrap_or_default();
+        i.config_disk = self.config_disk_usage();
+        i.crash = self.ext::<crate::crash_log::CrashLog>().filter(|l| l.fed).map(|l| CrashInput {
+            last_boot: l
+                .crashes
+                .first()
+                .filter(|_| l.new_this_boot > 0)
+                .map(|c| (c.reason.clone(), c.summary.clone(), c.time)),
+            backend: l.backend.clone(),
+            efi_low: l.efi.as_ref().filter(|e| e.turned_off).map(|e| e.free.unwrap_or(0)),
+        });
+        i
+    }
+
+    /// Judge the checks and log what changed (two readings in a row).
+    pub fn health_alerts(&mut self) -> Vec<Check> {
+        let inputs = self.health_inputs();
+        let checks = evaluate(&inputs);
+        let mut lines = Vec::new();
+        if let Some(a) = self.ext_mut::<HealthAlerts>() {
+            for c in &checks {
+                if c.severity == Severity::Unknown {
+                    continue;
+                }
+                let logged = a.logged.get(c.key).copied().unwrap_or(Severity::Ok);
+                if c.severity == logged {
+                    a.pending.remove(c.key);
+                    continue;
+                }
+                if a.pending.get(c.key) != Some(&c.severity) {
+                    a.pending.insert(c.key, c.severity);
+                    continue;
+                }
+                a.pending.remove(c.key);
+                a.logged.insert(c.key, c.severity);
+                let text = match c.severity {
+                    Severity::Ok => format!("Saúde: {} normalizado ({})", c.name, c.reason),
+                    _ => format!("Saúde: {} — {}", c.name, c.reason),
+                };
+                lines.push((c.severity, text, c.key));
+            }
+        }
+        for (sev, text, key) in lines {
+            let level = match sev {
+                Severity::Error => "error",
+                Severity::Warning => "warning",
+                _ => "info",
+            };
+            self.log_event(&["system", level], "health", text, serde_json::json!({"check": key, "severity": sev.as_str()}));
+        }
+        checks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sev(checks: &[Check], key: &str) -> Severity {
+        checks.iter().find(|c| c.key == key).map(|c| c.severity).unwrap()
+    }
+
+    /// One row: what to change in healthy inputs, the check and the
+    /// severity it must give.
+    type Case = (&'static str, fn(&mut Inputs), &'static str, Severity);
+
+    fn healthy() -> Inputs {
+        Inputs {
+            nic_hardware: None,
+            readings: true,
+            cpu_avg: Some((20.0, 60)),
+            psi_some60: Some(0.5),
+            psi_full60: Some(0.0),
+            mem_used: Some(40.0),
+            swap_used: None,
+            swap_in_rate: Some(0.0),
+            disks: vec![("/".into(), 60.0)],
+            temps: vec![("k10temp Tctl".into(), 55.0, Some(100.0), Level::Ok)],
+            nics: vec![("ether1".into(), 0.0, 0.0)],
+            conntrack: Some((1000, 262_144)),
+            cgnat: None,
+            cgnat_pool_full: 0,
+            cgnat_conntrack: None,
+            oom_recent: Some(0),
+            oom_victims: Vec::new(),
+            ntp: Some((true, NtpState::Synchronized)),
+            ntp_needed: false,
+            ntp_clock: NtpClock { clock: ClockState::Slewing, offset_ms: Some(1.5), ..NtpClock::default() },
+            clock_unix: Some(1_800_000_000),
+            services: Some(vec![("dns-resolver".into(), ServiceState::Running)]),
+            rss: Some((0, 20.0, 8, 50_000.0)),
+            sockbuf: Some(vec![("radius".into(), 4 << 20, 4 << 20)]),
+            ecmp: Some((0, 0, None)),
+            no_password: Vec::new(),
+            root_verity: Some(("a".into(), true)),
+            root_untrusted: false,
+            system_disk: None,
+            config_snapshots: Vec::new(),
+            config_disk: Some(Default::default()),
+            bgp_no_eor: Some((1, Vec::new())),
+            bgp_gr_no_bfd: Some((1, Vec::new())),
+            usb: Vec::new(),
+            usb_watchdog: Vec::new(),
+            absent_ports: Vec::new(),
+            wireguard_stale: Vec::new(),
+            mgmt_route: None,
+            boot_apply: Vec::new(),
+            crash: None,
+            memory: None,
+            ospf_lsdb: Some(Vec::new()),
+            ram_bytes: Some(8 << 30),
+        }
+    }
+
+    /// G3.4r: the OSPF databases, case by case: the protection's states
+    /// and the memory against the RAM with no limit at all.
+    #[test]
+    fn ospf_lsdb_states_and_memory() {
+        use corerouter_model::ospf_state::MaxLsaState;
+        let by = |i: &Inputs| evaluate(i).into_iter().find(|c| c.key == "ospf.lsdb").unwrap();
+        let prot = |state: &str| MaxLsaState { limit: 50_000, state: state.into(), ignore_entries: 2, ignore_count: 5, ignore_remaining_secs: Some(108) };
+        let inst = |lsas: u64, protection: Option<MaxLsaState>| OspfLsdbInput {
+            instance: "v2".into(),
+            lsas,
+            others: Some(lsas.saturating_sub(10)),
+            limit: protection.as_ref().map(|p| (p.limit, 37_500)),
+            protection,
+        };
+        let mut i = healthy();
+        i.ospf_lsdb = None;
+        assert_eq!(by(&i).severity, Severity::Unknown);
+        i.ospf_lsdb = Some(vec![inst(12_350, None)]);
+        let c = by(&i);
+        assert_eq!(c.severity, Severity::Ok);
+        assert!(c.reason.contains("12350 LSAs, ~26 MiB"), "{c:?}");
+        let cases: [(u64, Option<&str>, Severity, &str); 6] = [
+            (12_350, Some("normal"), Severity::Ok, "1 instância"),
+            (41_210, Some("warning"), Severity::Warning, "82 % do limite"),
+            (60_010, Some("exceeded"), Severity::Warning, "warning-only"),
+            (10, Some("ignore"), Severity::Error, "nova tentativa em 1m48s (2 de 5"),
+            (10, Some("isolated"), Severity::Error, "isolada"),
+            // No limit: 1 000 000 LSAs take ~2 GiB, 25 % of 8 GiB.
+            (1_000_000, None, Severity::Warning, "25 % da RAM"),
+        ];
+        for (lsas, state, severity, text) in cases {
+            i.ospf_lsdb = Some(vec![inst(lsas, state.map(prot))]);
+            let c = by(&i);
+            assert_eq!(c.severity, severity, "{state:?}: {c:?}");
+            assert!(c.reason.contains(text), "{state:?}: {c:?}");
+        }
+        // Half the RAM is an error, and the advice is to set a limit.
+        i.ospf_lsdb = Some(vec![inst(2_000_000, None)]);
+        let c = by(&i);
+        assert_eq!(c.severity, Severity::Error, "{c:?}");
+        assert!(c.action.unwrap().contains("ponha um limite"));
+        // The worst instance speaks.
+        i.ospf_lsdb = Some(vec![inst(41_210, Some(prot("warning"))), OspfLsdbInput { instance: "b".into(), ..inst(10, Some(prot("isolated"))) }]);
+        assert!(by(&i).reason.starts_with("b isolada"), "{:?}", by(&i));
+    }
+
+    /// G1.6zy: no ECC, no check; a module that corrects errors; one that
+    /// does not.
+    #[test]
+    fn memory_errors_by_module() {
+        let mut i = Inputs::default();
+        let by = |i: &Inputs| evaluate(i).into_iter().find(|c| c.key == "memory.ecc");
+        assert!(by(&i).is_none());
+        let dimm = |ce, ue| ("CPU_SrcID#0_MC#0_Chan#1_DIMM#0".to_owned(), ce, ue);
+        i.memory = Some(MemoryInput { dimms: vec![dimm(0, 0), dimm(0, 0)], ..MemoryInput::default() });
+        assert_eq!(by(&i).unwrap().severity, Severity::Ok);
+        i.memory = Some(MemoryInput { dimms: vec![dimm(0, 0), dimm(7, 0)], ..MemoryInput::default() });
+        let c = by(&i).unwrap();
+        assert_eq!(c.severity, Severity::Warning);
+        assert!(c.reason.contains("7 erro(s) corrigido(s)") && c.reason.contains("Chan#1_DIMM#0 (7)"), "{}", c.reason);
+        i.memory = Some(MemoryInput { dimms: vec![dimm(7, 1)], ..MemoryInput::default() });
+        assert_eq!(by(&i).unwrap().severity, Severity::Error);
+        i.memory = Some(MemoryInput { corrupted_kib: 4, ..MemoryInput::default() });
+        let c = by(&i).unwrap();
+        assert_eq!(c.severity, Severity::Warning);
+        assert!(c.reason.contains("4 KiB"), "{}", c.reason);
+    }
+
+    /// G1.6zx: the previous boot's panic, and a NVRAM too short for the next.
+    #[test]
+    fn crash_of_the_previous_boot_and_the_store() {
+        let mut i = Inputs::default();
+        let by = |i: &Inputs, k: &str| evaluate(i).into_iter().find(|c| c.key == k);
+        assert!(by(&i, "kernel.crash").is_none(), "no service, no check");
+        i.crash = Some(CrashInput { backend: Some("efi_pstore".into()), ..CrashInput::default() });
+        assert_eq!(by(&i, "kernel.crash").unwrap().severity, Severity::Ok);
+        assert!(by(&i, "kernel.crash-store").is_none());
+        i.crash = Some(CrashInput {
+            last_boot: Some(("panic".into(), "Kernel panic - not syncing: x".into(), Some(1_763_000_000))),
+            backend: Some("efi_pstore".into()),
+            efi_low: Some(9000),
+        });
+        let c = by(&i, "kernel.crash").unwrap();
+        assert_eq!(c.severity, Severity::Warning);
+        assert!(c.reason.contains("pânico do kernel: Kernel panic - not syncing: x"), "{}", c.reason);
+        assert_eq!(c.value.as_deref(), Some("panic 2025-11-13 02:13:20 UTC"));
+        let st = by(&i, "kernel.crash-store").unwrap();
+        assert_eq!(st.severity, Severity::Warning);
+        assert!(st.reason.contains("9000 bytes"));
+    }
+
+    /// The kernel's count since boot, read by a daemon that just started
+    /// (the init restarted it after the OOM killer took it): counted when
+    /// the machine is young enough to date them, then like any rise.
+    #[test]
+    fn kills_before_the_daemon_started_count_when_they_are_recent() {
+        let mut a = HealthAlerts::default();
+        assert_eq!(a.oom_seen(700, 1), 1, "machine up 700 s: the kill is recent");
+        assert_eq!(a.oom_seen(705, 1), 1, "no new kill, the old one still counts");
+        assert_eq!(a.oom_seen(710, 2), 2);
+        assert_eq!(a.oom_seen(700 + OOM_WINDOW, 2), 1, "the first one left the window");
+        assert_eq!(a.oom_seen(710 + OOM_WINDOW, 2), 0);
+        // Up for days: the kills already counted cannot be dated.
+        let mut old = HealthAlerts::default();
+        assert_eq!(old.oom_seen(3 * 86_400, 4), 0);
+        assert_eq!(old.oom_seen(3 * 86_400 + 5, 5), 1);
+        // A first reading with no kill.
+        let mut clean = HealthAlerts::default();
+        assert_eq!(clean.oom_seen(30, 0), 0);
+        assert_eq!(clean.oom_seen(35, 1), 1);
+    }
+
+    #[test]
+    fn healthy_is_all_ok() {
+        let checks = evaluate(&healthy());
+        assert_eq!(checks.len(), 20);
+        for c in &checks {
+            assert_eq!(c.severity, Severity::Ok, "{c:?}");
+            assert!(c.action.is_none());
+        }
+        assert_eq!(overall(&checks), Severity::Ok);
+    }
+
+    #[test]
+    fn boot_apply_errors_only_while_something_is_out() {
+        assert!(evaluate(&healthy()).iter().all(|c| c.key != "boot.apply"));
+        let mut i = healthy();
+        i.boot_apply = vec![("firewall".into(), "nft refused rule 3".into())];
+        let checks = evaluate(&i);
+        let c = checks.iter().find(|c| c.key == "boot.apply").unwrap();
+        assert_eq!(c.severity, Severity::Error);
+        assert_eq!(c.value.as_deref(), Some("firewall"));
+        assert!(c.reason.contains("firewall: nft refused rule 3"), "{}", c.reason);
+        assert!(c.reason.contains("gerência"), "{}", c.reason);
+        assert!(c.action.is_some());
+    }
+
+    #[test]
+    fn a_wireguard_peer_without_answer_warns() {
+        assert!(evaluate(&healthy()).iter().all(|c| c.key != "wireguard.handshake"));
+        let mut i = healthy();
+        i.wireguard_stale = vec![("filial".into(), "wg0".into(), 420, true), ("loja".into(), "wg0".into(), 360, false)];
+        let checks = evaluate(&i);
+        let c = checks.iter().find(|c| c.key == "wireguard.handshake").unwrap();
+        assert_eq!(c.severity, Severity::Warning);
+        assert!(c.reason.contains("filial (wg0) sem handshake há 7 min"), "{}", c.reason);
+        assert!(c.reason.contains("loja (wg0) nunca respondeu, tentando há 6 min"), "{}", c.reason);
+    }
+
+    #[test]
+    fn absent_ports_warn_only_when_there_are_some() {
+        assert!(evaluate(&healthy()).iter().all(|c| c.key != "interface.absent"));
+        let mut i = healthy();
+        i.absent_ports = vec!["ether2".into(), "vlan20".into()];
+        let checks = evaluate(&i);
+        let c = checks.iter().find(|c| c.key == "interface.absent").unwrap();
+        assert_eq!(c.severity, Severity::Warning);
+        assert_eq!(c.value.as_deref(), Some("2"));
+        assert!(c.reason.contains("ether2, vlan20"), "{}", c.reason);
+        assert!(c.action.is_some());
+    }
+
+    #[test]
+    fn every_rule_by_table() {
+        let cases: &[Case] = &[
+            ("cpu 85", |i| i.cpu_avg = Some((85.0, 60)), "cpu", Severity::Warning),
+            ("root on the disk", |i| i.system_disk = Some(SystemDisk { disk: Some("sda".into()), ..Default::default() }), "system.disk", Severity::Ok),
+            ("root in RAM", |i| i.system_disk = Some(SystemDisk { in_ram: true, bytes: 87 << 20, ..Default::default() }), "system.disk", Severity::Ok),
+            ("RAM asked, too little", |i| i.system_disk = Some(SystemDisk { note: Some("200 MiB of RAM".into()), ..Default::default() }), "system.disk", Severity::Warning),
+            ("system disk pulled out", |i| i.system_disk = Some(SystemDisk { in_ram: true, removed: Some("system disk sda removed".into()), ..Default::default() }), "system.disk", Severity::Error),
+            ("bgp neighbor without End-of-RIB", |i| i.bgp_no_eor = Some((2, vec!["chr".into()])), "bgp.end-of-rib", Severity::Warning),
+            ("bgp without graceful restart", |i| i.bgp_no_eor = Some((0, Vec::new())), "bgp.end-of-rib", Severity::Ok),
+            ("no routing daemon", |i| i.bgp_no_eor = None, "bgp.end-of-rib", Severity::Unknown),
+            ("gr with the N bit, no BFD", |i| i.bgp_gr_no_bfd = Some((2, vec!["cr2".into()])), "bgp.gr-bfd", Severity::Warning),
+            ("gr without the N bit", |i| i.bgp_gr_no_bfd = Some((0, Vec::new())), "bgp.gr-bfd", Severity::Ok),
+            ("rmem_max caps the RADIUS socket", |i| i.sockbuf = Some(vec![("radius".into(), 212_992, 4 << 20)]), "sockbuf", Severity::Warning),
+            ("no burst socket open", |i| i.sockbuf = None, "sockbuf", Severity::Unknown),
+            ("cpu 97", |i| i.cpu_avg = Some((97.0, 60)), "cpu", Severity::Error),
+            ("cpu too little history", |i| i.cpu_avg = Some((99.0, 3)), "cpu", Severity::Unknown),
+            ("psi some 15", |i| i.psi_some60 = Some(15.0), "memory.pressure", Severity::Warning),
+            ("psi some 50", |i| i.psi_some60 = Some(50.0), "memory.pressure", Severity::Error),
+            ("psi full 6", |i| i.psi_full60 = Some(6.0), "memory.pressure", Severity::Error),
+            ("no psi, 92 % used", |i| { i.psi_some60 = None; i.mem_used = Some(92.0) }, "memory.pressure", Severity::Warning),
+            ("no psi, 98 % used", |i| { i.psi_some60 = None; i.mem_used = Some(98.0) }, "memory.pressure", Severity::Error),
+            ("swap 60", |i| i.swap_used = Some(60.0), "swap", Severity::Warning),
+            ("swap 95", |i| i.swap_used = Some(95.0), "swap", Severity::Error),
+            ("swap thrash", |i| { i.swap_used = Some(5.0); i.swap_in_rate = Some(500.0) }, "swap", Severity::Warning),
+            ("disk 10 % free", |i| i.disks.push(("/var".into(), 10.0)), "disk", Severity::Warning),
+            ("disk 3 % free", |i| i.disks = vec![("/".into(), 3.0)], "disk", Severity::Error),
+            ("no disk", |i| i.disks.clear(), "disk", Severity::Unknown),
+            ("config disk not measured", |i| i.config_disk = None, "config_disk", Severity::Unknown),
+            ("histories fit", |i| i.config_disk = Some(Default::default()), "config_disk", Severity::Ok),
+            (
+                "revisions cut",
+                |i| {
+                    i.config_disk = Some(crate::config_disk::Usage { revisions_not_saved: 3, ..Default::default() });
+                },
+                "config_disk",
+                Severity::Warning,
+            ),
+            (
+                "log lines dropped",
+                |i| {
+                    i.config_disk = Some(crate::config_disk::Usage { log_dropped: 1, ..Default::default() });
+                },
+                "config_disk",
+                Severity::Warning,
+            ),
+            (
+                "graphs refused by the disk",
+                |i| {
+                    i.config_disk = Some(crate::config_disk::Usage { graph_refused: 1, ..Default::default() });
+                },
+                "config_disk",
+                Severity::Warning,
+            ),
+            ("temp near crit", |i| i.temps.push(("nvme".into(), 92.0, Some(100.0), Level::Warning)), "temperature", Severity::Warning),
+            ("temp at crit", |i| i.temps = vec![("acpitz".into(), 99.0, Some(100.0), Level::Error)], "temperature", Severity::Error),
+            ("nic errors", |i| i.nics.push(("ether4".into(), 2.0, 15.0)), "nic.errors", Severity::Warning),
+            ("nic many errors", |i| i.nics.push(("ether4".into(), 500.0, 0.0)), "nic.errors", Severity::Error),
+            ("nic drops", |i| i.nics.push(("ether2".into(), 0.0, 200.0)), "nic.errors", Severity::Warning),
+            ("nic flood of drops", |i| i.nics.push(("ether2".into(), 0.0, 20_000.0)), "nic.errors", Severity::Error),
+            ("nic few drops", |i| i.nics.push(("ether2".into(), 0.0, 5.0)), "nic.errors", Severity::Ok),
+            ("conntrack 85", |i| i.conntrack = Some((85, 100)), "conntrack", Severity::Warning),
+            ("conntrack 99", |i| i.conntrack = Some((99, 100)), "conntrack", Severity::Error),
+            ("cgnat above", |i| i.cgnat = Some((3, 0)), "cgnat.ports", Severity::Warning),
+            ("cgnat failures", |i| i.cgnat = Some((0, 12)), "cgnat.ports", Severity::Error),
+            ("cgnat pool out of blocks", |i| { i.cgnat = Some((0, 0)); i.cgnat_pool_full = 15 }, "cgnat.ports", Severity::Error),
+            ("oom", |i| i.oom_recent = Some(1), "oom", Severity::Error),
+            ("ntp off, nothing needs it", |i| i.ntp = Some((false, NtpState::Stopped)), "ntp", Severity::Ok),
+            ("ntp off, radius needs it", |i| { i.ntp = Some((false, NtpState::Stopped)); i.ntp_needed = true }, "ntp", Severity::Warning),
+            ("ntp waiting", |i| i.ntp = Some((true, NtpState::Waiting)), "ntp", Severity::Warning),
+            ("ntp nobody to ask", |i| { i.ntp = Some((true, NtpState::Waiting)); i.ntp_clock.no_server = true }, "ntp", Severity::Warning),
+            ("ntp step waits for the operator", |i| { i.ntp_clock.clock = ClockState::AwaitingConfirmation; i.ntp_clock.pending_step_ms = Some(10_800_000.0) }, "ntp", Severity::Warning),
+            ("ntp answer refused", |i| i.ntp_clock.clock = ClockState::Refused, "ntp", Severity::Warning),
+            ("ntp measures a clock nobody corrects", |i| { i.ntp_clock.clock = ClockState::NotSet; i.ntp_clock.offset_ms = Some(-4000.0) }, "ntp", Severity::Warning),
+            ("ntp measures only, clock right", |i| { i.ntp_clock.clock = ClockState::NotSet; i.ntp_clock.offset_ms = Some(3.0) }, "ntp", Severity::Ok),
+            ("ntp off, clock never set", |i| { i.ntp = Some((false, NtpState::Stopped)); i.clock_unix = Some(86_400) }, "ntp", Severity::Warning),
+            ("ntp no daemon", |i| i.ntp = Some((true, NtpState::Stopped)), "ntp", Severity::Unknown),
+            ("service restarting", |i| i.services = Some(vec![("dns".into(), ServiceState::Restarting)]), "services", Severity::Warning),
+            ("service failed", |i| i.services = Some(vec![("a".into(), ServiceState::Running), ("dns".into(), ServiceState::Failed)]), "services", Severity::Error),
+            ("rss on one cpu", |i| i.rss = Some((0, 80.0, 8, 50_000.0)), "rss", Severity::Warning),
+            ("rss idle link", |i| i.rss = Some((0, 100.0, 8, 10.0)), "rss", Severity::Ok),
+            ("rss two cpus", |i| i.rss = Some((0, 100.0, 2, 50_000.0)), "rss", Severity::Ok),
+            ("ecmp of one origin", |i| i.ecmp = Some((0, 2, None)), "routes.ecmp", Severity::Ok),
+            ("ecmp static + dhcp", |i| i.ecmp = Some((1, 0, Some(("x".into(), Some("ip.dhcp-client.set".into()))))), "routes.ecmp", Severity::Warning),
+            ("routes not read", |i| i.ecmp = None, "routes.ecmp", Severity::Unknown),
+            ("admin without a password", |i| i.no_password = vec!["admin".into()], "auth.no_password", Severity::Warning),
+            ("root without dm-verity", |i| i.root_verity = Some(("b".into(), false)), "root.verity", Severity::Warning),
+            ("not the A/B image", |i| i.root_verity = None, "root.verity", Severity::Unknown),
+        ];
+        for (what, change, key, want) in cases {
+            let mut i = healthy();
+            change(&mut i);
+            let checks = evaluate(&i);
+            assert_eq!(sev(&checks, key), *want, "{what}");
+            let c = checks.iter().find(|c| c.key == *key).unwrap();
+            assert!(!c.reason.is_empty(), "{what}: a reason");
+            if matches!(want, Severity::Warning | Severity::Error) {
+                assert!(c.action.is_some(), "{what}: an action");
+            }
+            // Only that check moved.
+            for other in checks.iter().filter(|c| c.key != *key) {
+                assert!(matches!(other.severity, Severity::Ok), "{what} moved {}", other.key);
+            }
+        }
+    }
+
+    #[test]
+    fn a_full_config_names_the_snapshots_to_remove() {
+        let mut i = healthy();
+        i.disks = vec![("/config".into(), 0.0)];
+        i.config_snapshots = vec![
+            ("config-a".into(), 13_811_709),
+            ("config-b".into(), 0),
+            ("config-a.new".into(), 9_000_000),
+        ];
+        let checks = evaluate(&i);
+        let c = checks.iter().find(|c| c.key == "disk").unwrap();
+        assert_eq!(c.severity, Severity::Error);
+        let a = c.action.as_deref().unwrap();
+        assert!(a.contains("config-a 13.8 MB, config-a.new 9.0 MB (cópia parcial)"), "{a}");
+        assert!(!a.contains("config-b"), "nothing to free there: {a}");
+        assert!(a.contains("system.package.snapshot.remove"), "{a}");
+        // Another mount keeps the old advice.
+        i.disks = vec![("/var".into(), 0.0)];
+        let checks = evaluate(&i);
+        let c = checks.iter().find(|c| c.key == "disk").unwrap();
+        assert!(c.action.as_deref().unwrap().contains("logs"));
+    }
+
+    /// G1.6zh: what the session tells the NTP check, and what it says to do.
+    #[test]
+    fn the_ntp_check_says_why_the_clock_is_not_set_and_what_to_do() {
+        use corerouter_model::ntp::{NO_SERVER, NtpStatus};
+        let mut s = Session::virtual_lab();
+        let ntp = |s: &mut Session| evaluate(&s.health_inputs()).into_iter().find(|c| c.key == "ntp").unwrap();
+        s.execute("system.ntp.client.set", &serde_json::json!({"enabled": true})).unwrap();
+        // No daemon yet runs the client.
+        assert_eq!(ntp(&mut s).severity, Severity::Unknown);
+        // On, nobody to ask: a new router whose network gave no option 42.
+        s.set_ntp_status(NtpStatus { status: NtpState::Waiting, last_error: Some(NO_SERVER.into()), ..NtpStatus::default() });
+        let c = ntp(&mut s);
+        assert_eq!((c.severity, c.value.as_deref()), (Severity::Warning, Some("no-server")));
+        assert!(c.reason.starts_with("relógio não ajustado"), "{}", c.reason);
+        assert!(c.action.as_deref().unwrap().contains("system.ntp.client.set servers="), "{:?}", c.action);
+        // Servers that do not answer.
+        s.set_ntp_status(NtpStatus { status: NtpState::Waiting, last_error: Some("192.0.2.1: timed out".into()), ..NtpStatus::default() });
+        assert_eq!(ntp(&mut s).value.as_deref(), Some("waiting"));
+        // A clock three hours behind (an RTC kept in local time): the step
+        // waits for the operator, and the check says how to confirm.
+        s.set_ntp_status(NtpStatus {
+            status: NtpState::Synchronized,
+            system_offset_ms: Some(10_800_000.0),
+            clock: ClockState::AwaitingConfirmation,
+            pending_step_ms: Some(10_800_000.0),
+            ..NtpStatus::default()
+        });
+        let c = ntp(&mut s);
+        assert_eq!(c.severity, Severity::Warning);
+        assert!(c.reason.contains("3 h 0 min atrasado"), "{}", c.reason);
+        assert!(c.action.as_deref().unwrap().contains("system.ntp.client.confirm-step"));
+        // Corrected.
+        s.set_ntp_status(NtpStatus { status: NtpState::Synchronized, system_offset_ms: Some(2.0), clock: ClockState::Slewing, ..NtpStatus::default() });
+        let c = ntp(&mut s);
+        assert_eq!((c.severity, c.reason.as_str()), (Severity::Ok, "relógio sincronizado"));
+        // Off: fine with a plausible clock, a warning with one never set.
+        s.execute("system.ntp.client.set", &serde_json::json!({"enabled": false})).unwrap();
+        s.tick(1_800_000_000);
+        assert_eq!(ntp(&mut s).severity, Severity::Ok);
+        s.tick(86_400);
+        let c = ntp(&mut s);
+        assert_eq!(c.severity, Severity::Warning);
+        assert!(c.reason.contains("anterior a 2026"), "{}", c.reason);
+    }
+
+    #[test]
+    fn new_router_has_no_ntp_warning() {
+        let mut s = Session::virtual_lab();
+        s.health_alerts();
+        let log = s.execute("log.print", &serde_json::json!({})).unwrap().to_string();
+        assert!(!log.contains("Saúde: NTP"), "{log}");
+    }
+
+    #[test]
+    fn admin_without_password_warns_until_set() {
+        let mut s = Session::virtual_lab();
+        assert!(s.bootstrap_admin(false).is_some());
+        let warn = |s: &mut Session| {
+            let checks = evaluate(&s.health_inputs());
+            checks.iter().find(|c| c.key == "auth.no_password").map(|c| c.severity)
+        };
+        assert_eq!(warn(&mut s), Some(Severity::Warning));
+        s.execute("user.set", &serde_json::json!({"name": "admin", "password": "a-real-password"})).unwrap();
+        assert_eq!(warn(&mut s), Some(Severity::Ok));
+    }
+
+    /// G3.9fj: the RouterOS 7.25 case, a graceful-restart neighbor that
+    /// never sends End-of-RIB, named once established for the grace time.
+    #[test]
+    fn bgp_neighbor_without_end_of_rib_warns() {
+        let mut s = Session::virtual_lab();
+        let at = |s: &mut Session| evaluate(&s.health_inputs()).into_iter().find(|c| c.key == "bgp.end-of-rib").unwrap();
+        assert_eq!(at(&mut s).severity, Severity::Unknown);
+        let one = |conn: &str, uptime: u64, eor: &[&str], remote: Option<&str>| BgpSession {
+            instance: "default".into(),
+            remote_address: "192.0.2.2".into(),
+            state: "established".into(),
+            established: true,
+            uptime_secs: Some(uptime),
+            connection: Some(conn.into()),
+            gr_local: Some("restart".into()),
+            gr_remote: remote.map(Into::into),
+            end_of_rib_received: eor.iter().map(|f| (*f).to_owned()).collect(),
+            ..BgpSession::default()
+        };
+        let status = |sessions| RoutingStatus {
+            backend: "frr 10.7.1".into(),
+            bgp_sessions: sessions,
+            ..RoutingStatus::default()
+        };
+        // Just up: the initial update may still be running.
+        s.set_routing_status(status(vec![one("chr", 60, &[], Some("helper")), one("cr2", 900, &["ipv4"], Some("restart"))]));
+        assert_eq!(at(&mut s).severity, Severity::Ok);
+        // A neighbor without graceful restart is not waited for.
+        s.set_routing_status(status(vec![one("plain", 900, &[], None)]));
+        assert_eq!(at(&mut s).severity, Severity::Ok);
+        s.set_routing_status(status(vec![one("chr", 900, &[], Some("helper")), one("cr2", 900, &["ipv4"], Some("restart"))]));
+        let c = at(&mut s);
+        assert_eq!((c.severity, c.value.as_deref()), (Severity::Warning, Some("1 de 2")), "{c:?}");
+        assert!(c.reason.contains("chr") && !c.reason.contains("cr2"), "{}", c.reason);
+        assert!(c.action.is_some_and(|a| a.contains("Defer Time")));
+    }
+
+    /// G3.9fj, RFC 8538: a restarting neighbor with the N bit and no BFD
+    /// keeps its routes hold + Restart Time on a silent failure.
+    #[test]
+    fn bgp_gr_with_the_n_bit_and_no_bfd_warns() {
+        let mut s = Session::virtual_lab();
+        let at = |s: &mut Session| evaluate(&s.health_inputs()).into_iter().find(|c| c.key == "bgp.gr-bfd").unwrap();
+        let one = |conn: &str, n_bit: bool, bfd: Option<&str>| BgpSession {
+            instance: "default".into(),
+            remote_address: "10.39.5.1".into(),
+            established: true,
+            connection: Some(conn.into()),
+            gr_local: Some("helper".into()),
+            gr_remote: Some("restart".into()),
+            n_bit,
+            bfd: bfd.map(Into::into),
+            ..BgpSession::default()
+        };
+        let set = |s: &mut Session, v| s.set_routing_status(RoutingStatus { backend: "frr 10.7.1".into(), bgp_sessions: v, ..RoutingStatus::default() });
+        set(&mut s, vec![one("cr1", true, Some("up")), one("old", false, None)]);
+        assert_eq!(at(&mut s).severity, Severity::Ok);
+        set(&mut s, vec![one("cr1", true, None)]);
+        let c = at(&mut s);
+        assert_eq!((c.severity, c.value.as_deref()), (Severity::Warning, Some("1 de 1")), "{c:?}");
+        // Without the N bit on our instance a hold expiry drops the routes.
+        s.execute("routing.bgp.instance.set", &serde_json::json!({"asn": 65002, "router_id": "10.0.0.2", "graceful_notification": false})).unwrap();
+        assert_eq!(at(&mut s).severity, Severity::Ok);
+    }
+
+    #[test]
+    fn nothing_known_is_unknown_not_ok() {
+        let checks = evaluate(&Inputs::default());
+        assert_eq!(sev(&checks, "cpu"), Severity::Unknown);
+        assert_eq!(sev(&checks, "temperature"), Severity::Unknown);
+        assert_eq!(overall(&checks), Severity::Ok, "unknown alone is not a warning");
+    }
+
+    #[test]
+    fn alerts_need_two_readings_and_log_once() {
+        use corerouter_hal::system_resource::{LabSampler, ResourceSampler, Want};
+        let mut s = Session::virtual_lab();
+        let mut lab = LabSampler::new();
+        let mut warnings = 0;
+        for i in 0..6u64 {
+            s.resource_ingest(lab.sample(Want { processes: false, now_ms: Some(i * 5000) }));
+            s.health_alerts();
+            let log = s.execute("log.print", &serde_json::json!({})).unwrap().to_string();
+            warnings = log.matches("Saúde: NIC errors").count();
+            if i < 2 {
+                // First reading has no rates; the second is the first warning.
+                assert_eq!(warnings, 0, "reading {i}");
+            }
+        }
+        assert_eq!(warnings, 1, "logged once, not on every reading");
+    }
+
+    /// G1.6qj: a machine up for days whose daemon was killed by the OOM
+    /// killer and restarted: /proc/vmstat cannot date the kill, the kernel
+    /// log can, and the check names who died. Older than the window: ok.
+    #[test]
+    fn oom_kills_dated_by_the_kernel_log() {
+        use corerouter_hal::oslog::{OsLine, OsSource};
+        let mut s = Session::virtual_lab();
+        let now = 1_795_000_000u64;
+        s.safe_mode_mut().clock = Some(now);
+        let line = |ago: u64, pid: u32, comm: &str| OsLine {
+            time_us: (now - ago) * 1_000_000,
+            severity: 3,
+            source: OsSource::Kernel,
+            unit: String::new(),
+            device: String::new(),
+            pid: None,
+            message: format!("Out of memory: Killed process {pid} ({comm}) total-vm:812344kB, anon-rss:419840kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:1532kB oom_score_adj:-900"),
+            boot: "b1".into(),
+        };
+        let check = |s: &mut Session| {
+            let h = s.execute("system.health.check", &serde_json::json!({})).unwrap();
+            h["checks"].as_array().unwrap().iter().find(|c| c["key"] == "oom").unwrap().clone()
+        };
+        {
+            let book = s.ext_mut::<crate::oslog::OsLogBook>().unwrap();
+            book.push(line(2 * OOM_WINDOW, 90, "unbound"));
+        }
+        let c = check(&mut s);
+        assert_ne!(c["severity"], "error", "{c}");
+        {
+            let book = s.ext_mut::<crate::oslog::OsLogBook>().unwrap();
+            book.push(line(720, 812, "corerouter-daem"));
+            book.push(line(720, 812, "corerouter-daem")); // the journal's copy
+            book.push(line(30, 4100, "bgpd"));
+        }
+        let c = check(&mut s);
+        assert_eq!(c["severity"], "error", "{c}");
+        assert_eq!(c["value"], "2", "{c}");
+        let reason = c["reason"].as_str().unwrap();
+        assert!(reason.contains("bgpd, do FRR (pid 4100, há 30 s, 410 MiB)"), "{reason}");
+        assert!(reason.contains("corerouter-daemon, o próprio daemon (o init o reiniciou) (pid 812, há 12 min"), "{reason}");
+        assert!(reason.find("bgpd").unwrap() < reason.find("corerouter").unwrap(), "newest first: {reason}");
+        // An hour later both left the window.
+        s.safe_mode_mut().clock = Some(now + OOM_WINDOW);
+        assert_ne!(check(&mut s)["severity"], "error");
+    }
+}

@@ -1,0 +1,53 @@
+//! Portuguese labels and explanations of System › OS Log (G4.8b), scope `os_log`, sorted by key.
+
+/// Labels: (English, Portuguese).
+pub(super) const LABELS: &[(&str, &str)] = &[
+    ("Boot", "Boot"),
+    ("Click a row to see it in detail.", "Clique numa linha para ver os detalhes."),
+    ("Command", "Comando"),
+    ("Copy message", "Copiar mensagem"),
+    ("Details", "Detalhes"),
+    ("Device", "Dispositivo"),
+    ("Driver / unit", "Driver / unidade"),
+    ("Find", "Buscar"),
+    ("Find: text, unit, PID", "Buscar: texto, unidade, PID"),
+    ("Follow", "Seguir"),
+    ("Level", "Nível"),
+    ("Levels", "Níveis"),
+    ("Message", "Mensagem"),
+    ("No line passes the filters.", "Nenhuma linha passa nos filtros."),
+    ("No lines yet.", "Nada no log do sistema ainda."),
+    ("OS Log", "Log do sistema"),
+    ("Pause", "Pausar"),
+    ("Priority", "Prioridade"),
+    ("Repeated", "Repetição"),
+    ("Source", "Origem"),
+    ("Sources", "Fontes"),
+    ("Sources:", "Fontes:"),
+    ("Stop scrolling to new rows (they keep arriving)", "Parar de rolar para as linhas novas (elas continuam chegando)"),
+    ("The router does not know this message yet.", "O roteador ainda não conhece esta mensagem."),
+    ("This window is not in this GUI yet", "Esta janela ainda não existe nesta GUI"),
+    ("Time", "Hora"),
+    ("What it means", "O que significa"),
+    ("earlier boot", "boot anterior"),
+    ("lines read", "linhas lidas"),
+    ("on the router", "no roteador"),
+    ("rows here", "linhas aqui"),
+    ("shown", "mostradas"),
+    ("this boot", "boot atual"),
+    ("unavailable", "indisponível"),
+];
+
+/// Explanations: (key, Markdown).
+pub(super) const HELP: &[(&str, &str)] = &[
+    ("menu.os-log", "## O que faz\nO log do **sistema operacional** debaixo do roteador: o kernel (drivers de placa, pilha de rede, memória, discos), os serviços e os logins. É diferente do **Log** do roteador, que mostra o que o próprio CoreRouter fez (comandos, DHCP, NTP).\n\nCada linha tem o nível da RFC 5424, a origem e a mensagem; mensagens repetidas viram uma linha só com a contagem, e as que o roteador conhece trazem **O que significa** e um botão para a janela que resolve. No Linux lê `/dev/kmsg` e o journal do systemd; na imagem de produção (sem systemd), só o kernel."),
+    ("os_log.details", "## Detalhes\n\nA linha escolhida inteira: de onde veio (kernel, serviço ou login), o driver ou unidade que a escreveu, o dispositivo (porta, disco), a prioridade, o boot em que foi escrita (**boot atual** ou anterior), quantas vezes repetiu e entre que horas, e a mensagem completa para copiar.\n\nSe o roteador conhece a mensagem, logo abaixo vem **O que significa** e os botões para agir."),
+    ("os_log.find", "## Buscar\n\nFiltra as linhas que esta janela tem pelo texto da mensagem, pelo nome do driver ou unidade (`r8169`, `sshd`, `unbound.service`), pelo dispositivo (`ether2`) ou pelo número do processo (PID). Não diferencia maiúsculas.\n\nEsc limpa a busca."),
+    ("os_log.level", "## Nível\n\nA gravidade da linha, nos oito níveis da **RFC 5424** (§6.2.1): `emergency` (0), `alert` (1), `critical` (2), `error` (3), `warning` (4), `notice` (5), `info` (6), `debug` (7). O kernel e o syslog usam os mesmos números.\n\nOs selos de cima juntam em três: **error** (0 a 3, pede ação), **warning** (4, vale um olhar) e **info** (5 a 7). O número ao lado é quantas linhas o roteador guarda daquele nível. Nenhum selo ligado: todos."),
+    ("os_log.meaning", "## O que significa\n\nPara mensagens conhecidas (anel da placa cheio, link caindo, conntrack cheio, memória acabando, erro de disco, erro de hardware, CPU quente, programa caindo, login recusado…), o roteador explica o que aconteceu, as causas comuns e o que fazer, e oferece botões que abrem a janela certa — o **Tuning** da porta, o **gráfico**, **Interfaces**, **Services**.\n\nAs que custam tráfego ou hardware também vão uma vez para o **Log** do roteador (`system,error`), para as regras de `/system logging` (syslog remoto) as verem."),
+    ("os_log.message", "## Mensagem\n\nO texto que o kernel ou o programa escreveu, sem caracteres de controle. Um selo **37×** na frente diz que a mesma mensagem (a menos dos números) chegou 37 vezes; um selo azul diz que o roteador a conhece — clique na linha para ver o que significa.\n\nPasse o ponteiro sobre uma mensagem longa para lê-la inteira."),
+    ("os_log.repeat", "## Repetição\n\nUma mensagem igual a uma dos últimos 10 minutos — mesma origem, unidade, nível e texto, a menos dos números (`rx_missed 12` e `rx_missed 13` são a mesma) — não vira linha nova: a linha existente conta mais uma, guarda o texto mais novo e sobe para o fim da lista. **repetido 37× em 9 min** diz quantas vezes e entre a primeira e a última.\n\nAssim uma placa que descarta pacotes o dia todo ocupa uma linha, não milhares."),
+    ("os_log.source", "## Origem\n\nDe onde a linha vem:\n\n- **kernel** — drivers (placas de rede, discos), a pilha de rede, memória, hardware; ao lado, o driver (`r8169`, `nf_conntrack`).\n- **services** — programas e serviços (unidades do systemd, daemons).\n- **auth** — logins e privilégios: `sshd`, `sudo`, PAM (facilidades syslog auth e authpriv).\n\nNenhum selo ligado: todas."),
+    ("os_log.sources", "## Fontes\n\nDe onde o roteador lê o log do sistema, e se está conseguindo:\n\n- **kmsg** — `/dev/kmsg`, o anel do kernel, lido direto. Com `kernel.dmesg_restrict=1` precisa da capacidade `CAP_SYSLOG`; sem ela o selo fica vermelho com o motivo e as linhas do kernel vêm do journal.\n- **journal** — o journal do systemd, por `journalctl` (sem shell, com tempo-limite). A imagem de produção não tem systemd: este fica indisponível e o kernel basta.\n- **lab** — no laboratório virtual, linhas inventadas de um roteador para testar a janela (`--os-log host` no daemon lê a máquina de verdade).\n\nPasse o ponteiro num selo vermelho para ver por quê."),
+    ("os_log.time", "## Hora\n\nQuando a linha foi escrita, pelo relógio do roteador em UTC (ainda sem fuso). Linha de outro dia mostra a data. Numa linha repetida é a hora da **última** vez; os detalhes mostram a primeira e a última.\n\nO kernel conta o tempo desde o boot; o roteador soma a hora do boot, como o `dmesg -T` (depois de uma suspensão a hora pode adiantar)."),
+];

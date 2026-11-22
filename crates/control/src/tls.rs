@@ -1,0 +1,505 @@
+//! TLS for the control channel and the WebSocket (G0.3): `rustls` with the
+//! `ring` provider, no OpenSSL.
+//!
+//! The router makes its own self-signed certificate the first time
+//! ([`load_or_create`]: `tls-cert.pem`, and `tls-key.pem` with mode 0600, in
+//! the config directory). There is no CA to check it against, so clients
+//! pin it the SSH way: the first connection shows its SHA-256
+//! [`fingerprint`] and asks; [`crate::known_hosts`] remembers the answer;
+//! a different certificate later is refused ([`connect`] fails before a
+//! single byte of the login is sent). Signatures in the handshake are
+//! still verified, so a man in the middle cannot reuse a pinned
+//! certificate without its key.
+
+use std::fs;
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
+use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
+use ring::digest::{SHA256, digest};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::{
+    CertificateError, ClientConfig, ClientConnection, DigitallySignedStruct, ServerConfig,
+    ServerConnection, SignatureScheme, StreamOwned,
+};
+
+pub const CERT_FILE: &str = "tls-cert.pem";
+pub const KEY_FILE: &str = "tls-key.pem";
+/// Longest PEM file read.
+const MAX_PEM: u64 = 64 * 1024;
+/// Time a peer gets to finish the TLS handshake.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Name sent in SNI. Clients pin the certificate, so it is not checked.
+const SERVER_NAME: &str = "corerouter";
+
+pub type ServerStream = StreamOwned<ServerConnection, crate::conn::Sock>;
+pub type ClientStream = StreamOwned<ClientConnection, TcpStream>;
+
+fn provider() -> Arc<CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// `SHA256:AB:CD:…` of a DER certificate, as browsers show it.
+pub fn fingerprint(der: &[u8]) -> String {
+    let hex: Vec<String> = digest(&SHA256, der)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect();
+    format!("SHA256:{}", hex.join(":"))
+}
+
+/// The router's TLS identity.
+#[derive(Clone)]
+pub struct ServerIdentity {
+    pub config: Arc<ServerConfig>,
+    pub fingerprint: String,
+}
+
+impl std::fmt::Debug for ServerIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerIdentity")
+            .field("fingerprint", &self.fingerprint)
+            .finish_non_exhaustive()
+    }
+}
+
+fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    fs::File::open(path)?.take(MAX_PEM).read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// Load the certificate and key from `dir`, or make and save new ones.
+/// Returns the identity and whether it was just created.
+pub fn load_or_create(dir: &Path) -> Result<(ServerIdentity, bool), String> {
+    let cert_path = dir.join(CERT_FILE);
+    let key_path = dir.join(KEY_FILE);
+    let created = !(cert_path.exists() && key_path.exists());
+    if created {
+        let (cert_pem, key_pem) = generate_for(node_tag(dir).as_deref())?;
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        write_private(&key_path, key_pem.as_bytes())
+            .map_err(|e| format!("{}: {e}", key_path.display()))?;
+        fs::write(&cert_path, cert_pem).map_err(|e| format!("{}: {e}", cert_path.display()))?;
+    } else {
+        keep_private(&key_path).map_err(|e| format!("{}: {e}", key_path.display()))?;
+    }
+    let cert = read_bounded(&cert_path).map_err(|e| format!("{}: {e}", cert_path.display()))?;
+    let key = read_bounded(&key_path).map_err(|e| format!("{}: {e}", key_path.display()))?;
+    Ok((identity_from_pem(&cert, &key)?, created))
+}
+
+/// A new self-signed certificate and its key, as PEM (see [`generate_for`]).
+pub fn generate() -> Result<(String, String), String> {
+    generate_for(None)
+}
+
+/// The router's node id kept next to the certificate (`<dir>/node-id`, 32
+/// hex digits, made by the daemon before the certificate): its first 8
+/// digits tell two routers' certificates apart.
+fn node_tag(dir: &Path) -> Option<String> {
+    let mut text = String::new();
+    fs::File::open(dir.join("node-id"))
+        .ok()?
+        .take(64)
+        .read_to_string(&mut text)
+        .ok()?;
+    let tag: String = text.trim().chars().take(8).collect();
+    (tag.len() == 8 && tag.chars().all(|c| c.is_ascii_hexdigit())).then(|| tag.to_ascii_lowercase())
+}
+
+/// A new self-signed certificate and its key, as PEM (G1.6zr). Before, the
+/// certificate was rcgen's sample: CN "rcgen self signed cert", valid from
+/// 1975 to 4096. Now:
+///
+/// - CN `CoreRouter <tag>` (the node id's first digits) and O `CoreRouter`:
+///   a browser's warning and certificate list say what it is and which
+///   router;
+/// - SAN `corerouter` (the name the CLI/GUI check against the pinned
+///   certificate), `localhost`, `127.0.0.1`, `::1`. The router's own
+///   addresses and identity stay out: the certificate is pinned on first
+///   use and an address change must not change it (a certificate made
+///   from them on demand is the gap G1.6zs);
+/// - valid from 2025-01-01 (before any CoreRouter, so a client whose clock
+///   is behind still accepts it) to 9999-12-31 23:59:59, RFC 5280
+///   §4.1.2.5's "no well-defined expiration date": a self-signed
+///   certificate that expires locks the operator out (RouterOS'
+///   `days-valid` default is 365);
+/// - a server certificate, not a CA (`basicConstraints` CA:FALSE, key
+///   usage digitalSignature, extended key usage serverAuth).
+pub fn generate_for(tag: Option<&str>) -> Result<(String, String), String> {
+    use rcgen::{DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType};
+    let err = |e: rcgen::Error| format!("certificate: {e}");
+    let mut params =
+        rcgen::CertificateParams::new(vec![SERVER_NAME.to_owned(), "localhost".to_owned()])
+            .map_err(err)?;
+    params.subject_alt_names.extend([
+        SanType::IpAddress(std::net::Ipv4Addr::LOCALHOST.into()),
+        SanType::IpAddress(std::net::Ipv6Addr::LOCALHOST.into()),
+    ]);
+    let cn = match tag {
+        Some(t) => format!("CoreRouter {t}"),
+        None => "CoreRouter".to_owned(),
+    };
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params.distinguished_name.push(DnType::CommonName, cn);
+    params
+        .distinguished_name
+        .push(DnType::OrganizationName, "CoreRouter");
+    params.not_before = rcgen::date_time_ymd(2025, 1, 1);
+    params.not_after = rcgen::date_time_ymd(9999, 12, 31) + Duration::from_secs(86_399);
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let key = KeyPair::generate().map_err(err)?;
+    let cert = params.self_signed(&key).map_err(err)?;
+    Ok((cert.pem(), key.serialize_pem()))
+}
+
+/// Server identity from PEM bytes.
+///
+/// `cert_pem` may hold the chain after the certificate (an imported one,
+/// G1.6zs): all of it is sent, so a client needs nothing else to build the
+/// path (RFC 8446 §4.4.2; RFC 8484 erratum 6708: no fetch during the
+/// handshake). The fingerprint is the certificate's.
+pub fn identity_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<ServerIdentity, String> {
+    let chain = CertificateDer::pem_slice_iter(cert_pem)
+        .take(16)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("certificate: {e}"))?;
+    let cert = chain.first().ok_or("certificate: no CERTIFICATE block")?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| format!("private key: {e}"))?;
+    let fingerprint = fingerprint(cert.as_ref());
+    let config = ServerConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .map_err(|e| format!("certificate/key: {e}"))?;
+    Ok(ServerIdentity {
+        config: Arc::new(config),
+        fingerprint,
+    })
+}
+
+/// Write a private file: a new temporary file created with mode 0600, then
+/// renamed over `path`. Opening `path` itself would keep the mode of a file
+/// already there (a restored 0644 key would stay world-readable).
+fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("pem.tmp");
+    let _ = fs::remove_file(&tmp);
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    {
+        let mut f = opts.open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)
+}
+
+/// An existing private key readable by group or others is tightened to
+/// 0600 (with a warning): the key is the router's identity.
+fn keep_private(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            log::warn!(
+                "{}: private key was readable by others (mode {:o}); set to 0600",
+                path.display(),
+                mode & 0o777
+            );
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Run the server side of the handshake on an accepted connection. The
+/// time limit is the transport's: the control server hands in a
+/// [`crate::conn::Sock`] whose reads stop at the handshake deadline.
+pub fn accept<S: Read + Write>(
+    sock: S,
+    config: Arc<ServerConfig>,
+) -> io::Result<StreamOwned<ServerConnection, S>> {
+    let conn = ServerConnection::new(config).map_err(io::Error::other)?;
+    let mut s = StreamOwned::new(conn, sock);
+    while s.conn.is_handshaking() {
+        s.conn.complete_io(&mut s.sock)?;
+    }
+    Ok(s)
+}
+
+/// Accepts any certificate, remembers its fingerprint, and refuses it when
+/// it is not the `expected` one.
+#[derive(Debug)]
+struct Pinning {
+    expected: Option<String>,
+    seen: Mutex<Option<String>>,
+    algs: WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifier for Pinning {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let fp = fingerprint(end_entity.as_ref());
+        let ok = self.expected.as_ref().is_none_or(|e| *e == fp);
+        *self.seen.lock().unwrap_or_else(PoisonError::into_inner) = Some(fp);
+        if ok {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.algs.supported_schemes()
+    }
+}
+
+/// Why a TLS connection was not made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TlsError {
+    /// The router shows another certificate than the one remembered.
+    Changed {
+        expected: String,
+        seen: String,
+    },
+    Other(String),
+}
+
+impl std::fmt::Display for TlsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Changed { expected, seen } => write!(
+                f,
+                "REFUSED: the router's TLS certificate CHANGED. Remembered {expected}, \
+                 now {seen}. Nothing was sent. The router may have been reinstalled (a new \
+                 certificate), or someone may be intercepting the connection: check the \
+                 fingerprint the router prints at start-up before trusting the new one."
+            ),
+            Self::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+/// Client side of the handshake over `tcp`, pinned to `expected` (or to
+/// whatever the router shows when `None`). Returns the stream and the
+/// fingerprint seen.
+pub fn connect(tcp: TcpStream, expected: Option<&str>) -> Result<(ClientStream, String), TlsError> {
+    let other = |e: &dyn std::fmt::Display| TlsError::Other(format!("TLS: {e}"));
+    let provider = provider();
+    let pin = Arc::new(Pinning {
+        expected: expected.map(str::to_owned),
+        seen: Mutex::new(None),
+        algs: provider.signature_verification_algorithms,
+    });
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| other(&e))?
+        .dangerous()
+        .with_custom_certificate_verifier(pin.clone())
+        .with_no_client_auth();
+    let name = ServerName::try_from(SERVER_NAME).map_err(|e| other(&e))?;
+    let conn = ClientConnection::new(Arc::new(config), name).map_err(|e| other(&e))?;
+    let mut s = StreamOwned::new(conn, tcp);
+    let seen = || {
+        pin.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    };
+    while s.conn.is_handshaking() {
+        if let Err(e) = s.conn.complete_io(&mut s.sock) {
+            return Err(match (expected, seen()) {
+                (Some(want), Some(got)) if want != got => TlsError::Changed {
+                    expected: want.to_owned(),
+                    seen: got,
+                },
+                _ => other(&e),
+            });
+        }
+    }
+    let fp = seen().ok_or_else(|| TlsError::Other("TLS: the router sent no certificate".into()))?;
+    Ok((s, fp))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn echo_server(id: &ServerIdentity) -> std::net::SocketAddr {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let cfg = id.config.clone();
+        thread::spawn(move || {
+            for c in l.incoming() {
+                let cfg = cfg.clone();
+                thread::spawn(move || {
+                    if let Ok(mut s) = accept(c.unwrap(), cfg) {
+                        let mut b = [0u8; 5];
+                        if s.read_exact(&mut b).is_ok() {
+                            let _ = s.write_all(&b);
+                            let _ = s.flush();
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn pinned_handshake_end_to_end() {
+        let (cert, key) = generate().unwrap();
+        let id = identity_from_pem(cert.as_bytes(), key.as_bytes()).unwrap();
+        assert!(id.fingerprint.starts_with("SHA256:") && id.fingerprint.len() == 7 + 95);
+        let addr = echo_server(&id);
+
+        // First time: whatever the router shows, and we learn it.
+        let (mut s, fp) = connect(TcpStream::connect(addr).unwrap(), None).unwrap();
+        assert_eq!(fp, id.fingerprint);
+        s.write_all(b"hello").unwrap();
+        let mut b = [0u8; 5];
+        s.read_exact(&mut b).unwrap();
+        assert_eq!(&b, b"hello");
+
+        // Same certificate: fine.
+        assert!(connect(TcpStream::connect(addr).unwrap(), Some(&fp)).is_ok());
+
+        // Another one: refused, with both fingerprints.
+        let wrong = "SHA256:00".to_owned();
+        match connect(TcpStream::connect(addr).unwrap(), Some(&wrong)) {
+            Err(TlsError::Changed { expected, seen }) => {
+                assert_eq!((expected, seen), (wrong, fp));
+            }
+            other => panic!("expected Changed, got {:?}", other.map(|(_, f)| f)),
+        }
+    }
+
+    fn der(pem: &str) -> Vec<u8> {
+        CertificateDer::from_pem_slice(pem.as_bytes())
+            .unwrap()
+            .as_ref()
+            .to_vec()
+    }
+
+    fn has(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// G1.6zr: the notebook's www-ssl and API showed rcgen's sample
+    /// certificate (CN "rcgen self signed cert", 1975–4096).
+    #[test]
+    fn the_certificate_says_whose_it_is_and_never_expires() {
+        let dir = std::env::temp_dir().join(format!("cr-tls-cn-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("node-id"), "3FA2B1C9d0e1f2a3b4c5d6e7f8091a2b\n").unwrap();
+        load_or_create(&dir).unwrap();
+        let cert = der(&fs::read_to_string(dir.join(CERT_FILE)).unwrap());
+        assert!(!has(&cert, b"rcgen self signed cert"));
+        assert!(has(&cert, b"CoreRouter 3fa2b1c9"), "CN from the node id");
+        // RFC 5280 §4.1.2.5: UTCTime up to 2049, then GeneralizedTime;
+        // 99991231235959Z is "no well-defined expiration date".
+        assert!(has(&cert, b"250101000000Z"), "not before 2025-01-01");
+        assert!(has(&cert, b"99991231235959Z"), "never expires");
+        assert!(has(&cert, b"corerouter") && has(&cert, b"localhost"));
+        assert!(has(&cert, &[127, 0, 0, 1]), "SAN 127.0.0.1");
+        let _ = fs::remove_dir_all(&dir);
+        // Without a node id: "CoreRouter", and the pinned handshake works
+        // with it (`pinned_handshake_end_to_end`).
+        let (plain, _) = generate().unwrap();
+        assert!(has(&der(&plain), b"CoreRouter"));
+    }
+
+    #[test]
+    fn files_are_created_once_and_key_is_private() {
+        let dir = std::env::temp_dir().join(format!("cr-tls-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (a, created) = load_or_create(&dir).unwrap();
+        assert!(created);
+        let (b, created) = load_or_create(&dir).unwrap();
+        assert!(!created);
+        assert_eq!(a.fingerprint, b.fingerprint);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.join(KEY_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        fs::write(dir.join(CERT_FILE), "junk").unwrap();
+        assert!(load_or_create(&dir).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A key restored with mode 0644 never stays world-readable: neither
+    /// when the certificate is missing (both are made again) nor when both
+    /// are there (it is tightened on load).
+    #[cfg(unix)]
+    #[test]
+    fn a_world_readable_key_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cr-tls-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let key = dir.join(KEY_FILE);
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        fs::write(&key, "old").unwrap();
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+        let (_, created) = load_or_create(&dir).unwrap();
+        assert!(created);
+        assert_eq!(mode(&key), 0o600);
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+        let (_, created) = load_or_create(&dir).unwrap();
+        assert!(!created);
+        assert_eq!(mode(&key), 0o600);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

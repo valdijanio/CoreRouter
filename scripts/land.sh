@@ -1,0 +1,675 @@
+#!/usr/bin/env bash
+# Fila de entrada: integra PRs prontos na `main` (AGENTS.md, "Integração").
+#
+# Uso: scripts/land.sh [--watch | --batch] [--fold] [<pr>...]
+#
+# --watch: fila contínua — pega sozinha os PRs com o rótulo `fila` e roda os lotes abaixo, com um
+#   lote especulativo montado em cima do que está no CI (veja `watch`).
+#
+# --batch (o normal): um CI para a combinação, não um por PR.
+#   1. junta numa branch temporária (`queue/batch-<hora>`) a `main` e os PRs, em ordem; um PR que
+#      conflita de verdade fica de fora (a sessão dona resolve); conflito só nos documentos do
+#      fold é resolvido sozinho;
+#   2. faz o fold nessa combinação (confere os docs/changes) e roda o CI completo
+#      (`workflow_dispatch`): é o que a `main` vai ser, então "sozinho passa, junto quebra"
+#      aparece aqui;
+#   3. verde: squash de cada PR em ordem (os checks rápidos do próprio PR precisam estar verdes);
+#   4. vermelho: bisseção — divide ao meio e repete em cada metade, a da direita sobre a `main`
+#      que já recebeu a da esquerda, até isolar quem quebra (~log2 N CIs); quem quebra fica de fora.
+#   Medido: lote de 1 a 4 PRs em 220–348 s, contra ~2,5–4 min por PR no um por um.
+#
+# Fold (consolidar docs/changes em log, gaps, histórico e perf): periódico, como no
+# towncrier/changesets, que só consolidam no release. Só com --fold (sozinho ou junto) ou quando
+# houver FOLD_MIN (10) arquivos pendentes; até lá, `cargo xtask docs pending` mostra os status de
+# gap ainda não consolidados.
+#
+# Sem --batch, um por um: merge da `main` na branch do PR, fold, push, CI completo disparado no
+# commit que vai entrar, squash; para no primeiro problema.
+#
+# Runner do lote: os jobs pesados (test, bench-check, netns) vão para o runner próprio
+# (`corerouter`, docs/ci-runner.md) quando o GitHub o mostra online, senão para os do GitHub; lote
+# com PR de fork vai sempre para os do GitHub. Ociosa, a fila contínua volta a VM do runner ao
+# snapshot a cada CI_RUNNER_RESET_JOBS jobs (`cargo xtask ci-runner reset --if-due`).
+#
+# Ambiente: BASE (padrão main); LAND_DIR (padrão <repo>/target-land: worktrees e o target do
+# xtask, fora do git); FOLD_MIN (padrão 10); LAND_CI_RUNNER (auto, github ou corerouter);
+# CI_RUNNER_RESET_JOBS (padrão 40).
+set -euo pipefail
+
+batch=0 fold=0 watch=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --batch) batch=1 ;;
+    --watch) watch=1 ;;
+    --fold) fold=1 ;;
+    *) break ;;
+  esac
+  shift
+done
+[ $# -ge 1 ] || [ "$fold" = 1 ] || [ "$watch" = 1 ] ||
+  { echo "uso: scripts/land.sh [--watch | --batch] [--fold] [<pr>...]" >&2; exit 2; }
+
+root=$(git rev-parse --show-toplevel)
+base=${BASE:-main}
+dir=${LAND_DIR:-$root/target-land}
+repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+export CARGO_TARGET_DIR="$dir/target"
+mkdir -p "$dir"
+
+say() { printf '%s\n' "$*"; }
+stop() { say "PARADO em #$1: $2"; exit 1; }
+
+# `git fetch origin <refs>` com nova tentativa. As worktrees das sessões dividem os refs deste
+# repositório: quando outra sessão faz fetch no mesmo instante, um dos dois perde a trava do
+# ref ("cannot lock ref 'refs/remotes/origin/main': is at X but expected Y") e sai com erro,
+# embora o ref já esteja atualizado. Sem repetir, o checkout principal ficava para trás e, nos
+# fetches fora de um `if`, a fila morria (`set -e`). Medido: 199 de 200 pares de fetch
+# simultâneos falham um dos dois; com a repetição, 0 de 200.
+fetch() {
+  local try
+  for try in 1 2 3; do
+    git -C "$root" fetch --quiet origin "$@" 2>/dev/null && return 0
+    sleep "$try"
+  done
+  git -C "$root" fetch --quiet origin "$@"
+}
+
+# Os checks exigidos pela proteção da main (nomes).
+required=$(gh api "repos/$repo/branches/$base/protection/required_status_checks" \
+  --jq '.checks[].context' 2>/dev/null || true)
+n_required=$(printf '%s\n' "$required" | grep -c . || true)
+
+# Espera os checks exigidos aparecerem e terminarem no commit `sha`. 0: verdes; 1: algum falhou
+# (nomes em $failed); 2: não terminou em 30 min.
+failed=""
+# O CI do commit `sha`, uma consulta: 0 verde; 1 vermelho; 3 ainda rodando (ou nenhum run ainda).
+# Todo run do `ci` nesse commit conta (o portão rápido do PR e o completo que a fila dispara).
+check_once() {
+  local sha=$1 runs
+  failed=""
+  # Fonte: os runs do workflow `ci` desse commit (Actions), não os check-runs: o GitHub já deixou
+  # um check-run "in_progress" para sempre num job que tinha terminado verde (2026-10-22, lote
+  # do #94), e a fila ficou esperando. Todos os runs do commit têm de terminar; um vermelho
+  # reprova.
+  runs=$(gh api "repos/$repo/actions/runs?head_sha=$sha&per_page=30" \
+    --jq '.workflow_runs[] | select(.name == "ci") | "\(.status) \(.conclusion)"') || return 3
+  [ -n "$runs" ] || return 3
+  if printf '%s\n' "$runs" | grep -qv '^completed '; then
+    return 3
+  fi
+  if printf '%s\n' "$runs" | grep -qE ' (failure|timed_out|startup_failure|action_required)$'; then
+    failed=" ci"
+    return 1
+  fi
+  # Um run cancelado sem outro verde no mesmo commit: o GitHub cancela o CI de um commit quando
+  # chega um push novo na branch. Esse commit não vai mais ficar verde; esperar 30 min por ele
+  # travou o lote do #144 (2026-10-23). Sai logo; o PR volta com o head novo na próxima rodada.
+  if printf '%s\n' "$runs" | grep -q ' cancelled$' && ! printf '%s\n' "$runs" | grep -q ' success$'; then
+    failed=" cancelado: a branch recebeu um push novo"
+    return 1
+  fi
+  printf '%s\n' "$runs" | grep -q ' success$' || return 3
+  return 0
+}
+
+wait_checks() {
+  local sha=$1 r
+  for _ in $(seq 1 180); do
+    r=0
+    check_once "$sha" || r=$?
+    [ "$r" = 3 ] || return "$r"
+    sleep 10
+  done
+  return 2
+}
+
+# Testes instáveis (falharam e passaram ao repetir) no CI completo do commit `sha`: o nextest
+# marca FLAKY e o passo netns avisa "flaky netns test"; nenhum dos dois reprova. Vão para o log do
+# lote, para a sessão principal corrigir antes que um deles falhe duas vezes e cause uma bisseção.
+report_flaky() {
+  local sha=$1 id lines
+  for id in $(gh api "repos/$repo/actions/runs?head_sha=$sha&event=workflow_dispatch&per_page=10" \
+    --jq '.workflow_runs[] | select(.name == "ci" and .status == "completed") | .id' 2>/dev/null); do
+    lines=$(gh run view "$id" -R "$repo" --log 2>/dev/null |
+      sed 's/\x1b\[[0-9;]*m//g' |
+      grep -oE '(FLAKY .*|flaky netns test .*)$' | sort -u) || true
+    [ -n "$lines" ] || continue
+    printf '%s\n' "$lines" | while IFS= read -r l; do say "  instável (run $id): $l"; done
+  done
+}
+
+checks_or_stop() {
+  local n=$1 sha=$2 r=0
+  wait_checks "$sha" || r=$?
+  case $r in
+    0) ;;
+    1) stop "$n" "CI vermelho em${failed} (gh run view --log-failed)" ;;
+    *) stop "$n" "o CI não terminou em 30 min" ;;
+  esac
+}
+
+# Documentos que só o fold escreve. Um conflito neles não é de verdade: vem de uma branch que
+# guardou um fold de uma rodada anterior da fila (que parou no meio). Log, histórico, perf e
+# ideias só recebem acréscimos: ficam as entradas dos dois lados. No gaps.md, uma linha de gap
+# que mudou dos dois lados fica uma só (a do PR, a mais nova).
+FOLD_DOCS="docs/log.md docs/gaps-history.md docs/perf.md docs/ideias.md docs/gaps.md"
+
+# `git merge` de $1 (mensagem $2) que resolve sozinho os conflitos só em FOLD_DOCS. 0: limpo ou
+# resolvido; 1: conflito de verdade (merge abortado; arquivos em $conflicts).
+conflicts=""
+# Heads de PRs já integrados que são ancestrais de $1: os "pais" de um PR empilhado.
+# Qualquer commit do pai serve, não só o último: a fila manda merges da main na branch do pai antes
+# do squash, e esse último commit não está na branch do filho (#177, #186 em 2026-10-23). Por PR
+# integrado, o commit mais novo dele que está na história do filho.
+merged_parents() {
+  local n s
+  gh pr list -R "$repo" --state merged --limit 40 --json number --jq '.[].number' 2>/dev/null |
+    while read -r n; do
+      gh api "repos/$repo/pulls/$n/commits?per_page=100" --jq '.[].sha' 2>/dev/null |
+        tac | while read -r s; do
+          if git merge-base --is-ancestor "$s" "$1" 2>/dev/null; then
+            printf '%s\n' "$s"
+            break
+          fi
+        done
+    done
+  return 0
+}
+
+# O lado da main tem em $1 exatamente o que um pai ($2…) tinha: o conflito é o squash desse pai.
+from_parent() {
+  local f=$1 main_side=$2 m p
+  shift 2
+  m=$(git rev-parse -q --verify "$main_side:$f" 2>/dev/null || true)
+  for p in "$@"; do
+    [ "$m" = "$(git rev-parse -q --verify "$p:$f" 2>/dev/null || true)" ] && return 0
+  done
+  return 1
+}
+
+# Merge que resolve sozinho dois conflitos que não são de verdade:
+# - nos documentos do fold (union das entradas);
+# - de **PR empilhado**: a branch saiu da branch de outro PR que entrou por squash, então traz os
+#   commits originais do pai e a main traz o squash dele. Se, em cada arquivo em conflito, a main
+#   tem exatamente o que o pai tinha, o lado certo é o do PR (pai + o que ele mudou). Foi o que as
+#   sessões fizeram à mão em #112, G4.2b/c, #146 e #147 (2026-10-22/23).
+# Qualquer outro arquivo em conflito: aborta (a sessão dona resolve). $3 = pr-is-ours quando o PR
+# é o HEAD (a main entra na branch do PR); sem ele, o PR é quem entra (lote).
+merge_fold_aware() {
+  local f pr_side main_side parents stacked=""
+  conflicts=""
+  git merge --quiet --no-edit "$1" -m "$2" >/dev/null 2>&1 && return 0
+  conflicts=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+  if [ "${3:-}" = pr-is-ours ]; then
+    pr_side=HEAD main_side=MERGE_HEAD
+  else
+    pr_side=MERGE_HEAD main_side=HEAD
+  fi
+  parents=""
+  for f in $conflicts; do
+    case " $FOLD_DOCS " in
+      *" $f "*) continue ;;
+    esac
+    if [ -z "$parents" ]; then
+      parents=$(merged_parents "$(git rev-parse "$pr_side")" | tr '\n' ' ')
+      [ -n "$parents" ] || parents=none
+    fi
+    # shellcheck disable=SC2086 # a lista de shas, um por palavra
+    if [ "$parents" != none ] && from_parent "$f" "$main_side" $parents; then
+      stacked="$stacked$f "
+      continue
+    fi
+    git merge --abort
+    return 1
+  done
+  for f in $stacked; do
+    if git cat-file -e "$pr_side:$f" 2>/dev/null; then
+      git show "$pr_side:$f" > "$f"
+      git add "$f"
+    else
+      git rm --quiet "$f"
+    fi
+  done
+  [ -z "$stacked" ] || say "  PR empilhado: conflito do squash do pai resolvido com o lado do PR ($stacked)"
+  for f in $conflicts; do
+    case " $stacked " in
+      *" $f "*) continue ;;
+    esac
+    git show ":1:$f" > "$f.base" 2>/dev/null || : > "$f.base"
+    git show ":2:$f" > "$f.ours"
+    git show ":3:$f" > "$f.theirs"
+    git merge-file -p --union "$f.ours" "$f.base" "$f.theirs" > "$f"
+    rm -f "$f.base" "$f.ours" "$f.theirs"
+    if [ "$f" = docs/gaps.md ]; then
+      # A mesma gap duas vezes: fica a última (o lado do PR vem depois no union).
+      awk -F' [|] ' '/^\| G[0-9]/ { id = $1; last[id] = NR } { line[NR] = $0; ids[NR] = (/^\| G[0-9]/ ? $1 : "") }
+        END { for (i = 1; i <= NR; i++) if (ids[i] == "" || last[ids[i]] == i) print line[i] }' "$f" > "$f.tmp"
+      mv "$f.tmp" "$f"
+    fi
+    git add "$f"
+  done
+  git commit --quiet --no-edit
+  [ "$stacked" = "$conflicts" ] ||
+    say "  conflito nos documentos do fold ($conflicts): resolvido, entradas dos dois lados"
+  return 0
+}
+
+# Um PR que o GitHub marca em conflito com a main não entraria no squash, mesmo que o lote o
+# resolva: se o conflito é só nos documentos do fold, a main entra na própria branch (push) antes.
+# Devolve o head novo em $head; 1 se o conflito é de verdade.
+refresh_if_conflicting() {
+  local n=$1 branch=$2 m="" w
+  for _ in 1 2 3 4 5 6; do
+    m=$(gh pr view "$n" --json mergeable --jq .mergeable)
+    [ "$m" != UNKNOWN ] && break
+    sleep 5
+  done
+  [ "$m" = CONFLICTING ] || return 0
+  w="$dir/refresh-$n"
+  git -C "$root" worktree remove --force "$w" 2>/dev/null || true
+  git -C "$root" worktree add --quiet --detach "$w" "origin/$branch"
+  if (cd "$w" && merge_fold_aware "origin/$base" "Merge origin/$base em $branch (fila de entrada)" pr-is-ours &&
+    git push --quiet origin "HEAD:refs/heads/$branch"); then
+    head=$(git -C "$w" rev-parse HEAD)
+    git -C "$root" worktree remove --force "$w"
+    return 0
+  fi
+  git -C "$root" worktree remove --force "$w"
+  return 1
+}
+
+# Squash com o título do PR: sem isso o GitHub usa a mensagem do primeiro commit quando a branch
+# tem um só autor de commits ("wip hotspots (#79)" foi parar na main).
+squash() {
+  local n=$1 sha=$2 title
+  title=$(gh pr view "$n" --json title --jq .title)
+  gh pr merge -R "$repo" "$n" --squash --subject "$title (#$n)" --match-head-commit "$sha"
+}
+
+# Runner dos jobs pesados do lote (docs/ci-runner.md): `corerouter` quando o GitHub mostra algum
+# runner com esse rótulo online; senão `github`, para a fila nunca esperar um runner fora do ar
+# (um job em `self-hosted` sem runner fica na fila do Actions por até 24 h). LAND_CI_RUNNER força.
+ci_runner() {
+  local online
+  case "${LAND_CI_RUNNER:-auto}" in
+    github | corerouter) printf '%s\n' "$LAND_CI_RUNNER"; return ;;
+  esac
+  online=$(gh api "repos/$repo/actions/runners" --jq \
+    '[.runners[] | select(.status == "online" and any(.labels[]; .name == "corerouter"))] | length' \
+    2>/dev/null || echo 0)
+  if [ "${online:-0}" -gt 0 ] 2>/dev/null; then echo corerouter; else echo github; fi
+}
+
+# Ociosa: a VM do runner volta ao snapshot `registered` depois de CI_RUNNER_RESET_JOBS jobs
+# (no máximo uma consulta a cada 10 min; não mexe se um job estiver rodando nem se a VM não
+# existir). Falha aqui só avisa: a fila segue, no máximo nos runners do GitHub.
+RUNNER_CHECKED=0
+ci_runner_maintenance() {
+  local now
+  now=$(date +%s)
+  [ $((now - RUNNER_CHECKED)) -ge 600 ] || return 0
+  RUNNER_CHECKED=$now
+  virsh -c qemu:///system domstate corerouter-ci >/dev/null 2>&1 || return 0
+  (cd "$root" && cargo xtask ci-runner reset --if-due "${CI_RUNNER_RESET_JOBS:-40}" 2>&1 |
+    sed 's/^/  /') || say "  aviso: ci-runner reset --if-due falhou (docs/ci-runner.md)"
+}
+
+pr_info() {
+  gh pr view "$1" --json state,isCrossRepository,headRefName,headRefOid \
+    --jq '"\(.state) \(.isCrossRepository) \(.headRefName) \(.headRefOid)"'
+}
+
+# Head de cada PR do lote (pode mudar: refresh_if_conflicting).
+declare -A HEADS=()
+members=()
+
+# Monta a combinação `main` + PRs (os que entram limpos ficam em $members), faz o fold nela e roda o
+# CI completo uma vez. 0: verde; 1: vermelho; 2: ninguém entrou na combinação.
+# Monta numa worktree ($2) a combinação de `$1` (a main, ou a branch de um lote em andamento) com
+# os PRs, faz o fold, envia a branch `queue/batch-<hora>` e dispara o CI completo nela. Deixa em
+# $members os que entraram limpos, em $combo_sha/$combo_branch o resultado. 0: disparado; 2:
+# ninguém entrou; 1: docs/changes inválido. Quem fica de fora vai para SKIP (até a branch mudar).
+declare -A SKIP=()
+combo_sha="" combo_branch=""
+build_combo() {
+  local from=$1 name=$2 n state cross branch head wt runner fork=0
+  shift 2
+  members=()
+  fetch "$base"
+  case "$from" in origin/queue/*) fetch "${from#origin/}" ;; esac
+  wt="$dir/$name"
+  git -C "$root" worktree remove --force "$wt" 2>/dev/null || true
+  git -C "$root" worktree add --quiet --detach "$wt" "$from"
+  cd "$wt"
+  for n in "$@"; do
+    read -r state cross branch head < <(pr_info "$n")
+    if [ "$state" != OPEN ]; then
+      say "  #$n fora: o PR está $state"
+      continue
+    fi
+    if ! refresh_if_conflicting "$n" "$branch"; then
+      say "  #$n fora: conflito com a $base — a sessão dona resolve"
+      SKIP[$n]=$head
+      continue
+    fi
+    fetch "$branch"
+    if [ "$(git rev-parse "origin/$branch")" != "$head" ]; then
+      say "  #$n fora: a branch andou durante a fila"
+      continue
+    fi
+    if merge_fold_aware "origin/$branch" "lote: #$n"; then
+      members+=("$n")
+      HEADS[$n]=$head
+      if [ "$cross" = true ]; then fork=1; fi
+    else
+      # Sem SKIP: o conflito é com outro PR do lote (ou do lote especulativo), não com a main;
+      # quando aquele entra, este pode mesclar limpo. Marcar fazia a fila ignorá-lo até a branch
+      # mudar (o #144 ficou parado assim, 2026-10-23). Ele volta na próxima rodada.
+      say "  #$n fica para a próxima rodada: conflito com o lote em $conflicts"
+    fi
+  done
+  if [ ${#members[@]} = 0 ]; then
+    cd "$root"
+    return 2
+  fi
+  if ! cargo xtask docs fold >/dev/null; then
+    cd "$root"
+    say "  docs/changes inválido na combinação (cargo xtask docs)"
+    return 1
+  fi
+  git add -A docs
+  git commit --quiet -m "lote: consolida docs/changes" || true
+  combo_sha=$(git rev-parse HEAD)
+  combo_branch="queue/batch-$(date +%s%N | cut -c1-13)"
+  git push --quiet origin "HEAD:refs/heads/$combo_branch"
+  # Código de fork nunca vai para o runner próprio (o repositório é público): docs/ci-runner.md.
+  runner=$(ci_runner)
+  if [ "$fork" = 1 ]; then runner=github; fi
+  gh workflow run ci.yml --ref "$combo_branch" -f runner="$runner" >/dev/null
+  say "== lote ${members[*]}: CI da combinação ($(git rev-parse --short HEAD), sobre ${from#origin/}, runner $runner)"
+  cd "$root"
+  return 0
+}
+
+drop_branch() {
+  [ -n "$1" ] && git push --quiet origin --delete "$1" 2>/dev/null || true
+}
+
+# Monta a combinação `main` + PRs e espera o CI. 0: verde; 1: vermelho; 2: ninguém entrou.
+test_combo() {
+  local r=0
+  build_combo "origin/$base" batch "$@" || return $?
+  wait_checks "$combo_sha" || r=$?
+  report_flaky "$combo_sha"
+  drop_branch "$combo_branch"
+  return $r
+}
+
+# Depois de PRs entrarem: o checkout principal (o de onde a fila roda) vai para a main nova e os
+# binários são recompilados, para quem testa nunca rodar um build velho. Só se o checkout estiver
+# na main e sem alterações (senão avisa e não mexe); LAND_REBUILD=0 desliga. O daemon que estiver
+# rodando não é reiniciado (pode estar no meio de um teste): a GUI avisa quando o commit dele
+# difere do dela.
+refresh_checkout() {
+  local head
+  [ "${LAND_REBUILD:-1}" = 1 ] || return 0
+  head=$(git -C "$root" symbolic-ref --quiet --short HEAD || true)
+  if [ "$head" != "$base" ]; then
+    say "  checkout em '${head:-detached}': não recompila"
+    return 0
+  fi
+  if [ -n "$(git -C "$root" status --porcelain --untracked-files=no)" ]; then
+    say "  checkout com alterações: não recompila"
+    return 0
+  fi
+  if ! { fetch "$base" && git -C "$root" merge --quiet --ff-only "origin/$base"; }; then
+    say "  checkout não avançou para a $base (ff): não recompila"
+    return 0
+  fi
+  if (cd "$root" && env -u CARGO_TARGET_DIR cargo build -q -p corerouter-daemon -p corerouter-gui -p corerouter-cli); then
+    say "  checkout em $(git -C "$root" rev-parse --short HEAD), binários recompilados (reinicie o daemon para usar)"
+  else
+    say "  aviso: o build do checkout falhou"
+  fi
+}
+
+# Algum PR entrou desde o último fold (a fila contínua consolida quando fica ociosa).
+MERGED_ANY=0
+
+# Squash de cada PR de $members (os checks rápidos do próprio PR têm de estar verdes).
+merge_members() {
+  local n r merged=0
+  for n in "${members[@]}"; do
+    r=0
+    wait_checks "${HEADS[$n]}" || r=$?
+    if [ $r != 0 ]; then
+      say "  #$n fora: o CI do próprio PR está vermelho (${failed:-tempo})"
+      continue
+    fi
+    if squash "$n" "${HEADS[$n]}"; then
+      say "  #$n entrou"
+      merged=1
+    else
+      say "  #$n fora: o merge foi recusado (a branch mudou?)"
+    fi
+  done
+  [ "$merged" = 0 ] || { MERGED_ANY=1; refresh_checkout; }
+}
+
+# Integra os PRs: testa a combinação; verde, entram todos; vermelho, divide ao meio e repete em
+# cada metade (bisseção: ~log2 N CIs para achar o culpado, em vez de N no um por um). A metade da
+# direita é testada sobre a main que já recebeu a da esquerda.
+land_set() {
+  local r=0 half
+  [ $# -gt 0 ] || return 0
+  test_combo "$@" || r=$?
+  case $r in
+    0) merge_members; return 0 ;;
+    2) return 0 ;;
+  esac
+  local set=("${members[@]}")
+  if [ ${#set[@]} = 1 ]; then
+    say "  #${set[0]} fora: quebra o CI (${failed:-tempo}) — a sessão dona corrige na branch"
+    # Fora até a branch mudar: sem isso a fila contínua o testava de novo a cada ciclo.
+    SKIP[${set[0]}]=${HEADS[${set[0]}]:-}
+    return 0
+  fi
+  say "  vermelho (${failed:-tempo}): dividindo ${set[*]}"
+  half=$(( ${#set[@]} / 2 ))
+  land_set "${set[@]:0:$half}"
+  land_set "${set[@]:$half}"
+}
+
+# Fold dos docs/changes pendentes num PR próprio (a main é protegida). Periódico, como no
+# towncrier/changesets (que só consolidam no release): só com --fold ou com FOLD_MIN arquivos
+# pendentes; até lá `cargo xtask docs pending` mostra os status ainda não consolidados.
+FOLD_MIN=${FOLD_MIN:-10}
+maybe_fold() {
+  local wt pending fb fpr
+  fetch "$base"
+  # Só os arquivos de mudança contam: as pastas `<id>-screenshots` ficam em docs/changes depois
+  # do fold, e contá-las (37 em 2026-11-11) fazia um PR de fold a cada lote.
+  pending=$(git -C "$root" ls-tree --name-only "origin/$base" docs/changes/ |
+    grep '\.md$' | grep -vc '/README\.md$' || true)
+  if [ "$fold" != 1 ] && [ "$pending" -lt "$FOLD_MIN" ]; then
+    [ "$pending" -gt 0 ] && say "fold adiado: $pending arquivo(s) em docs/changes (consolida com $FOLD_MIN ou --fold)"
+    return 0
+  fi
+  [ "$pending" -gt 0 ] || return 0
+  wt="$dir/fold"
+  git -C "$root" worktree remove --force "$wt" 2>/dev/null || true
+  git -C "$root" worktree add --quiet --detach "$wt" "origin/$base"
+  cd "$wt"
+  # A linha "saldo: …" (G0.34) vai no corpo do PR do fold: gaps fechadas × criadas no período.
+  saldo=$(cargo xtask docs fold 2>&1 >/dev/null | grep '^saldo:') || stop fold "fold falhou na main"
+  fb="queue/fold-$(date +%s)"
+  git add -A docs
+  git commit --quiet -m "docs: consolida docs/changes ($pending arquivos)"
+  git push --quiet origin "HEAD:refs/heads/$fb"
+  fpr=$(gh pr create --base "$base" --head "$fb" \
+    --title "docs: consolida docs/changes ($pending arquivos)" \
+    --body "Fold da fila de entrada (scripts/land.sh). $saldo" | grep -o '[0-9]*$')
+  checks_or_stop "$fpr" "$(git rev-parse HEAD)"
+  # Sem --delete-branch: o GitHub já apaga a branch no merge, e o 404 de apagar de novo fazia o
+  # gh sair com erro depois de um merge que deu certo (a fila parou assim em #120).
+  if ! gh pr merge -R "$repo" "$fpr" --squash --match-head-commit "$(git rev-parse HEAD)" &&
+    [ "$(gh pr view -R "$repo" "$fpr" --json state --jq .state)" != MERGED ]; then
+    stop "$fpr" "o merge do fold foi recusado"
+  fi
+  git push --quiet origin --delete "$fb" 2>/dev/null || true
+  say "  fold #$fpr entrou ($pending arquivos; $saldo)"
+  cd "$root"
+  git worktree remove --force "$wt"
+}
+
+# PRs prontos: abertos, para a main, não rascunho, com o rótulo `fila`, fora dos que ficaram de
+# fora (SKIP) enquanto a branch deles não mudar.
+ready_prs() {
+  local n head
+  gh pr list --base "$base" --state open --label fila --limit 100 \
+    --json number,isDraft,headRefOid --jq '.[] | select(.isDraft | not) | "\(.number) \(.headRefOid)"' |
+    while read -r n head; do
+      [ "${SKIP[$n]:-}" = "$head" ] || printf '%s\n' "$n"
+    done
+}
+
+# --watch: fila contínua. A cada WATCH_TICK segundos pega os PRs prontos (rótulo `fila`):
+# - sem lote em andamento: monta um com todos e dispara o CI da combinação;
+# - com lote em andamento: os PRs novos entram num lote especulativo montado **em cima dele**, com
+#   o próprio CI, rodando ao mesmo tempo;
+# - lote verde: squash dos PRs; o especulativo (se houver) vira o lote em andamento, já com o CI
+#   adiantado — testou exatamente main + lote + PRs novos;
+# - lote vermelho: o especulativo é descartado e o lote passa pela bisseção (land_set).
+# Para depois de WATCH_IDLE segundos sem nada para fazer.
+watch() {
+  local tick=${WATCH_TICK:-20} max_idle=${WATCH_IDLE:-1800} idle=0 r n
+  local run=() run_sha="" run_branch="" spec=() spec_sha="" spec_branch="" ready=() new=()
+  gh label create fila --color 0E8A16 --description "Pronto para a fila de entrada" 2>/dev/null || true
+  say "fila contínua: rótulo 'fila', a cada ${tick}s"
+  while :; do
+    # Sempre da raiz: um passo anterior pode ter saído de dentro de uma worktree já removida.
+    cd "$root"
+    mapfile -t ready < <(ready_prs)
+    if [ -z "$run_sha" ] && [ ${#ready[@]} -gt 0 ]; then
+      if build_combo "origin/$base" batch "${ready[@]}"; then
+        run=("${members[@]}") run_sha=$combo_sha run_branch=$combo_branch
+      fi
+    elif [ -n "$run_sha" ] && [ -z "$spec_sha" ]; then
+      new=()
+      for n in "${ready[@]}"; do
+        case " ${run[*]} " in *" $n "*) ;; *) new+=("$n") ;; esac
+      done
+      if [ ${#new[@]} -gt 0 ] && build_combo "origin/$run_branch" spec "${new[@]}"; then
+        spec=("${members[@]}") spec_sha=$combo_sha spec_branch=$combo_branch
+        say "   (especulativo, sobre o lote ${run[*]})"
+      fi
+    fi
+    if [ -n "$run_sha" ]; then
+      r=0
+      check_once "$run_sha" || r=$?
+      [ "$r" = 3 ] || report_flaky "$run_sha"
+      case $r in
+        0)
+          members=("${run[@]}")
+          merge_members
+          drop_branch "$run_branch"
+          run=() run_sha="" run_branch=""
+          if [ -n "$spec_sha" ]; then
+            run=("${spec[@]}") run_sha=$spec_sha run_branch=$spec_branch
+            spec=() spec_sha="" spec_branch=""
+            say "   o especulativo ${run[*]} vira o lote em andamento"
+          fi
+          ;;
+        1)
+          say "  lote ${run[*]} vermelho (${failed}): especulativo descartado, bisseção"
+          drop_branch "$run_branch"
+          drop_branch "$spec_branch"
+          local again=("${run[@]}")
+          run=() run_sha="" run_branch="" spec=() spec_sha="" spec_branch=""
+          land_set "${again[@]}"
+          ;;
+      esac
+    fi
+    if [ -z "$run_sha" ] && [ ${#ready[@]} = 0 ]; then
+      # Ociosa depois de integrar: consolida os docs/changes se passaram de FOLD_MIN (o fold
+      # periódico; antes só rodava quando a fila contínua terminava).
+      if [ "$MERGED_ANY" = 1 ]; then
+        MERGED_ANY=0
+        maybe_fold
+      fi
+      ci_runner_maintenance
+      idle=$((idle + tick))
+      if [ "$idle" -ge "$max_idle" ]; then
+        say "fila contínua: ${max_idle}s sem PR pronto, encerrando"
+        break
+      fi
+    else
+      idle=0
+    fi
+    sleep "$tick"
+  done
+}
+
+serial=("$@")
+if [ "$watch" = 1 ]; then
+  watch
+  serial=()
+elif [ "$batch" = 1 ]; then
+  land_set "$@"
+  serial=()
+fi
+
+for n in "${serial[@]}"; do
+  read -r state cross branch < <(gh pr view "$n" \
+    --json state,isCrossRepository,headRefName --jq '"\(.state) \(.isCrossRepository) \(.headRefName)"')
+  [ "$state" = OPEN ] || stop "$n" "o PR está $state"
+  [ "$cross" = false ] || stop "$n" "PR de fork: integre à mão"
+  say "== #$n ($branch)"
+
+  fetch "$base" "$branch"
+  wt="$dir/pr-$n"
+  git -C "$root" worktree remove --force "$wt" 2>/dev/null || true
+  git -C "$root" worktree add --quiet --detach "$wt" "origin/$branch"
+  cd "$wt"
+
+  if ! merge_fold_aware "origin/$base" "Merge origin/$base em $branch (fila de entrada)" pr-is-ours; then
+    stop "$n" "conflito real com a $base em: $conflicts— a sessão dona resolve na branch"
+  fi
+
+  cargo xtask docs fold >/dev/null || stop "$n" "docs/changes inválido (cargo xtask docs)"
+  if [ -n "$(git status --porcelain)" ]; then
+    git add -A docs
+    git commit --quiet -m "docs: consolida docs/changes (#$n)"
+  fi
+
+  sha=$(git rev-parse HEAD)
+  if [ "$sha" != "$(git rev-parse "origin/$branch")" ]; then
+    say "  push $(git rev-parse --short HEAD)"
+    git push --quiet origin "HEAD:refs/heads/$branch" || stop "$n" "push recusado (a branch andou?)"
+  fi
+
+  # O CI do PR é o portão rápido; o completo (testes contra o kernel) roda aqui, no commit que
+  # vai entrar.
+  gh workflow run ci.yml --ref "$branch" >/dev/null
+  # Espera o run disparado aparecer, senão o portão rápido (já verde) passaria por ele.
+  for _ in $(seq 1 30); do
+    gh run list --workflow ci.yml --branch "$branch" --event workflow_dispatch --commit "$sha" \
+      --json databaseId --jq 'length' | grep -qv '^0$' && break
+    sleep 4
+  done
+  if [ "$n_required" -gt 0 ]; then
+    say "  esperando os $n_required checks exigidos (rápido do PR + completo)"
+    checks_or_stop "$n" "$sha"
+  fi
+
+  squash "$n" "$sha" || stop "$n" "o merge foi recusado"
+  say "  #$n entrou"
+  refresh_checkout
+
+  cd "$root"
+  git worktree remove --force "$wt"
+done
+
+maybe_fold
+fetch "$base"
+say "fila concluída: $*"

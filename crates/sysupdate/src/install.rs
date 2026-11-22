@@ -1,0 +1,1522 @@
+//! Installing the image on an empty disk (G1.6c, `docs/os-image.md`): what
+//! the installer (`corerouter-init` booted from the ISO) writes, kept here
+//! so it runs on plain files in the tests.
+//!
+//! The ISO carries `INSTALL.JSON` (this module's [`Index`]: the disk
+//! layout, read from the build's `disk.img`, and the payload files with
+//! their sizes and SHA-256), its detached Ed25519 signature `INSTALL.SIG`
+//! (the image key, the same that signs update packages) and the payload:
+//! the update package (`COREROUTER.CRPKG`, whose rootfs is slot A), the ESP
+//! and the empty `/config` filesystem. [`install`]:
+//!
+//! 1. checks the index signature and the package header signature, and
+//!    that the target is large enough (nothing is written before);
+//! 2. clears the first and last MiB (old partition tables, RAID/LVM
+//!    labels): from here the disk has no partition table;
+//! 3. streams each partition from the medium (read and hash on one thread,
+//!    write on another), checking the hashes;
+//! 4. `fsync`, drops the page cache and reads every region back (in
+//!    parallel, one thread per region): ESP and `/config` against their
+//!    hashes, slot A by recomputing its dm-verity tree (the signed root);
+//! 5. writes the GPT last, primary and backup, and reads it back: a cut
+//!    before this point leaves a disk the firmware does not boot, never a
+//!    half-written one that it does.
+//!
+//! Slot B is not written (the first update fills it); the boot entry is the
+//! caller's (efivarfs, `corerouter-init`). G1.6g: the BIOS boot stage goes
+//! with step 3 (`core`) and step 5 (the code in block 0), so a cut leaves no
+//! half boot either; a disk of 4 KiB blocks does not get it (no BIOS boots
+//! one, the caller refuses it when running on a BIOS).
+
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
+use std::time::Instant;
+
+use ring::digest::{Context, SHA256};
+use serde::{Deserialize, Serialize};
+
+use crate::biosboot::{self, Stage};
+use crate::efi::{LoadOption, Partition, Vars, boot_name};
+use crate::gpt::{self, NewPart};
+use crate::iso::{self, Extent};
+use crate::package::{self, Header, Key, Manifest};
+use crate::verity;
+use crate::{SlotCmdline, SlotId};
+
+pub const INDEX: &str = "INSTALL.JSON";
+pub const SIGNATURE: &str = "INSTALL.SIG";
+pub const PACKAGE: &str = "COREROUTER.CRPKG";
+/// G1.6za: the modules of the ISO's kernel (a squashfs), for the live image.
+/// Listed in the signed index like the other files.
+pub const LIVE_MODULES: &str = "LIVEMODS.IMG";
+/// Largest index read (a few hundred bytes in practice).
+const MAX_INDEX: u64 = 64 << 10;
+/// Cleared at both ends of the target before anything is written.
+const WIPE: u64 = 1 << 20;
+const CHUNK: usize = 1 << 20;
+
+/// What a partition holds after the install.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase", tag = "kind")]
+pub enum Content {
+    /// A file of the medium, the rest of the partition left as it was
+    /// (the ESP: FAT marks the tail free).
+    Image { file: String },
+    /// A file of the medium, the rest of the partition zeroed (`/config`:
+    /// ext4 metadata may lie anywhere).
+    Filesystem { file: String },
+    /// The package's rootfs (squashfs + verity tree): slot A.
+    Rootfs,
+    /// Not written (slot B).
+    Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Part {
+    pub name: String,
+    pub type_guid: String,
+    pub guid: String,
+    /// Bytes from the start of the disk; a multiple of 4096.
+    pub offset: u64,
+    pub size: u64,
+    pub attrs: u64,
+    pub content: Content,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSum {
+    pub size: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Index {
+    pub format: u32,
+    pub version: String,
+    pub build: u64,
+    pub commit: String,
+    pub disk_guid: String,
+    pub partitions: Vec<Part>,
+    pub files: BTreeMap<String, FileSum>,
+    /// G1.6g: what boots the disk by BIOS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bios: Option<BiosBoot>,
+}
+
+/// G1.6g: the BIOS boot stage of an install.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BiosBoot {
+    /// The [`Stage`] file.
+    pub file: String,
+    /// Where slot A's GRUB configuration is, from the start of the ESP image:
+    /// the installer rewrites it there with the box's own command line.
+    pub slot_a_cfg: u64,
+}
+
+impl Index {
+    /// Bytes the disk needs: the last partition, plus the backup GPT.
+    pub fn min_disk(&self) -> u64 {
+        self.partitions
+            .iter()
+            .map(|p| p.offset + p.size)
+            .max()
+            .unwrap_or(0)
+            + WIPE
+    }
+
+    pub fn part(&self, name: &str) -> Option<&Part> {
+        self.partitions.iter().find(|p| p.name == name)
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.format != 1 {
+            return Err(format!(
+                "install index format {} (this build reads 1)",
+                self.format
+            ));
+        }
+        if self.partitions.is_empty() || self.partitions.len() > 16 {
+            return Err("install index: 1 to 16 partitions".into());
+        }
+        for p in &self.partitions {
+            if !p.offset.is_multiple_of(4096) || !p.size.is_multiple_of(4096) || p.size == 0 {
+                return Err(format!(
+                    "install index: partition {} is not 4 KiB aligned",
+                    p.name
+                ));
+            }
+            let file = match &p.content {
+                Content::Image { file } | Content::Filesystem { file } => Some(file),
+                Content::Rootfs | Content::Empty => None,
+            };
+            if let Some(f) = file {
+                let s = self
+                    .files
+                    .get(f)
+                    .ok_or_else(|| format!("install index: no file {f}"))?;
+                if s.size > p.size {
+                    return Err(format!("install index: {f} does not fit {}", p.name));
+                }
+            }
+        }
+        if !self.files.contains_key(PACKAGE) {
+            return Err(format!("install index: no {PACKAGE}"));
+        }
+        if let Some(b) = &self.bios {
+            let s = self
+                .files
+                .get(&b.file)
+                .ok_or_else(|| format!("install index: no file {}", b.file))?;
+            let room = 512 + biosboot::MAX_CORE as u64;
+            let first = self.partitions.iter().map(|p| p.offset).min().unwrap_or(0);
+            if s.size > room || first < biosboot::CORE_LBA * 512 + s.size.saturating_sub(512) {
+                return Err(
+                    "install index: the BIOS boot stage does not fit before the first partition"
+                        .into(),
+                );
+            }
+            let esp = self.part("efi").ok_or("install index: no efi partition")?;
+            let end = b.slot_a_cfg.checked_add(biosboot::SLOT_CFG_SIZE as u64);
+            if end.is_none_or(|e| e > esp.size) {
+                return Err("install index: slot A's GRUB configuration is outside the ESP".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The installer medium: the index (signature checked) and where each file
+/// is.
+pub struct Medium<R> {
+    pub dev: R,
+    pub index: Index,
+    pub files: BTreeMap<String, Extent>,
+    pub header: Header,
+    pub key: String,
+}
+
+fn read_at(dev: &mut (impl Read + Seek), e: Extent, max: u64) -> Result<Vec<u8>, String> {
+    if e.size > max {
+        return Err(format!("{} bytes (at most {max})", e.size));
+    }
+    let mut buf = vec![0u8; e.size as usize];
+    dev.seek(SeekFrom::Start(e.offset))
+        .and_then(|_| dev.read_exact(&mut buf))
+        .map_err(|e| e.to_string())?;
+    Ok(buf)
+}
+
+impl<R: Read + Seek + Send> Medium<R> {
+    /// Opens an installer medium (CD, stick, ISO file) and checks the
+    /// signatures of the index and of the package header against `keys`.
+    pub fn open(mut dev: R, keys: &[Key]) -> Result<Self, String> {
+        if !iso::is_installer(&mut dev) {
+            return Err("not a CoreRouter installer medium".into());
+        }
+        let files = iso::read_dir(&mut dev)?;
+        let get = |n: &str| {
+            files
+                .get(n)
+                .copied()
+                .ok_or_else(|| format!("medium: no {n}"))
+        };
+        let text =
+            read_at(&mut dev, get(INDEX)?, MAX_INDEX).map_err(|e| format!("{INDEX}: {e}"))?;
+        let sig =
+            read_at(&mut dev, get(SIGNATURE)?, 1024).map_err(|e| format!("{SIGNATURE}: {e}"))?;
+        let key = package::verify_detached(&text, &sig, keys)
+            .map_err(|e| format!("{INDEX}: {e}"))?
+            .id_hex();
+        let index: Index = serde_json::from_slice(&text).map_err(|e| format!("{INDEX}: {e}"))?;
+        index.check()?;
+        for (name, sum) in &index.files {
+            let e = get(name)?;
+            if e.size != sum.size {
+                return Err(format!(
+                    "medium: {name} is {} bytes, the index says {}",
+                    e.size, sum.size
+                ));
+            }
+        }
+        let pkg = get(PACKAGE)?;
+        dev.seek(SeekFrom::Start(pkg.offset))
+            .map_err(|e| e.to_string())?;
+        let header = Header::read(&mut dev)?;
+        header.verify(keys)?;
+        let m = &header.manifest;
+        if header.len() + m.kernel.size + m.rootfs.size != pkg.size {
+            return Err(format!("{PACKAGE}: size does not match its manifest"));
+        }
+        if m.build != index.build || m.commit != index.commit {
+            return Err(format!("{PACKAGE} is not the build the index describes"));
+        }
+        Ok(Medium {
+            dev,
+            index,
+            files,
+            header,
+            key,
+        })
+    }
+
+    /// Where the signed root filesystem (squashfs + verity tree) is on the
+    /// medium: inside the update package, after its header and kernel.
+    pub fn rootfs_extent(&self) -> Result<Extent, String> {
+        let pkg = self.extent(PACKAGE)?;
+        Ok(Extent {
+            offset: pkg.offset + self.header.len() + self.header.manifest.kernel.size,
+            size: self.header.manifest.rootfs.size,
+        })
+    }
+
+    /// G1.6za: where a file of the signed index is, and the SHA-256 the index
+    /// gives for it. A file that is not in the index is an error: being on
+    /// the medium proves nothing.
+    pub fn signed_file(&self, name: &str) -> Result<(Extent, String), String> {
+        let sum = self
+            .index
+            .files
+            .get(name)
+            .ok_or_else(|| format!("{name} is not in the signed index"))?;
+        Ok((self.extent(name)?, sum.sha256.clone()))
+    }
+
+    fn extent(&self, name: &str) -> Result<Extent, String> {
+        self.files
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("medium: no {name}"))
+    }
+}
+
+/// What the caller asks for.
+#[derive(Debug, Clone)]
+pub struct Opts {
+    /// Keep the `config` partition of an earlier CoreRouter install (same
+    /// place, same GUID, an ext4 filesystem in it).
+    pub keep_config: bool,
+    /// Read and hash on one thread, write on another.
+    pub pipelined: bool,
+    /// Read the regions back in parallel (one thread each).
+    pub parallel_verify: bool,
+    /// Threads for the verity tree.
+    pub threads: usize,
+    /// G1.6g: running on a BIOS, mark the protective partition active.
+    pub bios_active: bool,
+    /// G1.6g: the kernel's command line for slot A when GRUB boots it.
+    pub bios_cmdline: Option<String>,
+}
+
+/// How the install went.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Report {
+    pub bytes_written: u64,
+    pub write_ms: u64,
+    pub sync_ms: u64,
+    pub verify_ms: u64,
+    pub total_ms: u64,
+    pub kept_config: bool,
+    /// The ESP as a boot entry names it, slot A's PARTUUID.
+    pub esp: Option<Partition>,
+    pub rootfs_a: String,
+}
+
+/// What a target disk holds now (shown before asking to erase it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Existing {
+    Empty,
+    /// A GPT with these partition names.
+    Gpt(Vec<String>),
+    /// A CoreRouter install (`rootfs-a` and `config`), with whether its
+    /// `config` can be kept by this medium.
+    CoreRouter {
+        config_keepable: bool,
+    },
+    /// Something else on the first sectors (MBR, a filesystem).
+    Unknown,
+}
+
+const EXT4_MAGIC_AT: u64 = 1024 + 56;
+
+/// Looks at `disk` (read-only).
+pub fn existing(disk: &mut (impl Read + Seek), lbs: u64, index: &Index) -> Existing {
+    if let Ok(parts) = gpt::read(disk, lbs) {
+        let names: Vec<String> = parts.iter().map(|p| p.name.clone()).collect();
+        if names.iter().any(|n| n == "rootfs-a") && names.iter().any(|n| n == "config") {
+            return Existing::CoreRouter {
+                config_keepable: config_keepable(disk, lbs, index, &parts),
+            };
+        }
+        return Existing::Gpt(names);
+    }
+    if looks_blank(disk) {
+        Existing::Empty
+    } else {
+        Existing::Unknown
+    }
+}
+
+/// The edges of a disk, where partition tables and filesystem signatures live.
+const BLANK_EDGE: u64 = 1 << 20;
+const BLANK_SAMPLE: u64 = 64 << 10;
+const BLANK_SAMPLES: u64 = 64;
+
+/// G1.6y: "empty" decides that typing the name is enough, so it needs more
+/// than the first sectors: `mkfs.btrfs` leaves the first 64 KiB zero (its
+/// magic is at 64 KiB + 64) and many filesystems keep data far from the
+/// start. All zero in the first and last MiB and in samples across the disk;
+/// a read error is not "empty". A disk that is zero everywhere looked at can
+/// still hold data between the samples: 64 samples of 64 KiB, about a second
+/// on a spinning disk (**estimado**).
+fn looks_blank(disk: &mut (impl Read + Seek)) -> bool {
+    let Ok(size) = disk.seek(SeekFrom::End(0)) else {
+        return false;
+    };
+    if size == 0 {
+        return false;
+    }
+    let mut buf = vec![0u8; CHUNK];
+    let mut zero_at = |at: u64, len: u64| -> bool {
+        if disk.seek(SeekFrom::Start(at)).is_err() {
+            return false;
+        }
+        let mut left = len;
+        while left > 0 {
+            let n = left.min(CHUNK as u64) as usize;
+            let Some(b) = buf.get_mut(..n) else {
+                return false;
+            };
+            if disk.read_exact(b).is_err() || b.iter().any(|&x| x != 0) {
+                return false;
+            }
+            left -= n as u64;
+        }
+        true
+    };
+    let edge = BLANK_EDGE.min(size);
+    if !zero_at(0, edge) || !zero_at(size - edge, edge) {
+        return false;
+    }
+    let step = size / (BLANK_SAMPLES + 1);
+    (1..=BLANK_SAMPLES).all(|i| {
+        let at = step * i;
+        at + BLANK_SAMPLE > size || zero_at(at, BLANK_SAMPLE)
+    })
+}
+
+/// What slot A's kernel is given, by the boot entry or by GRUB.
+pub fn slot_a_line(
+    rootfs_a: &str,
+    m: &Manifest,
+    running: &str,
+    tuning: &[(String, String)],
+) -> String {
+    SlotCmdline {
+        slot: SlotId::A,
+        partuuid: rootfs_a,
+        manifest: m,
+        tuning,
+        running,
+        drill: false,
+    }
+    .render()
+}
+
+/// `Boot####` "CoreRouter A" for the disk just written, first in `BootOrder`;
+/// an earlier install's "CoreRouter B" entry goes (its slot is empty now).
+/// Returns the line for the operator.
+pub fn boot_entry(efivars: &str, r: &Report, line: &str) -> Result<String, String> {
+    let vars = Vars::efivarfs(efivars);
+    let ents = crate::ab::entries(&vars);
+    let opt = LoadOption {
+        active: true,
+        description: SlotId::A.label().into(),
+        partition: r.esp.clone(),
+        file: Some(SlotId::A.efi_path()),
+        cmdline: line.to_owned(),
+    };
+    let used = vars.boot_numbers();
+    let n = match ents.first().copied().flatten() {
+        Some(n) => n,
+        None => (0..=0xffffu16)
+            .find(|n| !used.contains(n))
+            .ok_or("no free Boot#### number")?,
+    };
+    vars.set(&boot_name(n), &opt.encode()?)
+        .map_err(|e| format!("{}: {e}", boot_name(n)))?;
+    let stale_b = ents.get(1).copied().flatten();
+    if let Some(b) = stale_b {
+        let _ = vars.remove(&boot_name(b));
+    }
+    let mut order = vec![n];
+    for x in vars.boot_order().unwrap_or_default() {
+        if x != n && Some(x) != stale_b {
+            order.push(x);
+        }
+    }
+    vars.set_u16_list("BootOrder", &order)
+        .map_err(|e| format!("BootOrder: {e}"))?;
+    Ok(format!(
+        "Boot entry {} \"{}\" first in BootOrder",
+        boot_name(n),
+        SlotId::A.label()
+    ))
+}
+
+fn config_keepable(
+    disk: &mut (impl Read + Seek),
+    lbs: u64,
+    index: &Index,
+    parts: &[gpt::Entry],
+) -> bool {
+    let (Some(want), Some(have)) = (
+        index.part("config"),
+        parts.iter().find(|p| p.name == "config"),
+    ) else {
+        return false;
+    };
+    let mut magic = [0u8; 2];
+    // G1.6v: a `/config` grown to the rest of the disk is still the one to
+    // keep (never smaller than the image's).
+    let ok = have.first_lba * lbs == want.offset
+        && have.size_lba() * lbs >= want.size
+        && have.guid.eq_ignore_ascii_case(&want.guid)
+        && disk
+            .seek(SeekFrom::Start(want.offset + EXT4_MAGIC_AT))
+            .is_ok()
+        && disk.read_exact(&mut magic).is_ok();
+    ok && magic == [0x53, 0xEF]
+}
+
+/// A writer at a byte offset of the target (`pwrite`).
+struct At<'a> {
+    f: &'a File,
+    pos: u64,
+}
+
+impl Write for At<'_> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.f.write_all_at(b, self.pos)?;
+        self.pos += b.len() as u64;
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn zero(f: &File, at: u64, len: u64) -> Result<(), String> {
+    let buf = vec![0u8; CHUNK];
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(CHUNK as u64) as usize;
+        f.write_all_at(buf.get(..n).unwrap_or(&[]), at + done)
+            .map_err(|e| format!("write: {e}"))?;
+        done += n as u64;
+    }
+    Ok(())
+}
+
+/// SHA-256 of `len` bytes of `f` at `at`, and whether the next `zeros`
+/// bytes are all zero.
+fn hash_region(f: &File, at: u64, len: u64, zeros: u64) -> Result<(String, bool), String> {
+    let mut ctx = Context::new(&SHA256);
+    let mut buf = vec![0u8; CHUNK];
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(CHUNK as u64) as usize;
+        let b = buf.get_mut(..n).ok_or("buffer")?;
+        f.read_exact_at(b, at + done)
+            .map_err(|e| format!("read back: {e}"))?;
+        ctx.update(b);
+        done += n as u64;
+    }
+    let mut clean = true;
+    let mut z = 0;
+    while z < zeros && clean {
+        let n = (zeros - z).min(CHUNK as u64) as usize;
+        let b = buf.get_mut(..n).ok_or("buffer")?;
+        f.read_exact_at(b, at + len + z)
+            .map_err(|e| format!("read back: {e}"))?;
+        clean = b.iter().all(|&x| x == 0);
+        z += n as u64;
+    }
+    Ok((verity::hex(ctx.finish().as_ref()), clean))
+}
+
+/// Re-reads slot A and recomputes its verity tree (like
+/// `Platform::check_slot` after an update): every byte of the slot, a
+/// piece at a time (G0.30j).
+fn check_rootfs(f: &File, at: u64, m: &Manifest, threads: usize) -> Result<(), String> {
+    let salt = verity::unhex(&m.rootfs.salt).ok_or("salt")?;
+    let r = &m.rootfs;
+    if !verity::check_at(f, at, r.size, r.data_blocks, &salt, &r.root_hash, threads)? {
+        return Err("slot A: what was read back does not match the signed root hash".into());
+    }
+    Ok(())
+}
+
+/// Installs the medium's image on `target` (a whole disk of `disk_bytes`
+/// with `lbs`-byte logical blocks). `progress(done, total)` after each
+/// chunk written.
+pub fn install<R: Read + Seek + Send>(
+    medium: &mut Medium<R>,
+    target: &File,
+    disk_bytes: u64,
+    lbs: u64,
+    opts: &Opts,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<Report, String> {
+    let t0 = Instant::now();
+    let index = medium.index.clone();
+    let m = medium.header.manifest.clone();
+    if !(512..=4096).contains(&lbs) || !lbs.is_power_of_two() {
+        return Err(format!("logical block size {lbs}"));
+    }
+    if disk_bytes < index.min_disk() {
+        return Err(format!(
+            "the disk has {} MiB, the image needs {} MiB",
+            disk_bytes >> 20,
+            index.min_disk().div_ceil(1 << 20)
+        ));
+    }
+    let keep = opts.keep_config && {
+        let mut t = target;
+        let parts = gpt::read(&mut t, lbs).unwrap_or_default();
+        config_keepable(&mut t, lbs, &index, &parts)
+    };
+    if opts.keep_config && !keep {
+        return Err("the configuration on this disk cannot be kept (no CoreRouter config partition in the same place)".into());
+    }
+    let rootfs = medium.rootfs_extent()?;
+    // What gets written, in order: (partition, source extent, zero fill).
+    let mut jobs: Vec<(Part, Extent, u64)> = Vec::new();
+    for p in &index.partitions {
+        let (src, fill) = match &p.content {
+            Content::Image { file } => (medium.extent(file)?, 0),
+            Content::Filesystem { file } if keep && p.name == "config" => {
+                let _ = file;
+                continue;
+            }
+            Content::Filesystem { file } => {
+                let e = medium.extent(file)?;
+                (e, p.size - e.size)
+            }
+            Content::Rootfs => (rootfs, 0),
+            Content::Empty => continue,
+        };
+        if src.size + fill > p.size {
+            return Err(format!("{} does not fit partition {}", src.size, p.name));
+        }
+        jobs.push((p.clone(), src, fill));
+    }
+    let total: u64 = jobs.iter().map(|(_, s, f)| s.size + f).sum();
+    // G1.6g: checked here, while the disk is still as it was.
+    let bios = match &index.bios {
+        Some(b) if lbs == 512 => {
+            let want = index
+                .files
+                .get(&b.file)
+                .ok_or_else(|| format!("install index: no file {}", b.file))?;
+            let e = medium.extent(&b.file)?;
+            let f = read_at(&mut medium.dev, e, 512 + biosboot::MAX_CORE as u64)
+                .map_err(|e| format!("{}: {e}", b.file))?;
+            if package::sha256_hex(&f) != want.sha256 {
+                return Err(format!(
+                    "{}: the medium does not match its signed hash (bad medium?): nothing was written",
+                    b.file
+                ));
+            }
+            let cfg = opts
+                .bios_cmdline
+                .as_deref()
+                .map(|c| biosboot::slot_cfg(crate::SlotId::A, c))
+                .transpose()?;
+            Some((Stage::from_file(&f)?, b.slot_a_cfg, cfg))
+        }
+        _ => None,
+    };
+
+    // 2. No partition table from here until step 5.
+    let tw = Instant::now();
+    zero(target, 0, WIPE)?;
+    zero(target, disk_bytes - WIPE, WIPE)?;
+    if let Some((s, _, _)) = &bios {
+        target
+            .write_all_at(&s.core, biosboot::CORE_LBA * 512)
+            .map_err(|e| format!("BIOS boot: {e}"))?;
+    }
+    // 3. Stream, hash, write.
+    let mut done = 0u64;
+    let mut written: Vec<(Part, u64, u64, Option<String>)> = Vec::new();
+    for (p, src, fill) in &jobs {
+        medium
+            .dev
+            .seek(SeekFrom::Start(src.offset))
+            .map_err(|e| e.to_string())?;
+        let mut w = At {
+            f: target,
+            pos: p.offset,
+        };
+        let base = done;
+        let mut parts: [(u64, &mut dyn Write); 1] = [(src.size, &mut w)];
+        let c = package::copy(&mut medium.dev, &mut parts, opts.pipelined, &mut |n| {
+            progress(base + n, total)
+        })
+        .map_err(|e| format!("{}: {e}", p.name))?;
+        let got = c.sha256.first().cloned().unwrap_or_default();
+        let want = match &p.content {
+            Content::Image { file } | Content::Filesystem { file } => {
+                index.files.get(file).map(|s| s.sha256.clone())
+            }
+            _ => Some(m.rootfs.sha256.clone()),
+        };
+        if want.as_deref() != Some(got.as_str()) {
+            return Err(format!(
+                "{}: the medium does not match its signed hash (bad medium?): nothing was made bootable",
+                p.name
+            ));
+        }
+        if *fill > 0 {
+            zero(target, p.offset + src.size, *fill)?;
+        }
+        done += src.size + fill;
+        progress(done, total);
+        written.push((p.clone(), src.size, *fill, want));
+    }
+    let write_ms = tw.elapsed().as_millis() as u64;
+    // 4. On the disk, not in the cache.
+    let ts = Instant::now();
+    target.sync_all().map_err(|e| format!("sync: {e}"))?;
+    crate::ab::drop_cache(target);
+    let sync_ms = ts.elapsed().as_millis() as u64;
+    let tv = Instant::now();
+    let check = |(p, len, fill, want): &(Part, u64, u64, Option<String>)| -> Result<(), String> {
+        if p.content == Content::Rootfs {
+            return check_rootfs(target, p.offset, &m, opts.threads);
+        }
+        let (h, clean) = hash_region(target, p.offset, *len, *fill)?;
+        if want.as_deref() != Some(h.as_str()) || !clean {
+            return Err(format!(
+                "{}: what was read back is not what was written (bad disk?)",
+                p.name
+            ));
+        }
+        Ok(())
+    };
+    if opts.parallel_verify {
+        std::thread::scope(|s| -> Result<(), String> {
+            let handles: Vec<_> = written
+                .iter()
+                .map(|w| {
+                    std::thread::Builder::new()
+                        .name(format!("verify-{}", w.0.name))
+                        .spawn_scoped(s, || check(w))
+                })
+                .collect::<Result<_, _>>()
+                .map_err(|e| format!("thread: {e}"))?;
+            for h in handles {
+                h.join()
+                    .map_err(|_| "verify thread panicked".to_string())??;
+            }
+            Ok(())
+        })?;
+    } else {
+        for w in &written {
+            check(w)?;
+        }
+    }
+    if let Some((s, cfg_at, cfg)) = &bios {
+        let mut core = vec![0u8; s.core.len()];
+        target
+            .read_exact_at(&mut core, biosboot::CORE_LBA * 512)
+            .map_err(|e| format!("BIOS boot: read back: {e}"))?;
+        if core != s.core {
+            return Err("BIOS boot: what was read back is not what was written (bad disk?)".into());
+        }
+        // After the ESP's hash: this one file differs from the signed image.
+        if let (Some(cfg), Some(esp)) = (cfg, index.part("efi")) {
+            target
+                .write_all_at(cfg, esp.offset + cfg_at)
+                .and_then(|_| target.sync_all())
+                .map_err(|e| format!("BIOS boot: slot A configuration: {e}"))?;
+        }
+    }
+    let verify_ms = tv.elapsed().as_millis() as u64;
+    // 5. The partition table, last. G1.6v: `/config` (the last partition)
+    // takes the rest of the disk when that gives it at least
+    // `gpt::CONFIG_MIN`; its filesystem (the image's, or the one kept)
+    // grows at the first boot.
+    let last_part = index.partitions.iter().map(|p| p.offset).max();
+    let config_end = gpt::aligned_last(disk_bytes / lbs, lbs);
+    // G1.6zm: this disk's ESP gets a GUID of its own: a boot entry left by
+    // an earlier install (or another disk with the image) names another
+    // partition.
+    let esp_guid = crate::new_guid()?;
+    let new: Vec<NewPart> = index
+        .partitions
+        .iter()
+        .map(|p| {
+            let mut last_lba = (p.offset + p.size) / lbs - 1;
+            if p.name == "config"
+                && last_part == Some(p.offset)
+                && config_end > last_lba
+                && (config_end + 1) * lbs - p.offset >= gpt::CONFIG_MIN
+            {
+                last_lba = config_end;
+            }
+            NewPart {
+                name: p.name.clone(),
+                type_guid: p.type_guid.clone(),
+                guid: if p.name == "efi" {
+                    esp_guid.clone()
+                } else {
+                    p.guid.clone()
+                },
+                first_lba: p.offset / lbs,
+                last_lba,
+                attrs: p.attrs,
+            }
+        })
+        .collect();
+    let (mut primary, backup_at, backup) =
+        gpt::build(disk_bytes / lbs, lbs, &index.disk_guid, &new)?;
+    if let Some((s, _, _)) = &bios {
+        s.set_code(&mut primary);
+        if opts.bios_active {
+            biosboot::set_active(&mut primary);
+        }
+    }
+    target
+        .write_all_at(&primary, 0)
+        .and_then(|_| target.write_all_at(&backup, backup_at))
+        .and_then(|_| target.sync_all())
+        .map_err(|e| format!("partition table: {e}"))?;
+    crate::ab::drop_cache(target);
+    let mut t = target;
+    let back = gpt::read(&mut t, lbs)?;
+    let mut back_b = vec![0u8; backup.len()];
+    target
+        .read_exact_at(&mut back_b, backup_at)
+        .map_err(|e| format!("read back the backup GPT: {e}"))?;
+    let mut back_p = vec![0u8; primary.len()];
+    target
+        .read_exact_at(&mut back_p, 0)
+        .map_err(|e| format!("read back the GPT: {e}"))?;
+    if back.len() != new.len() || back_b != backup || back_p != primary {
+        return Err("partition table: what was read back is not what was written".into());
+    }
+    let esp = index.part("efi").and_then(|p| {
+        let e = back.iter().find(|b| b.name == p.name)?;
+        Some(Partition {
+            number: e.number,
+            start_lba: e.first_lba,
+            size_lba: e.size_lba(),
+            guid: e.guid.clone(),
+        })
+    });
+    Ok(Report {
+        bytes_written: done + 2 * WIPE,
+        write_ms,
+        sync_ms,
+        verify_ms,
+        total_ms: t0.elapsed().as_millis() as u64,
+        kept_config: keep,
+        esp,
+        rootfs_a: index
+            .part("rootfs-a")
+            .map(|p| p.guid.clone())
+            .unwrap_or_default(),
+    })
+}
+
+/// The index of a build (`corerouter-image installer`): the layout of
+/// `disk` (genimage's `disk.img`, its GPT) and the payload files.
+pub fn index_of(
+    disk: &mut (impl Read + Seek),
+    manifest: &Manifest,
+    files: &[(&str, &[u8])],
+    contents: &[(&str, Content)],
+) -> Result<Index, String> {
+    let mut hdr = vec![0u8; 512];
+    disk.seek(SeekFrom::Start(512))
+        .and_then(|_| disk.read_exact(&mut hdr))
+        .map_err(|e| format!("disk image: {e}"))?;
+    let dg = crate::efi::guid_text(hdr.get(56..72).unwrap_or(&[])).ok_or("disk GUID")?;
+    let parts = gpt::read(disk, 512)?;
+    let mut partitions = Vec::new();
+    for p in &parts {
+        let content = contents
+            .iter()
+            .find(|(n, _)| *n == p.name)
+            .map(|(_, c)| c.clone())
+            .unwrap_or(Content::Empty);
+        partitions.push(Part {
+            name: p.name.clone(),
+            type_guid: p.type_guid.clone(),
+            guid: p.guid.clone(),
+            offset: p.first_lba * 512,
+            size: p.size_lba() * 512,
+            attrs: gpt_attrs(disk, p.number)?,
+            content,
+        });
+    }
+    let files = files
+        .iter()
+        .map(|(n, d)| {
+            (
+                (*n).to_owned(),
+                FileSum {
+                    size: d.len() as u64,
+                    sha256: package::sha256_hex(d),
+                },
+            )
+        })
+        .collect();
+    let index = Index {
+        format: 1,
+        version: manifest.version.clone(),
+        build: manifest.build,
+        commit: manifest.commit.clone(),
+        disk_guid: dg,
+        partitions,
+        files,
+        bios: None,
+    };
+    index.check()?;
+    Ok(index)
+}
+
+fn gpt_attrs(disk: &mut (impl Read + Seek), number: u32) -> Result<u64, String> {
+    // Entries at LBA 2 of a 512-byte disk image, 128 bytes each.
+    let mut a = [0u8; 8];
+    disk.seek(SeekFrom::Start(1024 + u64::from(number - 1) * 128 + 48))
+        .and_then(|_| disk.read_exact(&mut a))
+        .map_err(|e| e.to_string())?;
+    Ok(u64::from_le_bytes(a))
+}
+
+/// `data` without its trailing all-zero 4 KiB blocks (the ESP and `/config`
+/// images are mostly empty).
+pub fn trim(data: &[u8]) -> &[u8] {
+    let blocks = data.len().div_ceil(4096);
+    let last = (0..blocks).rev().find(|b| {
+        data.get(b * 4096..((b + 1) * 4096).min(data.len()))
+            .is_some_and(|c| c.iter().any(|&x| x != 0))
+    });
+    match last {
+        Some(b) => data.get(..((b + 1) * 4096).min(data.len())).unwrap_or(data),
+        None => data.get(..0).unwrap_or(data),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    struct Build {
+        iso: Vec<u8>,
+        keys: Vec<Key>,
+        esp: Vec<u8>,
+        config: Vec<u8>,
+        rootfs: Vec<u8>,
+        disk: Vec<u8>,
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    /// A small build: GPT like genimage's, signed package and index, ISO.
+    fn build(tamper: impl Fn(&mut Vec<(String, Vec<u8>)>)) -> Build {
+        build_with(tamper, None)
+    }
+
+    /// With `bios`: the stage file and where slot A's GRUB configuration is.
+    fn build_with(
+        tamper: impl Fn(&mut Vec<(String, Vec<u8>)>),
+        bios: Option<(Vec<u8>, u64)>,
+    ) -> Build {
+        let key = package::generate_key().unwrap();
+        let keys = vec![Key::from_hex(&package::public_hex(&key).unwrap()).unwrap()];
+        let parts = [
+            (
+                "efi",
+                crate::iso::ESP_TYPE,
+                "4f9a520b-35f7-4633-a4bb-e9f871d1473c",
+                1,
+                2,
+                4u64,
+            ),
+            (
+                "rootfs-a",
+                "4f68bce3-e8cd-4db1-96e7-fbcaf984b709",
+                "3e1088b8-5b4b-4fbb-b756-a271f641d018",
+                3,
+                1,
+                0,
+            ),
+            (
+                "rootfs-b",
+                "4f68bce3-e8cd-4db1-96e7-fbcaf984b709",
+                "868e1d1d-85bb-4c62-a083-f61aa7a5cda2",
+                4,
+                1,
+                0,
+            ),
+            (
+                "config",
+                "0fc63daf-8483-4772-8e79-3d69d8477de4",
+                "4c6422db-190c-4f35-b930-a98862b6be7d",
+                5,
+                1,
+                0,
+            ),
+        ];
+        let new: Vec<NewPart> = parts
+            .iter()
+            .map(|(n, t, g, at, size, a)| NewPart {
+                name: (*n).into(),
+                type_guid: (*t).into(),
+                guid: (*g).into(),
+                first_lba: at * MIB / 512,
+                last_lba: (at + size) * MIB / 512 - 1,
+                attrs: *a,
+            })
+            .collect();
+        let (p, at, b) = gpt::build(
+            7 * MIB / 512,
+            512,
+            "39dfcaa2-2c8a-4912-acaa-6af0c68b5350",
+            &new,
+        )
+        .unwrap();
+        let mut disk = vec![0u8; 7 * MIB as usize];
+        disk[..p.len()].copy_from_slice(&p);
+        disk[at as usize..at as usize + b.len()].copy_from_slice(&b);
+
+        let data: Vec<u8> = (0..65536u32).map(|i| (i * 7 % 251) as u8).collect();
+        let salt = vec![9u8; 16];
+        let tree = verity::tree(&data, &salt, 2).unwrap();
+        let mut rootfs = data.clone();
+        rootfs.extend_from_slice(&tree.bytes);
+        let kernel = vec![0x4d; 10_000];
+        let mut man = package::tests::manifest(&kernel, &rootfs, &tree);
+        man.rootfs.salt = verity::hex(&salt);
+        let header = package::sign(&man, &key).unwrap();
+        let mut pkg = header.clone();
+        pkg.extend_from_slice(&kernel);
+        pkg.extend_from_slice(&rootfs);
+        let mut esp = vec![0u8; MIB as usize];
+        esp[..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
+        esp[600_000] = 1;
+        let esp = trim(&esp).to_vec();
+        assert_eq!(esp.len(), 602_112);
+        let mut config = vec![0u8; 8192];
+        config[1080..1082].copy_from_slice(&[0x53, 0xEF]);
+        let stage = bios.as_ref().map_or(&[][..], |(f, _)| f.as_slice());
+        let mut payload: Vec<(&str, &[u8])> =
+            vec![(PACKAGE, &pkg), ("ESP.IMG", &esp), ("CONFIG.IMG", &config)];
+        if bios.is_some() {
+            payload.push(("BIOSBOOT.IMG", stage));
+        }
+        let mut index = index_of(
+            &mut Cursor::new(&disk),
+            &man,
+            &payload,
+            &[
+                (
+                    "efi",
+                    Content::Image {
+                        file: "ESP.IMG".into(),
+                    },
+                ),
+                ("rootfs-a", Content::Rootfs),
+                (
+                    "config",
+                    Content::Filesystem {
+                        file: "CONFIG.IMG".into(),
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(index.part("efi").unwrap().attrs, 4);
+        index.bios = bios.as_ref().map(|(_, at)| BiosBoot {
+            file: "BIOSBOOT.IMG".into(),
+            slot_a_cfg: *at,
+        });
+        let text = serde_json::to_vec(&index).unwrap();
+        let sig = package::sign_detached(&text, &key).unwrap();
+        let mut files: Vec<(String, Vec<u8>)> = vec![
+            (INDEX.into(), text),
+            (SIGNATURE.into(), sig),
+            (PACKAGE.into(), pkg),
+            ("ESP.IMG".into(), esp.clone()),
+            ("CONFIG.IMG".into(), config.clone()),
+            ("EFIBOOT.IMG".into(), vec![0; 4096]),
+        ];
+        if let Some((f, _)) = &bios {
+            files.push(("BIOSBOOT.IMG".into(), f.clone()));
+        }
+        tamper(&mut files);
+        let mut readers: Vec<Cursor<Vec<u8>>> =
+            files.iter().map(|(_, d)| Cursor::new(d.clone())).collect();
+        let mut fl: Vec<iso::File<'_>> = files
+            .iter()
+            .zip(readers.iter_mut())
+            .map(|((n, d), r)| iso::File {
+                name: n.clone(),
+                size: d.len() as u64,
+                data: r,
+            })
+            .collect();
+        let mut img = Vec::new();
+        iso::write(&mut img, &mut fl, "EFIBOOT.IMG", None, 0).unwrap();
+        Build {
+            iso: img,
+            keys,
+            esp,
+            config,
+            rootfs,
+            disk,
+        }
+    }
+
+    fn target(len: u64, fill: u8) -> (File, std::path::PathBuf) {
+        let p = std::env::temp_dir().join(format!(
+            "cr-install-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&p)
+            .unwrap();
+        f.write_all_at(&vec![fill; len as usize], 0).unwrap();
+        (f, p)
+    }
+
+    fn opts() -> Opts {
+        Opts {
+            keep_config: false,
+            pipelined: true,
+            parallel_verify: true,
+            threads: 2,
+            bios_active: false,
+            bios_cmdline: None,
+        }
+    }
+
+    #[test]
+    fn installs_and_the_disk_reads_back_as_the_image() {
+        let b = build(|_| {});
+        let mut m = Medium::open(Cursor::new(b.iso.clone()), &b.keys).unwrap();
+        assert_eq!(m.index.min_disk(), 7 * MIB);
+        for (pipelined, parallel) in [(true, true), (false, false)] {
+            let (f, p) = target(16 * MIB, 0xA5);
+            let o = Opts {
+                pipelined,
+                parallel_verify: parallel,
+                ..opts()
+            };
+            let mut last = 0;
+            let r = install(&mut m, &f, 16 * MIB, 512, &o, &mut |d, t| {
+                assert!(d <= t);
+                last = d;
+            })
+            .unwrap();
+            assert_eq!(last, b.esp.len() as u64 + b.rootfs.len() as u64 + MIB);
+            let disk = std::fs::read(&p).unwrap();
+            let _ = std::fs::remove_file(&p);
+            let parts = gpt::read(&mut Cursor::new(&disk), 512).unwrap();
+            let names: Vec<&str> = parts.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, ["efi", "rootfs-a", "rootfs-b", "config"]);
+            let at =
+                |n: &str| (parts.iter().find(|p| p.name == n).unwrap().first_lba * 512) as usize;
+            assert_eq!(&disk[at("efi")..at("efi") + b.esp.len()], &b.esp[..]);
+            assert_eq!(
+                &disk[at("rootfs-a")..at("rootfs-a") + b.rootfs.len()],
+                &b.rootfs[..]
+            );
+            assert_eq!(
+                &disk[at("config")..at("config") + b.config.len()],
+                &b.config[..]
+            );
+            assert!(
+                disk[at("config") + b.config.len()..at("config") + MIB as usize]
+                    .iter()
+                    .all(|&x| x == 0)
+            );
+            assert!(
+                disk[at("rootfs-b")..at("rootfs-b") + 16]
+                    .iter()
+                    .all(|&x| x == 0xA5),
+                "slot B untouched"
+            );
+            // Same partitions as the build's disk image, backup GPT at the
+            // end; G1.6zm: but the ESP's GUID is this disk's own, and the
+            // boot entry names it.
+            let mut want = gpt::read(&mut Cursor::new(&b.disk), 512).unwrap();
+            let esp = parts.iter().find(|p| p.name == "efi").unwrap();
+            assert_ne!(esp.guid, crate::IMAGE_ESP_GUID);
+            assert_eq!(r.esp.as_ref().unwrap().guid, esp.guid);
+            if let Some(w) = want.iter_mut().find(|p| p.name == "efi") {
+                w.guid = esp.guid.clone();
+            }
+            assert_eq!(parts, want);
+            assert_eq!(&disk[disk.len() - 512..disk.len() - 504], b"EFI PART");
+            assert_eq!(r.esp.as_ref().unwrap().number, 1);
+            assert_eq!(r.rootfs_a, "3e1088b8-5b4b-4fbb-b756-a271f641d018");
+            assert_eq!(
+                existing(&mut Cursor::new(&disk), 512, &m.index),
+                Existing::CoreRouter {
+                    config_keepable: true
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_the_configuration_when_asked() {
+        let b = build(|_| {});
+        let mut m = Medium::open(Cursor::new(b.iso.clone()), &b.keys).unwrap();
+        let (f, p) = target(16 * MIB, 0);
+        install(&mut m, &f, 16 * MIB, 512, &opts(), &mut |_, _| {}).unwrap();
+        let cfg = m.index.part("config").unwrap().offset;
+        f.write_all_at(b"operator config", cfg + 8192).unwrap();
+        let r = install(
+            &mut m,
+            &f,
+            16 * MIB,
+            512,
+            &Opts {
+                keep_config: true,
+                ..opts()
+            },
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert!(r.kept_config);
+        let mut got = [0u8; 15];
+        f.read_exact_at(&mut got, cfg + 8192).unwrap();
+        assert_eq!(&got, b"operator config");
+        // A blank disk has nothing to keep: refused before writing.
+        let (g, q) = target(16 * MIB, 0x11);
+        let e = install(
+            &mut m,
+            &g,
+            16 * MIB,
+            512,
+            &Opts {
+                keep_config: true,
+                ..opts()
+            },
+            &mut |_, _| {},
+        )
+        .unwrap_err();
+        assert!(e.contains("cannot be kept"), "{e}");
+        let mut first = [0u8; 4];
+        g.read_exact_at(&mut first, 0).unwrap();
+        assert_eq!(first, [0x11; 4]);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&q);
+    }
+
+    /// G1.6v: on a disk with room, `/config` (the image's 1 MiB here) is
+    /// written to the end of the disk; reinstalling keeps it grown.
+    /// A build whose index has the BIOS stage; `cfg_at` inside the ESP image.
+    fn bios_build() -> (Build, Stage, u64) {
+        use crate::biosboot::tests::{fake_boot_img, fake_core};
+        let stage =
+            biosboot::stage(&fake_boot_img(), &fake_core(4096), biosboot::CORE_LBA).unwrap();
+        let cfg_at = 8192u64;
+        let b = build_with(|_| {}, Some((stage.to_file(), cfg_at)));
+        (b, stage, cfg_at)
+    }
+
+    /// G1.6g: `core` in the gap, the code in block 0 with the partition record,
+    /// slot A's configuration rewritten, the rest of the ESP as signed.
+    #[test]
+    fn writes_the_bios_stage_with_the_table() {
+        let (b, stage, cfg_at) = bios_build();
+        let mut m = Medium::open(Cursor::new(b.iso.clone()), &b.keys).unwrap();
+        let (f, p) = target(16 * MIB, 0xA5);
+        let o = Opts {
+            bios_active: true,
+            bios_cmdline: Some("root=/dev/dm-0 corerouter.mgmt=ether1,10.0.0.1/24".into()),
+            ..opts()
+        };
+        install(&mut m, &f, 16 * MIB, 512, &o, &mut |_, _| {}).unwrap();
+        let disk = std::fs::read(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(&disk[..biosboot::CODE], &stage.code[..]);
+        assert_eq!(disk[446], 0x80, "active on a BIOS");
+        assert_eq!(disk[446 + 4], 0xEE, "still a protective MBR");
+        assert_eq!(&disk[510..512], &[0x55, 0xAA]);
+        let core_at = biosboot::CORE_LBA as usize * 512;
+        assert_eq!(&disk[core_at..core_at + stage.core.len()], &stage.core[..]);
+        let parts = gpt::read(&mut Cursor::new(&disk), 512).unwrap();
+        assert_eq!(parts.len(), 4, "no partition for GRUB: numbers unchanged");
+        let esp = parts[0].first_lba as usize * 512;
+        let at = esp + cfg_at as usize;
+        let cfg = &disk[at..at + biosboot::SLOT_CFG_SIZE];
+        assert_eq!(
+            cfg,
+            &biosboot::slot_cfg(crate::SlotId::A, o.bios_cmdline.as_deref().unwrap()).unwrap()[..]
+        );
+        assert_eq!(&disk[esp..esp + 8192], &b.esp[..8192]);
+    }
+
+    #[test]
+    fn a_uefi_install_keeps_the_mark_off_and_the_code_on() {
+        let (b, stage, _) = bios_build();
+        let mut m = Medium::open(Cursor::new(b.iso.clone()), &b.keys).unwrap();
+        let (f, p) = target(16 * MIB, 0xA5);
+        install(&mut m, &f, 16 * MIB, 512, &opts(), &mut |_, _| {}).unwrap();
+        let disk = std::fs::read(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(disk[446], 0);
+        assert_eq!(&disk[..biosboot::CODE], &stage.code[..]);
+    }
+
+    /// No BIOS boots these: nothing of GRUB's goes on them.
+    #[test]
+    fn four_kib_blocks_get_no_bios_stage() {
+        let (b, _, _) = bios_build();
+        let mut m = Medium::open(Cursor::new(b.iso.clone()), &b.keys).unwrap();
+        let (f, p) = target(16 * MIB, 0xA5);
+        install(&mut m, &f, 16 * MIB, 4096, &opts(), &mut |_, _| {}).unwrap();
+        let disk = std::fs::read(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert!(disk[..440].iter().all(|&x| x == 0));
+        let core_at = biosboot::CORE_LBA as usize * 512;
+        assert!(disk[core_at..core_at + 4096].iter().all(|&x| x == 0));
+    }
+
+    /// The stage is checked before anything is touched.
+    #[test]
+    fn a_corrupt_bios_stage_writes_nothing() {
+        let (mut b, _, _) = bios_build();
+        let mut m = Medium::open(Cursor::new(b.iso.clone()), &b.keys).unwrap();
+        let e = m.files["BIOSBOOT.IMG"];
+        b.iso[e.offset as usize + 600] ^= 0xFF;
+        m.dev = Cursor::new(b.iso.clone());
+        let (f, p) = target(16 * MIB, 0xA5);
+        let err = install(&mut m, &f, 16 * MIB, 512, &opts(), &mut |_, _| {}).unwrap_err();
+        assert!(err.contains("signed hash"), "{err}");
+        let disk = std::fs::read(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert!(disk.iter().all(|&x| x == 0xA5), "disk untouched");
+    }
+
+    /// A parameter GRUB cannot pass stops the install before it starts.
+    #[test]
+    fn a_hostile_command_line_writes_nothing() {
+        let (b, _, _) = bios_build();
+        let mut m = Medium::open(Cursor::new(b.iso.clone()), &b.keys).unwrap();
+        let (f, p) = target(16 * MIB, 0xA5);
+        let o = Opts {
+            bios_cmdline: Some("a='; reboot; '".into()),
+            ..opts()
+        };
+        assert!(install(&mut m, &f, 16 * MIB, 512, &o, &mut |_, _| {}).is_err());
+        let disk = std::fs::read(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert!(disk.iter().all(|&x| x == 0xA5), "disk untouched");
+    }
+
+    #[test]
+    fn index_refuses_a_stage_that_does_not_fit() {
+        let (b, _, _) = bios_build();
+        let m = Medium::open(Cursor::new(b.iso.clone()), &b.keys).unwrap();
+        let mut i = m.index.clone();
+        i.files.get_mut("BIOSBOOT.IMG").unwrap().size = 2 << 20;
+        assert!(i.check().is_err());
+        let mut i = m.index.clone();
+        i.bios.as_mut().unwrap().slot_a_cfg = u64::MAX;
+        assert!(i.check().is_err());
+        let mut i = m.index.clone();
+        i.bios.as_mut().unwrap().file = "NOPE".into();
+        assert!(i.check().is_err());
+    }
+
+    #[test]
+    fn config_takes_the_rest_of_a_big_disk() {
+        let b = build(|_| {});
+        let mut m = Medium::open(Cursor::new(b.iso.clone()), &b.keys).unwrap();
+        let p = std::env::temp_dir().join(format!("cr-install-big-{}", std::process::id()));
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&p)
+            .unwrap();
+        let len = 300 * MIB;
+        f.set_len(len).unwrap(); // sparse
+        install(&mut m, &f, len, 512, &opts(), &mut |_, _| {}).unwrap();
+        let parts = gpt::read(&mut &f, 512).unwrap();
+        let cfg = parts.iter().find(|p| p.name == "config").unwrap();
+        assert_eq!(cfg.last_lba, gpt::aligned_last(len / 512, 512));
+        assert!(cfg.size_lba() * 512 >= gpt::CONFIG_MIN);
+        let want = gpt::read(&mut Cursor::new(&b.disk), 512).unwrap();
+        for (a, w) in parts.iter().zip(&want).filter(|(a, _)| a.name != "config") {
+            // G1.6zm: the ESP has a GUID of its own on every installed disk.
+            let w = &gpt::Entry {
+                guid: a.guid.clone(),
+                ..w.clone()
+            };
+            assert_eq!(a, w, "only config moves");
+        }
+        // Reinstall keeping the configuration: the grown partition is kept.
+        assert_eq!(
+            existing(&mut &f, 512, &m.index),
+            Existing::CoreRouter {
+                config_keepable: true
+            }
+        );
+        let r = install(
+            &mut m,
+            &f,
+            len,
+            512,
+            &Opts {
+                keep_config: true,
+                ..opts()
+            },
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert!(r.kept_config);
+        // G1.6zm: the same layout; the ESP's GUID is new with each install.
+        let no_esp_guid = |v: Vec<gpt::Entry>| -> Vec<gpt::Entry> {
+            v.into_iter()
+                .map(|e| {
+                    if e.name == "efi" {
+                        gpt::Entry {
+                            guid: String::new(),
+                            ..e
+                        }
+                    } else {
+                        e
+                    }
+                })
+                .collect()
+        };
+        let again = gpt::read(&mut &f, 512).unwrap();
+        assert_ne!(again[0].guid, parts[0].guid, "a new ESP GUID");
+        assert_eq!(no_esp_guid(again), no_esp_guid(parts));
+        // A disk that leaves /config under the minimum keeps the image's.
+        let (g, q) = target(16 * MIB, 0);
+        install(&mut m, &g, 16 * MIB, 512, &opts(), &mut |_, _| {}).unwrap();
+        assert_eq!(
+            no_esp_guid(gpt::read(&mut &g, 512).unwrap()),
+            no_esp_guid(want)
+        );
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&q);
+    }
+
+    #[test]
+    fn small_disk_and_bad_media_are_refused_before_writing() {
+        let b = build(|_| {});
+        let mut m = Medium::open(Cursor::new(b.iso.clone()), &b.keys).unwrap();
+        let (f, p) = target(6 * MIB, 0x22);
+        let e = install(&mut m, &f, 6 * MIB, 512, &opts(), &mut |_, _| {}).unwrap_err();
+        assert!(e.contains("needs 7 MiB"), "{e}");
+        let mut first = [0u8; 4];
+        f.read_exact_at(&mut first, 0).unwrap();
+        assert_eq!(first, [0x22; 4]);
+        let _ = std::fs::remove_file(&p);
+        // Untrusted key.
+        let other = vec![
+            Key::from_hex(&package::public_hex(&package::generate_key().unwrap()).unwrap())
+                .unwrap(),
+        ];
+        assert!(
+            Medium::open(Cursor::new(b.iso.clone()), &other)
+                .err()
+                .unwrap()
+                .contains("does not trust")
+        );
+        // A changed index (its signature no longer matches).
+        let t = build(|f| {
+            let i = f.iter_mut().find(|(n, _)| n == INDEX).unwrap();
+            let at = i.1.iter().position(|&c| c == b'0').unwrap();
+            i.1[at] = b'1';
+        });
+        assert!(
+            Medium::open(Cursor::new(t.iso), &t.keys)
+                .err()
+                .unwrap()
+                .contains("bad signature")
+        );
+        assert!(Medium::open(Cursor::new(vec![0u8; 100_000]), &b.keys).is_err());
+    }
+
+    #[test]
+    fn a_corrupt_payload_is_caught_and_no_table_is_written() {
+        // A flipped byte in the ESP image on the medium (index still signed).
+        let b = build(|f| {
+            let e = f.iter_mut().find(|(n, _)| n == "ESP.IMG").unwrap();
+            e.1[100] ^= 1;
+        });
+        let mut m = Medium::open(Cursor::new(b.iso), &b.keys).unwrap();
+        let (f, p) = target(16 * MIB, 0);
+        let e = install(&mut m, &f, 16 * MIB, 512, &opts(), &mut |_, _| {}).unwrap_err();
+        assert!(e.contains("does not match its signed hash"), "{e}");
+        let mut t = &f;
+        assert!(gpt::read(&mut t, 512).is_err(), "no partition table");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_rootfs_extent_is_the_signed_rootfs() {
+        let b = build(|_| {});
+        let m = Medium::open(Cursor::new(b.iso.clone()), &b.keys).unwrap();
+        let e = m.rootfs_extent().unwrap();
+        let (at, size) = (e.offset as usize, e.size as usize);
+        assert_eq!(&b.iso[at..at + size], &b.rootfs[..]);
+    }
+
+    #[test]
+    fn trim_keeps_up_to_the_last_used_block() {
+        assert_eq!(trim(&[0u8; 10000]).len(), 0);
+        let mut d = vec![0u8; 10000];
+        d[4096] = 1;
+        assert_eq!(trim(&d).len(), 8192);
+        d[9999] = 1;
+        assert_eq!(trim(&d).len(), 10000);
+    }
+
+    /// G1.6y: reproduced with `mkfs.btrfs`: zero first 64 KiB, magic right
+    /// after. "Empty" lets a disk be erased by typing its name.
+    #[test]
+    fn only_a_disk_blank_at_every_look_is_empty() {
+        let b = build(|_| {});
+        let m = Medium::open(Cursor::new(b.iso.clone()), &b.keys).unwrap();
+        let size = 64usize << 20;
+        let look = |d: &[u8]| existing(&mut Cursor::new(d), 512, &m.index);
+        assert_eq!(look(&vec![0; size]), Existing::Empty);
+        for (what, at) in [
+            ("btrfs magic at 64 KiB + 64", (64 << 10) + 64),
+            ("the end of the first MiB", (1 << 20) - 1),
+            ("a backup GPT on the last sector", size - 512),
+            ("a sample in the middle", size / 65 * 32 + 10),
+        ] {
+            let mut d = vec![0; size];
+            d[at] = 1;
+            assert_eq!(look(&d), Existing::Unknown, "{what}");
+        }
+        assert_eq!(
+            look(&[]),
+            Existing::Unknown,
+            "a disk of no size is not empty"
+        );
+    }
+}

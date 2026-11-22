@@ -1,0 +1,452 @@
+# CoreRouter — histórico da lista de gaps
+
+Gerado pela fila de entrada: a linha `history:` do `docs/changes/<id>.md` de cada PR entra aqui,
+no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.**
+
+- 2026-10-21 — lista inicial.
+- 2026-10-21 — G0.2 feito: `.github/workflows/ci.yml` (ainda não rodou no GitHub; sem push).
+- 2026-10-21 — G1.1 feito (VLAN, bridge, loopback, `interface.remove`); bonding separado em G1.8.
+- 2026-10-21 — G0.6 feito (persistência: `running.json` + `.prev`, escrita atômica, quarentena).
+- 2026-10-21 — G1.2 feito (rtnetlink: plano puro + executor com rollback, testes em netns); notas novas em G1.3 e G1.7.
+- 2026-10-21 — G1.9 (tabelas estilo WinBox) adicionado e feito.
+- 2026-10-21 — G0.4 feito (GUI cliente do daemon, nativo e web; WebSocket com Origin; `--web-root`).
+- 2026-10-21 — G5 adicionado: descoberta de vizinhos (CRDP), LLDP + MNDP passivo e gerência em malha.
+- 2026-10-21 — G1.10 (comentários inline) e G1.11 (tema claro/escuro) adicionados e feitos.
+- 2026-10-21 — G5.2 Parte 1 feita (proto-lldp, proto-mndp só decodificação, LLDP/MNDP no `hal-linux`); integração com a tabela do G5.1 pendente.
+- 2026-10-21 — G1.12 (maximizar/restaurar janelas internas) adicionado e feito.
+- 2026-10-21 — G1.5 feito (rotas estáticas IPv4/IPv6, VRF básico, janela Routes).
+- 2026-10-21 — G1.13 (VRF pela GUI) adicionado e feito.
+- 2026-10-22 — G1.14 (kernel sem VRF: `Hal::features`, `ip.vrf.add` desabilitado com o motivo, CI carrega o módulo `vrf`) adicionado e feito; nota de `CONFIG_NET_VRF=y` em G1.6.
+- 2026-10-22 — G1.4 feito (Safe Mode: comandos `config.safe-mode.*`, dono por conexão, timeout, sem salvar até confirmar).
+- 2026-10-22 — G5.1 feito (CRDP, tabela de vizinhos, tela de conexão); G5.2 Parte 2 pode usar `Session::record_neighbor`.
+- 2026-10-22 — G1.15 (teclado nos diálogos e janelas internas) adicionado e feito.
+- 2026-10-22 — G1.16 (ações indisponíveis cinza com o motivo: comando ausente num daemon antigo, desabilitado pelo engine ou link fora) adicionado e feito.
+- 2026-10-22 — G5.2 feito (Parte 2: LLDP/MNDP ligados à tabela de vizinhos no daemon).
+- 2026-10-22 — G5.4 (CRDP do lab virtual pelo loopback, `ether1` ligada por padrão no lab) adicionado e feito.
+- 2026-10-22 — G1.17 (cores dos comentários: azul no ativo, cinza no desativado, inline e coluna) adicionado e feito.
+- 2026-10-22 — G5.5 (despedida da descoberta no encerramento do daemon por SIGINT/SIGTERM) adicionado e feito.
+- 2026-10-22 — G1.18 (descoberta via netlink e posse dos links no `hal-linux`) adicionado e feito; G1.7 feito junto; nota nova em G1.3.
+- 2026-10-22 — G0.8 feito (terminal RouterOS na GUI e na CLI, export/import); SSH pendente do G0.3.
+- 2026-10-22 — G0.3 feito (autenticação, usuários/grupos e TLS no canal de controle e no WebSocket).
+- 2026-10-22 — G6 adicionado (ferramentas de diagnóstico); G6.1 (tarefas) e G6.2 (ping, vários destinos, MTU) feitos; G6.3 (MTR) e G6.4 abertos.
+- 2026-10-22 — G2.1 dividido em G2.1a/b/c; G2.1a (firewall base) feito.
+- 2026-10-22 — G6.3 (MTR) feito.
+- 2026-10-22 — G6.5 (ferramentas no terminal como no RouterOS) adicionado e feito.
+- 2026-10-22 — G0.3b (primeiro acesso sem senha, estilo RouterOS 7) adicionado e feito.
+- 2026-10-22 — G0.3c (tela de conexão: `admin` por padrão, token→senha em loopback, roteador antigo) adicionado e feito.
+- 2026-10-22 — G1.19 (abas do diálogo de interface, só leitura) adicionado e feito; G1.20 (Ethernet configurável, SFP/DOM, teste de cabo) adicionado.
+- 2026-10-22 — G4.7 (cliente DHCP: a DHCPv4, b DHCPv6+PD+RA, c resiliência) adicionado; G4.7a em andamento.
+- 2026-10-22 — G4.7a feito (cliente DHCPv4 estilo RouterOS com opções recebidas, rotas 121 com VRF, servidores permitidos e histórico).
+- 2026-10-22 — G0.9 (infraestrutura de benchmarks) adicionado; AGENTS.md ganha RFC original na pesquisa e a regra de desempenho (Rust puro × externo com dados).
+- 2026-10-22 — G4.7b feito (cliente DHCPv6 com endereço e prefixo delegado, pools `from_pool`, `ipv6.settings` de RA com padrão `auto` e limpeza do aprendido).
+- 2026-10-22 — G1.20 feito.
+- 2026-10-22 — G0.9 feito (`cargo xtask bench`, 31 benchmarks, `bench-check` no CI, `docs/perf.md` com números medidos).
+- 2026-10-22 — G2.1b (firewall: lockout, sombras, defaults, modelos, zonas, descrição) feito.
+- 2026-10-22 — G1.21 (hierarquia das janelas internas: trazer à frente, filho sobre o pai, fechar junto, Ctrl+Tab) adicionado e feito.
+- 2026-10-22 — processo: arquivos de mudança por PR (`docs/changes/`) e fila de entrada; o status das gaps passa a vir do fold
+- 2026-10-22 — G0.7 parcial (resources, prompts, completions); resto vira G0.7b
+- 2026-10-22 — G1.3 parte 1 feita (drift de links, endereços e rotas: listar e reconciliar); criados G1.3b e G1.3c
+- 2026-10-22 — G4.4 dividido: `/metrics` feito; G4.4b (exportador de fluxos) e G4.4c (`/metrics` como serviço configurável) criados
+- 2026-10-22 — G4.7c feito (resiliência do cliente DHCP); G4.7d criado (sobras: DNAv4, eco do client-id, bfd, carrier)
+- 2026-10-22 — G1.8 feito (bonding 802.3ad/active-backup e demais modos); G1.8b, G1.8c e G1.8d abertos
+- 2026-10-22 — G4.6 parte 1 feita (cliente SNTP e syslog remoto); criados G4.6b (acertar o relógio), G4.6c (servidor NTP), G4.6d (log do sistema e mais alvos), G4.6e (janelas da GUI)
+- 2026-10-22 — G0.5 feito (fuzzing do arquivo de config, do canal de controle e do MCP); G0.5b criado (fuzz dos codecs e rodada periódica)
+- 2026-10-22 — G0.5c feito (MCP recusa lotes JSON-RPC, revisão 2025-06-18)
+- 2026-10-22 — G0.8b criado e feito (terminal: linha comprida quebra na largura; `/export` com ` \` e `terse`)
+- 2026-10-22 — G1.8d feito (parâmetros do bond sem recriar); G1.8e criado (`lacp_rate` sem recriar)
+- 2026-10-22 — G4.1 dividido em G4.1a (feito: resolvedor do roteador), G4.1b (encaminhador para a LAN), G4.1c (servidor estilo BIND) e G4.1d (GUI, `:resolve`, DoH/DoT, VRF); decisão: DNS inteiro em Hickory DNS
+- 2026-10-22 — G4.1b parte 1 feita (base do encaminhador da LAN); criados G4.1e (Statistics), G4.1f (DNSSEC no encaminhador) e G4.1g (benchmark contra Unbound/dnsmasq)
+- 2026-10-22 — G4.4c em partes (serviço `/metrics` configurável); criados G4.4d (vrf, token/TLS) e G4.4e (métricas de protocolos e escala do scrape)
+- 2026-10-22 — G4.6d parte 1 feita (log do sistema em memória, `log.print`, janela Log); criadas G4.6g (log em disco) e G4.6h (`/log print` no terminal)
+- 2026-10-22 — G4.6e feito (GUI de NTP Client e Logging)
+- 2026-10-22 — G6.3b criado e feito (MTR/traceroute: nomes, ASN, privado/CGNAT e rótulos MPLS); G6.3c criado (ASN pela tabela BGP e zonas locais da RFC 6303)
+- 2026-10-22 — G6.3d criado e feito (acabamento visual da janela MTR)
+- 2026-10-22 — G0.10 criado e feito (supervisor de serviços do daemon e janela System › Services)
+- 2026-10-22 — G4.1c em partes: zonas autoritativas feitas (G4.1c-1); criados G4.1k (servir zonas para a internet) e G4.1l (secundária em disco, NOTIFY aos NS, mais tipos)
+- 2026-10-22 — G4.1d em partes: adlist feita (G4.1d-1)
+- 2026-10-22 — G4.1d em partes: forwarders e DoT/DoH feitos (G4.1d-2)
+- 2026-10-22 — G4.1d feito (adlist, forwarders, DoT/DoH, :resolve, cache de falhas)
+- 2026-10-22 — G4.1e feito (estatísticas do encaminhador DNS); criado G4.1h (mais estatísticas: latência, top nomes, /metrics)
+- 2026-10-22 — G6.6 criado (DNS Lookup, a ferramenta estilo dig; tela aprovada pelo usuário)
+- 2026-10-22 — G4.1c: assinatura DNSSEC das zonas feita (G4.1c-2); criado G4.1m (DNSSEC: CDS/CDNSKEY, checkds, rotação por idade e de algoritmo)
+- 2026-10-22 — G4.1c feito (atualização dinâmica RFC 2136 + TSIG, G4.1c-3); criado G4.1n (DNS dinâmico: DHCID, update-policy, TSIG em transferências); G4.2 ganhou o DHCP → DNS no critério
+- 2026-10-22 — G4.2 dividido em G4.2a (servidor DHCPv4), G4.2b (relay + opção 82 + histórico), G4.2c (DHCPv6 + PD); G4.2a feito; criado G4.2d (DHCP em alta disponibilidade)
+- 2026-10-22 — G4.2b feito (relay, opção 82, histórico); criado G4.2e (sonda ICMP para relays e limite por remote id)
+- 2026-10-22 — G4.2c feito (servidor DHCPv6 com IA_NA, IA_PD e relay v6); criado G4.2f (DHCPv6: reconfigure, opções, estatísticas)
+- 2026-10-22 — G6.6 feito (DNS Lookup estilo dig em Tools)
+- 2026-10-22 — G0.14 feito (validação do firewall linear no commit, auditoria)
+- 2026-10-22 — G1.23 feito (histórico em arquivos de revisão, pelo audit-perf)
+- 2026-10-23 — G0.15 criado e feito (idioma dos rótulos e das explicações, separados); G0.15b criado (traduzir os rótulos existentes)
+- 2026-10-23 — G0.16 feito (comando sem cópia da config inteira; critério refeito com o medido)
+- 2026-10-23 — G1.26a–f criados (System › Tuning, pedido do usuário); G1.26a feito (Resumo, Kernel e Perfis)
+- 2026-10-23 — G0.20 criado (histórico em memória como diferenças: boot e RAM com config grande)
+- 2026-10-23 — G1.26b feito (Tuning › Interfaces); G1.26g criado (RSS)
+- 2026-10-23 — G1.26c feito (Tuning › CPU e IRQ); G0.15c criado (glifos que a fonte não tem)
+- 2026-10-23 — G0.20 resolvido por audit-history-share (revisões restauradas dividem as seções CowArc; boot de 64 revisões de 10 MiB em 208 ms, RAM igual à de antes)
+- 2026-10-23 — G0.23a, G0.23b e G0.23c criados (menu lateral da GUI, pedido do usuário); G0.23a feito
+- 2026-10-23 — G0.23b feito (busca rápida, paleta, recentes, favoritos e teclado do menu)
+- 2026-10-23 — G0.23c feito (abas no lugar de itens do menu e selos de estado)
+- 2026-10-23 — G1.26d feito (Tuning › Boot, sem a imagem A/B); G1.26h criado (aplicar na imagem)
+- 2026-10-23 — G1.27 criada (IP › Routes melhorada, pedido do usuário) em três partes; G1.27a feito; G1.27d e G1.27e criadas
+- 2026-10-23 — G1.27b feito (detalhe da rota selecionada); G1.27f criada
+- 2026-10-23 — G2.3 redefinido e dividido em G2.3a–e; G2.2 e G2.4 com critério detalhado; G6.9 e G2.7 criados; G2.3a feito (núcleo do CGNAT)
+- 2026-10-23 — G2.3b feito (CGNAT por nfnetlink); G2.8 criado
+- 2026-10-23 — G6.8 criado (análise no Tools › DNS Lookup: Why this answer, Ask as, Watch, Upstreams, Check hijack); parte 1 em `stream/G6.8a-dns-why-ask-as`
+- 2026-10-23 — G0.24 feito (componentes do padrão de janela de lista)
+- 2026-10-23 — G1.27c feito (escala da janela IP › Routes para a tabela cheia)
+- 2026-10-23 — G2.2 feito (Connections por ctnetlink)
+- 2026-10-23 — G2.3c feito (PBA e alertas de portas)
+- 2026-10-23 — G2.3d feito (janela CGNAT)
+- 2026-10-23 — G4.4b em partes (comandos e serviço do Traffic Flow)
+- 2026-10-23 — G6.8 feito (análise no Tools › DNS Lookup)
+- 2026-10-23 — G0.25 criado e feito (identidade do assinante: selo com o nome ao lado do IP)
+- 2026-10-23 — G2.3e feito; testes em servidor real viraram G2.3f
+- 2026-10-23 — G2.4 feito em software e com detecção; teste em hardware real virou G2.4b, exclusões por regra G2.4c
+- 2026-10-23 — G2.5a–d criados (G2.5 em partes); G2.5a feito (base XDP e filtro anti-DDoS)
+- 2026-10-23 — G2.5b iniciado (fórmula do CGNAT determinístico extraída para `corerouter-cgnat-map`)
+- 2026-10-23 — G4.4b feito (Traffic Flow: exportador e janela)
+- 2026-10-23 — G4.5 feito (histórico de tráfego, janela Graphs, alertas de banda)
+- 2026-10-23 — G4.5 redefinida (histórico local estilo RRD no daemon + janela Graphs; ClickHouse externo no G4.4f)
+- 2026-10-23 — G6.4b feito: Bandwidth Test (cliente e servidor iperf3)
+- 2026-10-23 — G6.4 redefinido (bandwidth-test pelo protocolo do iperf3, traceroute como modo do MTR) e em andamento: Torch e Packet Sniffer
+- 2026-10-23 — G6.4 feito: traceroute de uma passada, sondas UDP/TCP e Paris (G6.4c)
+- 2026-10-23 — G6.9 feito (IP Calculator)
+- 2026-10-23 — G1.28 feito (IP › Addresses, referência do padrão de lista)
+- 2026-10-23 — G2.5b: crates do XDP passam a GPL-2.0-or-later (decisão de licença do usuário)
+- 2026-10-23 — G2.5b: reescrita NAT com checksum incremental (RFC 1624) no dataplane-ebpf-common
+- 2026-10-23 — G4.4f criado e feito (exportador para ClickHouse externo); G4.4g e G4.4h criados
+- 2026-10-24 — G2.5b feito (caminho rápido do CGNAT em XDP, offload guiado pelo conntrack, escolha do usuário)
+- 2026-10-24 — G4.3b criado e feito (RADIUS em Rust puro para o BNG, escolha do usuário em 2026-10-24)
+- 2026-10-24 — G4.3a criado e feito (PPPoE/PPP em Rust puro para o BNG, escolha do usuário em 2026-10-24); G4.3d–G4.3i criados
+- 2026-10-24 — G4.3c criado e feito (plano de dados PPPoE em XDP, Rust puro, escolha do usuário em 2026-10-24)
+- 2026-10-24 — G4.3j criado (RADIUS como serviço do sistema: `/radius`, `/radius incoming`, `/radius monitor`, `/ppp aaa`, serviço AAA no daemon e janela RADIUS)
+- 2026-10-24 — G4.3j feito (RADIUS como serviço do sistema)
+- 2026-10-24 — G4.3d em andamento (modelo e comandos PPP; serviço, janela e extras em PRs empilhados)
+- 2026-10-24 — G4.8, G4.8a, G4.8b criados (System › Resources e saúde; log do sistema operacional); G4.8c–G4.8e registrados
+- 2026-10-24 — G4.8a feito (System › Resources e saúde do roteador)
+- 2026-10-24 — G4.8b feito (log do sistema operacional); G4.8ba–G4.8bd registrados
+- 2026-10-25 — G0.26 criado e feito (laboratório em VM com root para agentes)
+- 2026-10-25 — G4.3d: serviço `pppoe` no daemon (BNG em Rust puro, XDP ou caminho lento, RADIUS, CoA/DM)
+- 2026-10-25 — G4.3d: janela PPP (abas do WinBox, Why?, "derruba N sessões")
+- 2026-10-25 — G4.3d feito (BNG: comandos, serviço pppoe, janela PPP e extras)
+- 2026-10-25 — G4.3e feito (BNG dual-stack: IPv6CP, RA, DHCPv6-PD, RADIUS e XDP)
+- 2026-10-25 — G4.3f: IPoE parte 1 (servidor DHCP que autoriza cada cliente, `use_radius`, `ipoe`, `/ppp secret service=ipoe`)
+- 2026-10-25 — G4.3f feito (IPoE: DHCP + opção 82 como sessão, RADIUS, XDP, janela PPP)
+- 2026-10-25 — G4.3g feito em parte (laboratório em massa, BNG em vários núcleos, onda pela capacidade do RADIUS, relatório docs/pppoe-relatorio.md)
+- 2026-10-26 — G4.3h em andamento (crate proto-ha, desenho e pesquisa)
+- 2026-10-26 — G4.3h: modelo e comandos ppp.redundancy
+- 2026-10-26 — G4.3h: serviço ppp-ha no daemon
+- 2026-10-26 — G4.3k parte 1 (tabela de Service-Names: modelo, comandos, AC, perfil por nome)
+- 2026-10-26 — G4.3k feito (vários Service-Names por porta)
+- 2026-10-26 — G4.9 criado (filas genéricas por alvo, decisão do usuário em 2026-10-26) com G4.9a–e; G4.9a feito (modelo e comandos)
+- 2026-10-26 — G4.3ca feito (entrega pelo kernel ao assinante PPPoE por `bng0`, shaping EDT)
+- 2026-10-26 — G4.3cc feito (policer sem corrida entre CPUs: GCRA + cmpxchg)
+- 2026-10-26 — G4.3h: proto-pppoe exporta e importa sessões (hot standby)
+- 2026-10-26 — G4.3h: registro da sessão para a tomada
+- 2026-10-26 — G4.3h: aba PPP › Redundancy
+- 2026-10-26 — G4.9b feito (plano de dados das filas: EDT, policer GCRA, PCQ); G4.9f criado (GSO no shaper)
+- 2026-10-26 — G0.21, G0.22 e G4.3gb em andamento (benchmarks antes da lista em blocos e do commit incremental)
+- 2026-10-26 — G0.21 feito (listas grandes da config em blocos copy-on-write, índices incrementais)
+- 2026-10-26 — G0.21: `queue.simple` também em blocos copy-on-write (pedido da G4.9)
+- 2026-10-26 — G0.22 em andamento (validação incremental com tabela de dependências verificada)
+- 2026-10-26 — G0.22 feito (commit incremental: validação por tabela de dependências, plano do data plane e journal da config)
+- 2026-10-26 — G4.3cd feito (rotas por assinante e uplink com VLAN)
+- 2026-10-26 — G4.3gb feito (secrets em blocos copy-on-write, índices incrementais, commit incremental e journal da config)
+- 2026-10-26 — G4.3h: fases 1 e 2 no serviço pppoe (stateless e hot standby)
+- 2026-10-26 — G4.3h: feito — laboratório ha com dois daemons e BNG Blaster (1000, 10 000 e 100 000 sessões, caminho lento e XDP)
+- 2026-10-26 — G4.3l parte 1 (QinQ e VLAN simples no caminho lento, limite por VLAN, TR-101 ao RADIUS, RFC 4638)
+- 2026-10-26 — G4.3l parte 2 (IPv6 encaminhado no caminho lento do PPPoE)
+- 2026-10-26 — G4.9b corrigido (descida de sessão moldada sem limite no BNG com XDP)
+- 2026-10-26 — G4.9c feito (janela Queues e campos PPP)
+- 2026-10-26 — G4.9d feito (laboratório em massa das filas)
+- 2026-10-26 — G0.21: índice do IPoE segue a config por bloco (sobra da G4.3gb)
+- 2026-10-26 — G0.21: `queue.simple` com índice de nomes e alvos e serviço `queue` sem replanejar à toa (sobra da G4.3gb)
+- 2026-10-26 — G0.22: prefixos do filtro XDP seguidos por mudança (sobra da G4.3gb)
+- 2026-10-26 — G0.27 feito (checkpoint da config no desligamento do daemon)
+- 2026-10-26 — G4.3l feito (QinQ e IPv6 sem XDP)
+- 2026-10-26 — G4.3n feito (migrar secrets PPP com senha do MikroTik; senhas cifradas em repouso)
+- 2026-10-26 — G4.3ha feito (Class do RADIUS na contabilização e na tomada do par)
+- 2026-10-26 — G4.9g criado e feito (janela "Queue <nome>": Traffic, Statistics, History; queue.simple.stats; histórico por fila opt-in)
+- 2026-10-26 — G4.10 criado (avisos ao assinante: página de bloqueio e de aviso pela detecção de portal do sistema, aprovado em 2026-10-26), com as partes G4.10a–f; G4.10a feito
+- 2026-10-26 — G4.3hb feito (CoA/DM depois de uma tomada do par); G4.3hg criada (endereço de CoA flutuante)
+- 2026-10-27 — G4.10b feito (plano de dados dos avisos ao assinante)
+- 2026-10-27 — G4.10c feito (serviço do portal dos avisos ao assinante)
+- 2026-10-27 — G4.10d feito (janela Subscriber Notices)
+- 2026-10-27 — G4.10e feito (laboratório dos avisos ao assinante); G4.10 em partes (faltam G4.10f–h)
+- 2026-10-27 — G4.3hd feito (IPoE no par em hot standby); G4.3fb criada (IPoE em escala com o BNG Blaster)
+- 2026-10-27 — G2.1c redefinido: inclui a tabela `/ip firewall raw` (aprovado pelo usuário), em dois PRs
+- 2026-10-27 — G2.7 feito (CGNAT avisa o assinante quando as portas acabam)
+- 2026-10-27 — G3.1 feito (hal-frr: FRR pelo socket vty, só a diferença, rollback)
+- 2026-10-27 — G1.6 dividido em G1.6a (imagem que boota), G1.6b (A/B e atualização segura) e G1.6c (instalador e imagens de VM); G1.6a feito; G1.6d nova (configuração padrão de primeiro boot)
+- 2026-10-27 — G2.1c feito (diagnóstico do firewall + tabela raw)
+- 2026-10-27 — G2.7 ganhou a aba Capacity (G2.7b) no mesmo trabalho, a pedido do usuário
+- 2026-10-27 — G1.26h feito (parâmetros de boot no slot inativo, com volta automática)
+- 2026-10-27 — G1.6b feito (imagem A/B, pacote assinado, dm-verity, atualização com teste de boot e volta automática)
+- 2026-10-27 — G2.8 feito (firewall por nfnetlink)
+- 2026-10-27 — G3.2 dividido em G3.2a (BGP base), G3.2b (políticas) e G3.2c (RPKI e "Por que essa rota?"); G3.2a feito
+- 2026-10-27 — G1.27d em andamento (parte a: leitura, eventos e comandos)
+- 2026-10-27 — G4.4j feito, redefinido para incluir o log de NAT do CGNAT (RFC 8158) e a aba Logging; G4.4k (DTLS) e G4.4l (identidade nas sessões, VRF) criados
+- 2026-10-27 — G1.27d parte b (janela IP › ARP)
+- 2026-10-27 — G1.27d parte c (add-arp do servidor DHCP)
+- 2026-10-27 — G1.27d feito (fabricante pelo OUI; o usuário decidiu embutir a lista do IEEE e permitir atualização)
+- 2026-10-27 — G1.6c feito (instalador ISO/USB, imagens de VM, FRR na imagem); abertas G1.6g (BIOS legado), G1.6h (cloud-init NoCloud), G1.6i (só os daemons FRR configurados), G1.6j (linux-firmware)
+- 2026-10-27 — G3.2c feito (RPKI, "Por que essa rota?", rotas por conexão); G3.3 coberto pela G3.2a e pela G3.2c
+- 2026-10-27 — G3.3 feito (coberto pela G3.2a e pela G3.2c)
+- 2026-10-27 — G3.2b feito (políticas BGP: /routing filter, prévia, impacto no commit, RFC 8212); G3.2g e G3.2h criados
+- 2026-10-27 — G3.4 parcial (configuração OSPF e render para o FRR)
+- 2026-10-27 — G4.3ce parcial (parte OSPF, com a G3.4)
+- 2026-10-27 — G3.4 parcial (estado OSPF, topologia e Diagnose)
+- 2026-10-27 — G3.6 redefinido: BFD próprio em Rust puro (não o bfdd), em três partes (G3.6a motor, G3.6b FRR e clientes, G3.6c janela)
+- 2026-10-27 — G3.4 feito (janela OSPF; teste no FRR real pendente da VM)
+- 2026-10-27 — G3.7 em partes (motor do simulador e comandos `tool.netsim.*`); criadas G3.7b, G3.7c, G3.7d
+- 2026-10-27 — G3.7b feito (janela do simulador de rede)
+- 2026-10-27 — G3.5 parcial (MPLS no kernel, LDP pelo FRR, janelas)
+- 2026-10-27 — G3.6 feito em três PRs (G3.6a motor, G3.6b FRR e clientes, G3.6c janela)
+- 2026-10-27 — G3.7d redefinida (OSPF e BFD do modelo) e feita; criada G3.7e (IPv6, refletor de rotas)
+- 2026-10-28 — G1.27f feito (check-gateway em rotas estáticas, com BFD da G3.6g)
+- 2026-10-28 — G3.5b feito (LSP ping e traceroute MPLS)
+- 2026-10-28 — G3.6g feito (rotas estáticas com check_gateway=bfd)
+- 2026-10-28 — G0.26b criado e feito (travas da VM do laboratório: sem vazamento, espera com prazo, `unlock`)
+- 2026-10-28 — G3.2c feito (teste com FRR real na VM do laboratório)
+- 2026-10-28 — G3.4 feito (teste com FRR real na VM do laboratório)
+- 2026-10-28 — G3.5 feito (dois `ldpd` reais sobre OSPF na VM, ping pelo LSP, lote × um a um medido)
+- 2026-10-28 — G3.6i feito (BFD contra o `bfdd` real na VM); criadas G3.6j (lote de syscalls) e G3.6k (Down logo depois do Up)
+- 2026-10-28 — G3.7c feito (fidelidade do simulador com o FRR real; multipath BGP como o FRR)
+- 2026-10-28 — G3.6h feito (BFD no par do BNG: tomada em ~150 ms em vez de 1,2 s)
+- 2026-10-28 — G3.4f feito (Segment Routing MPLS no OSPF); G3.4i e G3.4j criadas
+- 2026-10-28 — G3.4d feito (TI-LFA e aba Fast Reroute); G3.4k e G3.4l criadas
+- 2026-10-28 — G3.4i feita (loopback `lo` = `lo` do kernel, para o prefix SID)
+- 2026-10-28 — G4.3hh feito (adoção em lote na tomada do par); G4.3hi e G4.3hj abertos
+- 2026-10-28 — G1.6k criado e feito (FRR 10.7.1 na imagem); G1.6l, G3.6l e G3.6m abertos
+- 2026-10-28 — G3.6l feito (na G3.9)
+- 2026-10-28 — G3.6m feito (na G3.9)
+- 2026-10-28 — G3.9 criada e feita (interoperabilidade com RouterOS v7 e roteiro de produção do core)
+- 2026-10-28 — G1.27h criado e feito (rota do DHCP escondida pela estática de mesma distância)
+- 2026-10-28 — G4.6i feito (roteador novo nasce sem aviso de NTP)
+- 2026-10-28 — G1.6m criado e feito (primeiro boot de verdade numa VM: assistente, nomes de porta, interfaces do kernel, shell, NVRAM herdada); relacionado à G1.6d, que segue aberta
+- 2026-10-28 — G0.3d criado (pedido do usuário depois do teste na VM: senha vazia pela rede como no CHR e certificado trocado com escolha estilo PuTTY); parte a feita, muda o comportamento da G0.3b
+- 2026-10-28 — G0.28 criado e feito (pacote .deb da GUI + CLI, link corerouter://); G0.28b–d criados (AppImage, Windows, macOS)
+- 2026-10-28 — G0.3d feito (parte b: certificado trocado estilo PuTTY na GUI, `--accept-new-cert` na CLI/MCP)
+- 2026-10-28 — G1.27j criado e feito (rota do DHCP com distância 254 e aviso de ECMP)
+- 2026-10-28 — G1.6e em andamento (envio do pacote pela rede e ciclo rápido de teste da imagem)
+- 2026-10-28 — G1.6o criado e feito (acesso web de fábrica, estilo WebFig); G1.6p criado (janela IP › Services)
+- 2026-10-29 — G0.3e criado e feito (senha salva visível na tela de conexão; defeito achado ao reinstalar a VM)
+- 2026-10-29 — G0.29 criado: portão local só do afetado e 2 vagas de CI na máquina; sccache medido sem ganho entre worktrees (G0.29b)
+- 2026-10-29 — G0.29 feito (portão local só do afetado, 2 vagas de CI, testes de integração num executável por crate)
+- 2026-10-29 — G0.30 criado (orçamento de testes: o tempo do portão não cresce com o número de testes)
+- 2026-10-29 — G0.30 feito (orçamento de testes)
+- 2026-10-29 — G0.31 criado (auditoria de desempenho e paralelismo do daemon)
+- 2026-10-29 — G1.6q criado e feito (teste de produção da imagem instalada); G1.6qa–G1.6qe criados
+- 2026-10-29 — G3.9h criada (interoperabilidade de L2 e serviços com o RouterOS 7.25 e entre CoreRouters); G3.9ha–G3.9hc criadas
+- 2026-10-29 — G4.3hk criada e feita (instabilidade do `netns_ha_pppoe`: dois defeitos do par HA do BNG, não do teste)
+- 2026-10-29 — G3.9f criado (interoperabilidade BGP), parte 1 feita (CoreRouter × CoreRouter e FRR no host; o CHR na VM vem no PR seguinte); G3.9fb–G3.9ff criados
+- 2026-10-29 — G3.9fe feito (OSPF anuncia as estáticas do CoreRouter)
+- 2026-10-29 — G0.31 feito (auditoria de desempenho e paralelismo); G0.31a–f abertos com os números
+- 2026-10-29 — G3.9fd feito (campos de anúncio na janela BGP)
+- 2026-10-29 — G3.9g criado (interoperabilidade do BNG PPPoE com o RouterOS 7.25 CHR) e G3.9ga criado (cliente PPPoE no CoreRouter)
+- 2026-10-29 — G3.9g feito (interoperabilidade do BNG PPPoE com o RouterOS 7.25 CHR, parte 2)
+- 2026-10-29 — G3.9f feito (interoperabilidade BGP com RouterOS 7.25 e entre CoreRouters)
+- 2026-10-29 — G1.6qf criado (Safe Mode numa chamada avulsa da CLI acaba sem aviso)
+- 2026-10-29 — G0.31a feito (`config.diff` item a item nas listas grandes)
+- 2026-10-29 — G0.31b feito (consultas grandes fora do lock do `Session`); G0.31g criado (linhas de rota reconstruídas fora do lock)
+- 2026-10-29 — G1.6qf feito (Safe Mode recusado na chamada avulsa da CLI)
+- 2026-10-29 — G3.9hb feito (`interface=` do RouterOS em `/interface vlan add`); G3.9he criado (o que ainda diverge em `/interface vlan`)
+- 2026-10-29 — G3.9hc feito (S-tag 802.1ad na janela de VLAN)
+- 2026-10-29 — G0.31c feito (conntrack lido e filtrado fora do lock do `Session`)
+- 2026-10-29 — G0.31d feito (índice das rotas estáticas para a checagem de duplicata)
+- 2026-10-29 — G1.6qa feito (reboot e desligamento limpos pela rede)
+- 2026-10-29 — G3.9fg feito (contagem do bgp-path-prepend do RouterOS, com migração explícita)
+- 2026-10-29 — G3.9fh feito (next hop IPv4-mapeado do RouterOS reescrito por `set gw`)
+- 2026-10-29 — G0.31e feito (commit de uma rota sem custo O(total de rotas))
+- 2026-10-29 — G0.31f feito (commit de uma regra de firewall sem remontar a tabela inteira)
+- 2026-10-29 — G1.6qb feito (saúde avisa raiz sem dm-verity)
+- 2026-10-29 — G1.6qc feito (`ip.dns.resolve` logo depois de `ip.dns.set`)
+- 2026-10-29 — G1.6qd feito (métricas de processo e de saúde no `/metrics`)
+- 2026-10-29 — G1.6qe feito (CPU por thread do daemon)
+- 2026-10-29 — G3.9fb feito (anúncio por conexão)
+- 2026-10-29 — G3.9fc feito (extended communities no filtro); G3.9fi criada (link bandwidth, regexp, outros tipos de extended)
+- 2026-10-29 — G3.9ga parcial: comandos, execução e plano de dados do cliente PPPoE (PR a)
+- 2026-10-29 — G3.9ga feito: GUI do cliente PPPoE (janela, menu PPP em dois itens, selos)
+- 2026-10-29 — G3.9ha feito (anúncio de roteador IPv6, `/ipv6 nd`); gaps novas G3.9hg–G3.9hk
+- 2026-10-29 — G3.9hd feito (`ip.firewall.connection.remove`); G3.9hf criado (GUI: Remove com contagem e aviso de gerência)
+- 2026-10-29 — G3.9ff feito (graceful restart como quem reinicia); G3.9fj criada (LLGR, BFD C-bit, Hard Reset, GR do OSPF, tempos na janela)
+- 2026-10-29 — G3.9b feito (BFD tolerante à subida lenta do RouterOS)
+- 2026-10-29 — G1.6i feito (daemons do FRR sob demanda)
+- 2026-10-29 — G1.6r criado (enviar só o que mudou no `os push`)
+- 2026-10-29 — G3.4l feito (abort do ospfd com TI-LFA: causa, patch na imagem, issue e PR no FRR)
+- 2026-10-29 — G3.9d feito (ICMP de TTL vencido em MPLS); G3.9da criada (ICMP "fragmentation needed" em LSP, taxa por origem); G3.9db criada (tap MPLS em eBPF)
+- 2026-10-29 — G3.9hl feito (print e export dos submenus de interface)
+- 2026-10-29 — G0.31h feito (route.list em stream, sem o tamanho da resposta na memória)
+- 2026-10-29 — G1.6s criado (opção B da release da imagem: CI compila sem assinar, o dono confere a reprodutibilidade e assina)
+- 2026-10-29 — G0.31i feito (set de distância sem ler as rotas do kernel)
+- 2026-10-29 — G3.6n criada (BFD cai junto com o `corerouter-daemon` e derruba o BGP)
+- 2026-10-29 — G0.31j feito; G0.31k criada (memória do daemon por regra de firewall)
+- 2026-10-29 — G1.29a criado e feito (drivers de placa Ethernet USB na imagem)
+- 2026-10-29 — G1.29b criado e feito (placa USB: dados da porta, alerta de porta lenta, ícone USB)
+- 2026-10-29 — G1.29c criado e feito (recuperação manual de placa USB em três níveis)
+- 2026-10-29 — G1.5a feito (rotas blackhole, unreachable e prohibit)
+- 2026-10-29 — G1.6n feito (nome de porta para placa que aparece depois do boot)
+- 2026-10-29 — G3.9c feito (OSPF stub router, RFC 6987); G3.9ca, G3.9cb e G3.9cc abertos
+- 2026-10-29 — G1.6t criado e feito (adoção de porta física que aparece com o roteador ligado)
+- 2026-10-30 — G1.29d criado e feito (vigia automático de placa USB)
+- 2026-10-30 — G3.9da feito (ICMP too big em LSP e taxa de ICMP por origem)
+- 2026-10-30 — G1.3b feito (porta ausente não derruba o `apply`; flag `invalid`; reaplica na volta)
+- 2026-10-30 — G3.9db em revisão (tap MPLS em eBPF)
+- 2026-10-30 — G1.29f criado e feito (placa USB que volta do reset com o nome do kernel: causa, diagnóstico e mensagens do PID 1 no log)
+- 2026-10-30 — G1.3d feito (replug entre dois polls: `ifindex` no poll + eventos de link no daemon); G1.3f criado (poll de links sem o lock do `Session`)
+- 2026-10-30 — G1.3e feito (gerência sobe com seção recusada no boot; por seção; retry com backoff); G1.3g e G1.3h criados (por regra/rota com trava de gerência; firewall mínimo fechado)
+- 2026-10-30 — G1.29g feito (reset USB de porta fora da configuração)
+- 2026-10-30 — G1.6u feito (atualização num `/config` cheio)
+- 2026-10-30 — G1.3g parcial (só a regra de firewall recusada fica de fora, checagem sem aplicar, trava de gerência; máscara do boot nos caminhos laterais); G1.3h descartada por decisão do usuário (2026-10-30): sem firewall de emergência
+- 2026-10-30 — G1.6v criado e feito (`/config` ocupa o resto do disco)
+- 2026-10-30 — G1.3g feito (rotas uma a uma no boot, só a recusada de fora)
+- 2026-10-30 — G0.32 criado e feito (versão legível no lugar do commit, pedido do usuário)
+- 2026-10-30 — G1.3f feito (poll de links fora do lock, dump enxuto, um dump por tick); G1.3i criado (o resto da E/S do tick sob o lock)
+- 2026-11-08 — G1.6y criado (instalar pela GUI e pela web a partir da ISO live)
+- 2026-11-08 — G1.6j parte 1 feita (firmware na imagem e carga automática de drivers em módulo)
+- 2026-11-08 — G1.6g parte 1 (imagem e instalador por BIOS, GRUB)
+- 2026-11-08 — G1.6j feito (conjunto amplo de placas com fio e USB)
+- 2026-11-08 — G1.6g feito (A/B em BIOS)
+- 2026-11-09 — G0.30d feito (`netns_nat_ipfix` espera por progresso e confere o que o exportador contou)
+- 2026-11-09 — G1.27e em andamento (parte a: tabelas nomeadas)
+- 2026-11-09 — G1.6qh feito (Reboot e Shutdown na GUI)
+- 2026-11-09 — G1.6x feito (espaço do /config e remoção de cópias na janela Packages)
+- 2026-11-09 — G4.6b feito (o cliente NTP acerta o relógio do sistema)
+- 2026-11-09 — G0.18 feito (import de 10 000 concessões fixas em ~0,1 s, antes ~24 s)
+- 2026-11-09 — G0.30e criada e feita (`netns_mpls_too_big` instável: o respondedor perdia frames enquanto lia a tabela de labels)
+- 2026-11-09 — G0.30g criada e feita (`PppoePort` podia ler quadros de outra interface ao abrir)
+- 2026-11-09 — G0.30h criada e feita (`netns_fw_scale` compara o mínimo, que a carga não muda)
+- 2026-11-09 — G1.27e parte b: regras de política no motor e no kernel
+- 2026-11-09 — G1.27e feito (roteamento por política)
+- 2026-11-09 — G1.29e feito pela G1.6j (firmware `rtl_nic` na trava, sem o pacote inteiro); medir no RTL8153B ficou na G1.6jb
+- 2026-11-09 — G1.5b feito (lockout de rota de descarte; `ip.route.lookup` com blackhole/unreachable/prohibit)
+- 2026-11-09 — G1.6ja feito (saúde e GUI avisam placa sem driver, firmware faltando e ice em Safe Mode)
+- 2026-11-09 — G1.6p feito (janela IP › Services, com lockout do www-ssl)
+- 2026-11-09 — G1.6w feito (teto de disco para o histórico de revisões e os gráficos)
+- 2026-11-09 — G1.6za feito (módulos do kernel da ISO no live)
+- 2026-11-09 — G4.2h feito (DHCP fora do lock da sessão)
+- 2026-11-09 — G4.3m feito (reconexão em loop e limites por MAC e VLAN)
+- 2026-11-09 — G4.6c feito (servidor NTP próprio, comparado com o ntpd-rs)
+- 2026-11-09 — G4.6g feito (log em disco, ação `disk` do RouterOS)
+- 2026-11-09 — G4.2h também nas vinculações: DNS dinâmico com índice durante a rodada e listas em lote (p99 361 ms → 31 ms)
+- 2026-11-09 — G0.30i criado e feito (`netns_policy` instável: repetição do ARP caía na contagem de outra checagem)
+- 2026-11-10 — G0.24b criado e feito (janelas que cresciam sozinhas até o fim da tela)
+- 2026-11-10 — G1.27da criado e feito (ARP Ping e "Router address" com o endereço do cliente DHCP)
+- 2026-11-10 — G2.1 feito (as três partes entraram; a linha guarda-chuva estava desatualizada)
+- 2026-11-10 — G3.7 feito (o critério está atendido pelas partes; a linha guarda-chuva estava desatualizada)
+- 2026-11-10 — G3.9db feito (entrou no #505; a linha ainda dizia "em revisão")
+- 2026-11-10 — G3.9h feito (rodada completa com o RA do CoreRouter e o servidor NTP, os dois que faltavam)
+- 2026-11-10 — G4.2i criado e feito (pool em uso com PPP; Pool fora do grupo DHCP do menu)
+- 2026-11-10 — G4.7 feito (as três partes entraram; a linha guarda-chuva estava desatualizada)
+- 2026-11-10 — G1.29h criado e feito (r8152 como módulo: o firmware rtl_nic do RTL8153 carrega no boot)
+- 2026-11-11 — G1.6zc criado e feito (console de tela num boot UEFI: simpledrm + fbcon)
+- 2026-11-11 — G1.6zd criado e feito (boot sem linhas de erro do i915 e do som); G1.30 e G1.30a criados (Wi-Fi: estação e AP)
+- 2026-11-11 — G0.3f criado e feito (aviso "Login sem senha" agrupado; "Alterado" só para mudança de config)
+- 2026-11-11 — G1.6ze criado e feito (ISO live sem interfaces criadas pelo kernel; porta ligada depois do boot sem comando recusado no log)
+- 2026-11-11 — G1.6zh criado e feito (relógio certo no primeiro boot: cliente NTP ligado só com os servidores do DHCP)
+- 2026-11-11 — G1.26i criado e feito (encaminhamento IPv4/IPv6 ligado por padrão; a ISO live roteia); G1.26j criado (o daemon seguir um perfil de tuning)
+- 2026-11-11 — G1.30 parte 1 (imagem pronta para Wi-Fi em modo estação); mínimo de RAM da ISO live de 320 para 448 MiB
+- 2026-11-11 — G1.30 parte 2 (motor: interface wifi, comandos, wpa_supplicant, wifi-test)
+- 2026-11-11 — G1.30 feito (parte 3: janela Interfaces › Wi-Fi e porta Wi-Fi no assistente do console)
+- 2026-11-11 — G1.6zf criado e feito (sensores de CPU, disco e placa-mãe em qualquer hardware); G4.8g criado (temperatura dos DIMMs)
+- 2026-11-11 — G1.6zg criado e feito (console local com cor e formato: status, assistente do primeiro boot e instalador)
+- 2026-11-11 — G1.6zi criado e feito (cobertura de hardware do kernel: núcleos, disco de boot, hipervisores, diagnóstico); G1.6zw, G1.6zx e G1.6zy criados
+- 2026-11-11 — G1.30g criado e feito (janela Interface de uma porta Wi-Fi)
+- 2026-11-11 — G1.6zl criado e feito (assistente do primeiro boot: enlace real e DHCP no cabo)
+- 2026-11-11 — G1.6zm criado e feito (disco regravado não boota pela entrada velha da NVRAM)
+- 2026-11-11 — G1.6zn criado (sistema na RAM no disco instalado; aviso claro quando o disco do sistema some)
+- 2026-11-11 — G1.30h criado e feito (país do Wi-Fi a partir da janela Interface e do Enable)
+- 2026-11-11 — G1.30i ganhou o Auto do scan e o rótulo dentro do bloco; o snooper mostra o canal real ao lado de uma estação ociosa
+- 2026-11-11 — G1.30i criada e feita (scan Wi-Fi em três visões: lista, canais e espectro)
+- 2026-11-11 — G1.30j criado e feito (Wi-Fi em modo monitor: snooper e captura 802.11)
+- 2026-11-11 — G1.30m criado (Wi-Fi station-bridge e bonding sobre enlaces Wi-Fi)
+- 2026-11-11 — G1.6zn feito (sistema na RAM no disco instalado; aviso claro e commit recusado quando o disco do sistema some)
+- 2026-11-11 — G1.6zq criado (boot 20 s mais lento no handoff do xHCI do notebook Lenovo 83EU)
+- 2026-11-11 — G1.6zr criado e feito (defeitos da auditoria do notebook, dev.591); G1.6zs criado (certificado com identidade e endereços)
+- 2026-11-11 — G4.6m feito (NTP: primeiro acerto do boot sem confirmação, opção (a) escolhida pelo dono)
+- 2026-11-11 — G1.26k, G2.3h e G1.6ql criadas (aplicar perfil na aba Profiles do Tuning; aviso de conntrack pequeno para o pool de CGNAT; memória do kernel na aba Memory)
+- 2026-11-11 — G1.30a em andamento (parte 1: AP mínimo com hostapd)
+- 2026-11-11 — G2.3g criado e feito (CGNAT: bloco dado ao endereço do próprio roteador, teste por cabo no notebook dev.591)
+- 2026-11-11 — G2.7c criado e feito (ICMP do CGNAT quebrado na imagem, notebook dev.591)
+- 2026-11-11 — G2.7d criado e feito (diagnóstico do pool sem blocos e sugestão no modo blocos, teste de carga no notebook dev.591)
+- 2026-11-11 — G4.2l criado e feito (conflito falso e RELEASE repetido no servidor DHCP, teste de carga no notebook dev.591)
+- 2026-11-11 — G4.2m criado e feito (histórico DHCP vazio depois do reinício, notebook dev.595)
+- 2026-11-11 — G4.3v criado e feito (PPPoE sem tráfego até o gateway no notebook dev.591)
+- 2026-11-11 — G4.3w criado e feito (one-session-per-host derrubava a sessão boa antes de autenticar, notebook dev.591)
+- 2026-11-12 — G1.26k feito (aplicar o perfil também pela aba Profiles)
+- 2026-11-12 — G1.30m feito (Wi-Fi station-bridge e bonding sobre os enlaces)
+- 2026-11-12 — G1.6ql feito (Resources › Memory mostra o que o kernel gasta)
+- 2026-11-12 — G1.6zt criado e feito (atualização reiniciava com Safe Mode ativo e perdia a mudança em silêncio, notebook dev.607)
+- 2026-11-12 — G1.6zx feito (registro de pânico e de travamento no boot seguinte)
+- 2026-11-12 — G2.3h feito (CGNAT avisa quando o conntrack é pequeno para o pool)
+- 2026-11-12 — G4.3x criado e feito (PPPoE: DNS e TCP ao gateway sem resposta no caminho lento, notebook dev.607); G4.3y criado (tráfego do caminho lento entra pela lo)
+- 2026-11-12 — G4.3y feito (o assinante PPPoE do caminho lento deixa de entrar pela lo)
+- 2026-11-12 — G4.6n feito (servidores NTP do DHCPv6, opção 56)
+- 2026-11-12 — G4.6o feito (ISO live não regrava o relógio da placa)
+- 2026-11-12 — G4.6p feito (`/system clock`); G4.6q e G4.6r criados (fuso horário; acertar a hora à mão)
+- 2026-11-12 — G0.30j criada e feita (install-test: o kernel matava o daemon da live por memória ao conferir o rootfs gravado)
+- 2026-11-12 — G1.6zy feito (erros de memória: controladores e política)
+- 2026-11-12 — G3.4n criada e feita (custo do OSPF do nosso lado com escala); G3.4o e G3.4p criadas
+- 2026-11-12 — G4.8g feito no QEMU (temperatura dos pentes de memória)
+- 2026-11-13 — G1.31 criada (interfaces WireGuard; escopo escolhido pelo usuário: janela opção A, 10 extras, rotas pelo modal do par) e PR 1 (motor) feito
+- 2026-11-13 — G1.31a feito (janela Interfaces › WireGuard, opção A do mockup)
+- 2026-11-13 — G1.31b feito (extras do WireGuard: os 10 extras e a opção 2 de rotas)
+- 2026-11-13 — G1.31d feito (clamp de MSS como ação de firewall)
+- 2026-11-13 — G1.6zs feito (`/certificate` e `www-ssl certificate=`); G1.6zu e G1.6zv criados
+- 2026-11-13 — G4.1h redefinida e feita (abas Overview, Upstreams e Cache; contadores por thread)
+- 2026-11-13 — G4.1za feita (aba Names da DNS Statistics; Clients na G4.1zb, no mesmo PR)
+- 2026-11-13 — G4.1zb feita (aba Clients da DNS Statistics, junto com a G4.1za)
+- 2026-11-13 — G4.1zc feita (contadores do encaminhador DNS no `/metrics`)
+- 2026-11-13 — G4.1ze feita (o encaminhador envia o EDE)
+- 2026-11-13 — G1.31c feito (VRF do socket cifrado do WireGuard)
+- 2026-11-13 — G3.4m criado e feito (laboratório de carga e estabilidade do OSPF)
+- 2026-11-13 — G3.4q feito (FRR com milhares de interfaces OSPF); G3.4s, G3.4t, G3.4u e G3.4v criados
+- 2026-11-13 — G3.4r feito (proteção da LSDB do OSPF); G3.4w, G3.4x, G3.4y e G1.6zz criados
+- 2026-11-13 — G4.1g feito (comparação com Unbound e dnsmasq pela bateria da G4.1r)
+- 2026-11-13 — G4.1o feito (consultas iguais em andamento juntadas, achado e medido pela G4.1r)
+- 2026-11-13 — G4.1r criado e feito (bateria de carga do DNS; G4.1s criado e feito; G4.1t a G4.1z criados)
+- 2026-11-13 — G4.1t feito (laço de eventos no upstream do DNS); G4.1zm criado
+- 2026-11-13 — G4.1u feito (prazo por servidor adaptativo e nova tentativa no upstream do DNS)
+- 2026-11-13 — G4.1v feito (serve-stale com o prazo do cliente no encaminhador DNS)
+- 2026-11-13 — G4.1w feito (DNS TCP contra conexões paradas); G4.1zk criado
+- 2026-11-13 — G4.1z feito (custo da adlist por consulta); G4.1zl criado (travas globais por consulta no encaminhador)
+- 2026-11-13 — G4.1zd parte 1 feita (log persistente); dnstap fica na parte 2
+- 2026-11-13 — G4.1zf parte 1 (DoT) feita; G4.1zh e G4.1zi criados
+- 2026-11-13 — G4.1zf feito (DoT e DoH para a LAN)
+- 2026-11-20 — G0.33 feito (checkpoint com nome para voltar antes de um trabalho longo)
+- 2026-11-20 — G3.4z feito (gerência protegida contra rota aprendida)
+- 2026-11-20 — G4.1x feito (cache do DNS protegido contra nomes únicos, W-TinyLFU)
+- 2026-11-20 — G4.1y feito (`ip.dns.cache.print` sem parar as consultas)
+- 2026-11-20 — G4.1zo feito (um cliente não ocupa a recepção UDP do DNS)
+- 2026-11-20 — G4.1zp feito (`dns-stress-lab.sh` remoto: memória, threads, descritores, CPU e serve-stale)
+- 2026-11-20 — G0.30k criada (regressão noturna dos laboratórios, pedido do usuário)
+- 2026-11-21 — G0.11 feito (canal local por socket Unix com credencial do processo)
+- 2026-11-21 — G0.12 feito (força bruta distribuída contra um nome de usuário)
+- 2026-11-21 — G0.13 feito (prazos no relógio monotônico, fora o Safe Mode)
+- 2026-11-21 — G0.26c feito (segunda VM de laboratório); G0.26d criada (isolar o CCD da medição dos processos do host)
+- 2026-11-21 — G0.26d feito pela opção sem root (escolha do usuário): medição silenciosa no `vm-lab run --perf`
+- 2026-11-21 — G0.30f redefinida (a causa original já corrigida; diagnóstico para o EADDRNOTAVAIL que sobrou)
+- 2026-11-21 — G0.30k parte a feita (regressão noturna do laboratório de DNS no runner próprio); G0.30o criada (laboratórios com root ou KVM no noturno)
+- 2026-11-21 — G0.30m criada e feita (netns_link_dump instável: a consulta "este link é nosso?" copiava a lista inteira)
+- 2026-11-21 — G0.30n criada e feita (o checkpoint da config esperava o disco inteiro: syncfs → fsync dos arquivos em paralelo)
+- 2026-11-21 — G0.30p criada e feita (remote_reconnect do MCP: o teste esperava o fechamento do lado do roteador, não do cliente)
+- 2026-11-21 — G0.33b feito (checkpoint automático antes de uma atualização)
+- 2026-11-21 — G1.22 feito (varredura SFP/DOM fora do lock da sessão)
+- 2026-11-21 — G1.3i feito (o resto da E/S do tick sem o lock)
+- 2026-11-21 — G1.6qg feito (Safe Mode destacado, como `commit confirmed`; confirma o mesmo usuário, os outros com force)
+- 2026-11-21 — G3.4za feito (guarda da gerência dentro de VRF, conferida com OSPF na VRF e BGP na main)
+- 2026-11-21 — G3.4zb feito (VRF de gerência para www-ssl, www, metrics e a porta TLS de controle)
+- 2026-11-21 — G3.9fk feito (laboratório BGP do host: a corrida estava no próprio caso `restart`)
+- 2026-11-21 — G4.1zn feito (comandos de configuração rápidos com carga)
+- 2026-11-21 — G4.3cf feito (sem mudança de código: o `crxsub` não fica mais inválido; 3 rodadas completas verdes)
+- 2026-11-21 — G0.26c criada (segunda VM de laboratório, pedido do usuário)
+- 2026-11-21 — G0.15c feito (glifos sem fonte na GUI)
+- 2026-11-21 — G0.30l criada e feita (netns_ha_bfd instável: a tomada de teste começava com o BFD do par amortecido)
+- 2026-11-21 — G0.30q criada e feita (netns_v6_sample instável: DAD e prazos que viram o segundo em momentos diferentes)
+- 2026-11-21 — G0.31g feito (linhas de rota reconstruídas fora do lock)
+- 2026-11-21 — G1.24 em andamento (regras de linha vindas do engine)
+- 2026-11-21 — G1.5d feito (avisos da rota no modal)
+- 2026-11-21 — G1.6qj feito (datar pelo kmsg as mortes por OOM de antes do daemon)
+- 2026-11-21 — G1.6qm criada e feita (chave de desenvolvimento fora da pasta de build, uma por usuário)
+- 2026-11-21 — G1.6zz feito (`oom_score_adj` do plano de controle)
+- 2026-11-21 — G3.6n feito (BFD sobrevive ao `corerouter-daemon`); G3.6o criada (AdminDown no reboot planejado)

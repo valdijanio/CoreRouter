@@ -1,0 +1,4459 @@
+//! The BNG of the `pppoe` service (G4.3d), without I/O: it takes frames,
+//! the time and the running config, drives one `proto_pppoe::Server` per
+//! `/interface pppoe-server server`, answers authentication (local
+//! `/ppp secret`, or RADIUS through the G4.3j service) and addresses (its
+//! own allocator over `/ip pool`), and returns frames to send and
+//! [`Effect`]s for the driver (`pppoe.rs`): the XDP session map, the slow
+//! path routes, hooks and address lists, which need the HAL or the
+//! session lock. What the engine's commands read (`ppp.active.list`,
+//! `ppp.why`, `ppp.history`) is kept in [`Shared`], behind its own lock.
+//!
+//! Driven by the service's thread only; RADIUS answers come back over a
+//! channel ([`Bng::auth_inbox`]), so no callback ever touches the BNG.
+
+// Only the Linux driver (`pppoe.rs`) runs the BNG.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::net::Ipv4Addr;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+use corerouter_engine::framed::{self, Forbidden, FramedTable, Holder, RouteChange};
+use corerouter_engine::ppp::{PppBackend, expand_hook};
+use corerouter_engine::radius::{AaaBackend, AcctSource, SessionOwner};
+use corerouter_hal::pppoe::{PppoeCounters, PppoeOp, PppoeSession, Rate};
+use corerouter_model::MacAddr;
+use corerouter_model::framed_route::{FramedRoute, RouteOrigin};
+use corerouter_model::ip_pool::IpPools;
+use corerouter_model::ppp::{
+    ActiveSession, AddrOrPool, DEFAULT_PROFILE, Effective, HistoryEntry, LockedOut, Ppp, PppAuth,
+    PppHook, PppService, PppoeServer, ServiceStats, Stage, Why,
+};
+use corerouter_model::pppoe_services::{PppoeService, ServiceAction, ServiceName};
+use corerouter_model::pppoe_vlans::VlanMode;
+use corerouter_model::radius::{
+    AaaService, AcctCounters, AcctRequest, AcctStatus, Attribute, AuthOutcome, AuthReply,
+    AuthRequest as RadiusRequest, CoaKind, CoaOutcome, CoaRequest, Credentials,
+};
+use corerouter_proto_dhcp::server::agent;
+use corerouter_proto_pppoe::auth::AUTH_STRING_LEN;
+use corerouter_proto_pppoe::discovery::{self, Code};
+use corerouter_proto_pppoe::eth::Vlans;
+use corerouter_proto_pppoe::layers::AuthSet;
+use corerouter_proto_pppoe::lcp::AuthProto;
+use corerouter_proto_pppoe::ppp::{self as wire_ppp, proto};
+use corerouter_proto_pppoe::server::{
+    AuthMethod, AuthVerdict, Authorization, DownReason, Event, Ipv4Assignment, Ipv6Mode, Refusal,
+    Server, ServerConfig, ServerOutput, ServiceAction as ProtoAction, ServiceRule, ServiceTable,
+    SessionRef, ShortCycle, VlanFilter, VlanShare,
+};
+use corerouter_proto_pppoe::timer::Millis;
+use corerouter_proto_pppoe::wire::Mac;
+use corerouter_proto_radius::rate_limit::RateLimit;
+use ipnet::Ipv6Net;
+
+use super::pppoe_bng6::{self as v6, Pools6, RadiusV6, Source, V6};
+use super::pppoe_slow6::{self as slow6, Net6Index};
+
+/// G4.3h hot standby: publishing sessions, adopting them at a takeover.
+#[path = "pppoe_bng/ha.rs"]
+pub(crate) mod ha;
+
+/// Lines kept by `ppp.history`: a mass reconnect of 20 k subscribers is
+/// 40 k lines (**estimado**: 50 k × ~250 B = 12 MB).
+pub(crate) const HISTORY: usize = 50_000;
+/// Users and MACs `ppp.why` remembers: two per session the data plane
+/// holds. Past it the oldest goes (a flood of MACs pushes out only what
+/// nobody used since; G4.3g: clearing everything at 100 000 forgot every
+/// subscriber each 50 000 logins).
+pub(crate) const WHY_KEYS: usize = 2 * XDP_SLOTS as usize;
+/// Slots of the XDP session map the PPPoE service may use: the lower half
+/// of `dataplane-ebpf-common::pppoe::SESSIONS_MAX` (1 << 17). The upper half
+/// is the IPoE service's (G4.3f, `ipoe_bng::SLOT_TOP` downward).
+pub(crate) const XDP_SLOTS: u32 = 1 << 16;
+/// A subscriber's address-list entry is made again this often (dynamic
+/// entries last at most 35 days; the driver adds them for 35).
+const LIST_REFRESH_MS: u64 = 30 * 86_400_000;
+/// A lockout makes a log line from this many short cycles in a row.
+const LOCKOUT_LOG_FROM: u32 = 3;
+/// Lockouts a worker publishes for `ppp.lockout.list` (the count is exact).
+const LOCKOUT_ROWS: usize = 1000;
+/// Clears waiting for a worker (an operator's commands: few).
+const LOCKOUT_CLEARS: usize = 64;
+/// RADIUS answers older than this are dropped (the server gave up first).
+const RADIUS_GRACE_MS: u64 = 35_000;
+
+pub(crate) fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What the driver must do outside the BNG.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Effect {
+    /// The XDP session map (G4.3c).
+    Xdp(PppoeOp),
+    /// The slow path's /32 route to `bng0` (no XDP).
+    Route { ip: Ipv4Addr, add: bool },
+    /// G4.3cd: a block routed to a subscriber through `bng0` (no XDP).
+    Block { dst: ipnet::Ipv4Net, add: bool },
+    /// The slow path's IPv6 route of a session's /64 or delegated prefix
+    /// to `bng0` (G4.3l).
+    Route6 { net: Ipv6Net, add: bool },
+    /// Engine commands (hooks, address lists), run under the session lock.
+    Run {
+        command: String,
+        params: serde_json::Value,
+    },
+    /// A dynamic firewall address-list entry for a subscriber's address.
+    AddressList {
+        list: String,
+        ip: Ipv4Addr,
+        add: bool,
+        comment: String,
+    },
+    /// A line for the router's log (`ppp` topic), Portuguese.
+    Log { error: bool, text: String },
+}
+
+/// The stages in order, for [`Track::attempts`].
+const STAGES: [Stage; 6] = [
+    Stage::Padi,
+    Stage::Padr,
+    Stage::Lcp,
+    Stage::Auth,
+    Stage::Ncp,
+    Stage::Up,
+];
+
+/// Per-stage attempts of one user or MAC (`ppp.why`). Small: there is one
+/// per user and one per MAC (the last failure or end only, boxed; a
+/// subscriber that is up is in the active table).
+#[derive(Debug, Clone, Default)]
+struct Track {
+    /// When it was last used ([`Shared::why_seq`]): what eviction looks at.
+    seq: u64,
+    attempts: [u32; 6],
+    last_stage: Option<Stage>,
+    last: Option<Box<HistoryEntry>>,
+}
+
+fn stage_index(s: Stage) -> usize {
+    STAGES.iter().position(|x| *x == s).unwrap_or(0)
+}
+
+/// What the engine's commands and the RADIUS service read and ask.
+#[derive(Default)]
+pub(crate) struct Shared {
+    pub active: BTreeMap<String, ActiveSession>,
+    pub history: VecDeque<HistoryEntry>,
+    /// Each worker's "Why?" table (its own lock: a MAC always comes to
+    /// the same worker, and the workers do not wait on each other for it).
+    whys: Vec<Arc<Mutex<WhyTable>>>,
+    /// Sessions up by address (the identity chip, CGNAT's "Who was?").
+    by_ip: HashMap<Ipv4Addr, String>,
+    pub stats: ServiceStats,
+    /// `ppp.active.remove` and Disconnect-Requests, for the next round.
+    pub terminate: Vec<String>,
+    /// CoA rate changes: session id, RouterOS rate-limit text.
+    pub rates: Vec<(String, String)>,
+    /// CoA address-list changes (`Mikrotik-Address-List`, the arrears
+    /// notice): session id, list (empty: none).
+    pub lists: Vec<(String, String)>,
+    /// Acct-Session-Id → session id.
+    by_acct: HashMap<String, String>,
+    /// G4.3m: each server's count of sessions per VLAN, shared by the
+    /// workers.
+    vlan_shares: HashMap<corerouter_model::ItemId, VlanShare>,
+    /// What each worker counts on its own (summed by [`Backend::stats`]).
+    lanes: Vec<LaneStats>,
+    /// G4.3cd: CoA route changes (session id, the new routes), checked
+    /// already by [`Owner::handle`].
+    pub route_changes: Vec<(String, RouteChange)>,
+    /// What the CoA check needs: who holds which block, and the space no
+    /// subscriber may take (set by the workers with the config).
+    pub framed: FramedTable,
+    pub forbidden: Arc<Forbidden>,
+}
+
+/// One worker's share of the service counters.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LaneStats {
+    throttled: u64,
+    admission_rate: u32,
+    admission_reason: Option<String>,
+    counts: Counts,
+    /// G4.3m, refreshed once a second.
+    limits: Limits,
+    lockouts: Vec<LockedOut>,
+    /// Clears for this worker to do: a MAC, or all (`None`).
+    clear: Vec<Option<Mac>>,
+}
+
+/// What the limits of G4.3m refused, per worker.
+#[derive(Debug, Clone, Copy, Default)]
+struct Limits {
+    vlan: u64,
+    mac: u64,
+    short: u64,
+    cycles: u64,
+    locked: u64,
+}
+
+/// Discovery and login counters a worker keeps without the shared lock
+/// (published once a second).
+#[derive(Debug, Clone, Copy, Default)]
+struct Counts {
+    padi: u64,
+    pado: u64,
+    padr: u64,
+    pads: u64,
+    padt_rx: u64,
+    padt_tx: u64,
+    auth_accept: u64,
+    auth_reject: u64,
+}
+
+/// `ppp.why`'s memory of one worker: per user and per MAC.
+#[derive(Default)]
+pub(crate) struct WhyTable {
+    /// The key is kept once, shared with `why_order`.
+    why: HashMap<Arc<str>, Track>,
+    /// Keys in the order they were used (a key used again is pushed again;
+    /// the old place is skipped when popped): the oldest is evicted first.
+    why_order: VecDeque<(Arc<str>, u64)>,
+    why_seq: u64,
+    /// [`WHY_KEYS`] (shared by the workers) unless a test sets it.
+    why_cap: usize,
+    lanes: usize,
+}
+
+impl WhyTable {
+    fn track(&mut self, key: &str) -> Option<&mut Track> {
+        let cap = if self.why_cap == 0 {
+            WHY_KEYS / self.lanes.max(1)
+        } else {
+            self.why_cap
+        };
+        self.why_seq += 1;
+        let seq = self.why_seq;
+        let k: Arc<str> = match self.why.get_key_value(key) {
+            Some((k, _)) => k.clone(),
+            None => {
+                while self.why.len() >= cap {
+                    let Some((old, at)) = self.why_order.pop_front() else {
+                        break;
+                    };
+                    if self.why.get(&old).is_some_and(|t| t.seq == at) {
+                        self.why.remove(&old);
+                    }
+                }
+                Arc::from(key)
+            }
+        };
+        self.why_order.push_back((k.clone(), seq));
+        if self.why_order.len() > 2 * cap + 1024 {
+            // Mostly places of keys used again since: drop them.
+            let why = &self.why;
+            self.why_order
+                .retain(|(k, at)| why.get(k).is_some_and(|t| t.seq == *at));
+        }
+        let t = self.why.entry(k).or_default();
+        t.seq = seq;
+        Some(t)
+    }
+
+    fn reach(&mut self, keys: &[&str], stage: Stage) {
+        for k in keys {
+            if let Some(t) = self.track(k) {
+                if let Some(n) = t.attempts.get_mut(stage_index(stage)) {
+                    *n = n.saturating_add(1);
+                }
+                t.last_stage = Some(stage);
+            }
+        }
+    }
+
+    /// A refused PADI or PADR of MAC `key`. Asked several times a second
+    /// by a CPE locked out, so the same reason within a second costs no
+    /// allocation.
+    fn refused(
+        &mut self,
+        key: &str,
+        at: u64,
+        server: &str,
+        stage: Stage,
+        reason: &str,
+        hint: impl FnOnce() -> String,
+    ) {
+        let Some(t) = self.track(key) else {
+            return;
+        };
+        t.last_stage = Some(stage);
+        if t.last
+            .as_ref()
+            .is_some_and(|l| l.at == at && l.reason == reason)
+        {
+            return;
+        }
+        t.last = Some(Box::new(HistoryEntry {
+            at,
+            caller_id: key.to_owned(),
+            server: server.to_owned(),
+            event: "failed".into(),
+            stage: Some(stage),
+            reason: reason.to_owned(),
+            hint: hint(),
+            ..HistoryEntry::default()
+        }));
+    }
+
+    fn record(&mut self, keys: &[&str], h: &HistoryEntry) {
+        for k in keys {
+            if let Some(t) = self.track(k) {
+                if let Some(st) = h.stage {
+                    t.last_stage = Some(st);
+                }
+                if h.event != "up" {
+                    t.last = Some(Box::new(h.clone()));
+                }
+            }
+        }
+    }
+}
+
+impl Shared {
+    fn record(&mut self, h: HistoryEntry) {
+        if self.history.len() >= HISTORY {
+            self.history.pop_front();
+        }
+        self.history.push_back(h);
+    }
+}
+
+/// The [`PppBackend`] the engine gets: reads [`Shared`] only.
+pub(crate) struct Backend(pub Arc<Mutex<Shared>>);
+
+impl PppBackend for Backend {
+    fn active(&self) -> Vec<ActiveSession> {
+        guard(&self.0).active.values().cloned().collect()
+    }
+
+    fn active_page(
+        &self,
+        keep: &dyn Fn(&ActiveSession) -> bool,
+        limit: usize,
+    ) -> (usize, Vec<ActiveSession>) {
+        let sh = guard(&self.0);
+        let mut hits: Vec<&ActiveSession> = sh.active.values().filter(|a| keep(a)).collect();
+        let total = hits.len();
+        let order =
+            |a: &&ActiveSession, b: &&ActiveSession| a.name.cmp(&b.name).then(a.id.cmp(&b.id));
+        // The first `limit` without sorting the rest: O(n).
+        if limit > 0 && limit < hits.len() {
+            hits.select_nth_unstable_by(limit - 1, order);
+            hits.truncate(limit);
+        }
+        hits.truncate(limit);
+        hits.sort_by(order);
+        (total, hits.into_iter().cloned().collect())
+    }
+
+    fn session(&self, id: &str) -> Option<ActiveSession> {
+        guard(&self.0).active.get(id).cloned()
+    }
+
+    fn sessions_by_server(&self) -> std::collections::BTreeMap<String, usize> {
+        let sh = guard(&self.0);
+        let mut m = std::collections::BTreeMap::new();
+        for a in sh.active.values() {
+            match m.get_mut(&a.server) {
+                Some(n) => *n += 1,
+                None => {
+                    m.insert(a.server.clone(), 1);
+                }
+            }
+        }
+        m
+    }
+
+    fn terminate(&self, ids: &[String]) -> usize {
+        let mut sh = guard(&self.0);
+        let found: Vec<String> = ids
+            .iter()
+            .filter(|i| sh.active.contains_key(*i))
+            .cloned()
+            .collect();
+        let n = found.len();
+        sh.terminate.extend(found);
+        n
+    }
+
+    fn history(&self) -> Vec<HistoryEntry> {
+        guard(&self.0).history.iter().cloned().collect()
+    }
+
+    fn why(&self, name: Option<&str>, mac: Option<MacAddr>) -> Why {
+        let (active, whys) = {
+            let sh = guard(&self.0);
+            let active = sh
+                .active
+                .values()
+                .find(|a| {
+                    name.is_some_and(|n| a.name == n)
+                        || mac.is_some_and(|m| a.caller_id == m.to_string())
+                })
+                .map(|a| a.id.clone());
+            (active, sh.whys.clone())
+        };
+        let key = name
+            .map(str::to_owned)
+            .or_else(|| mac.map(|m| m.to_string()))
+            .unwrap_or_default();
+        // A key may be in several workers' tables (a user from MACs that
+        // hash apart): attempts add up, the newest end is the one shown.
+        let lookup = |key: &str| -> Option<Track> {
+            let mut out: Option<Track> = None;
+            for w in &whys {
+                let Some(t) = guard(w).why.get(key).cloned() else {
+                    continue;
+                };
+                out = Some(match out {
+                    None => t,
+                    Some(mut o) => {
+                        for (a, b) in o.attempts.iter_mut().zip(t.attempts) {
+                            *a = a.saturating_add(b);
+                        }
+                        let newer = |x: &Track| x.last.as_ref().map_or(0, |l| l.at);
+                        if newer(&t) > newer(&o) {
+                            o.last = t.last;
+                            o.last_stage = t.last_stage;
+                        }
+                        o
+                    }
+                });
+            }
+            out
+        };
+        let mut t = lookup(&key).unwrap_or_default();
+        // Before authentication the user is not known: the discovery
+        // stages of a user are those of the MAC it last came from.
+        if name.is_some()
+            && let Some(m) = t.last.as_ref().map(|l| l.caller_id.clone())
+            && let Some(by_mac) = lookup(&m)
+        {
+            for st in [Stage::Padi, Stage::Padr, Stage::Lcp] {
+                let i = stage_index(st);
+                if let (Some(n), Some(slot)) = (by_mac.attempts.get(i), t.attempts.get_mut(i)) {
+                    *slot = *n;
+                }
+            }
+        }
+        Why {
+            query: key,
+            active,
+            attempts: STAGES
+                .iter()
+                .copied()
+                .zip(t.attempts)
+                .filter(|(_, n)| *n > 0)
+                .collect(),
+            last_stage: t.last_stage,
+            last: t.last.map(|b| *b),
+        }
+    }
+
+    fn stats(&self) -> ServiceStats {
+        let sh = guard(&self.0);
+        let mut st = sh.stats.clone();
+        st.sessions = sh.active.len() as u64;
+        // The workers' own counters (G4.3g): the limits are per worker, the
+        // service's rate is their sum.
+        st.throttled = sh.lanes.iter().map(|l| l.throttled).sum();
+        let sum = |f: fn(&Counts) -> u64| sh.lanes.iter().map(|l| f(&l.counts)).sum::<u64>();
+        st.padi = sum(|c| c.padi);
+        st.pado = sum(|c| c.pado);
+        st.padr = sum(|c| c.padr);
+        st.pads = sum(|c| c.pads);
+        st.padt_rx = sum(|c| c.padt_rx);
+        st.padt_tx = sum(|c| c.padt_tx);
+        st.auth_accept = sum(|c| c.auth_accept);
+        st.auth_reject = sum(|c| c.auth_reject);
+        st.admission_rate = sh.lanes.iter().map(|l| l.admission_rate).sum();
+        st.admission_reason = sh.lanes.iter().find_map(|l| l.admission_reason.clone());
+        st.workers = sh.lanes.len().max(1) as u32;
+        st.ipv6_sessions = sh
+            .active
+            .values()
+            .filter(|a| a.link_local.is_some())
+            .count() as u64;
+        st.delegated = sh.active.values().filter(|a| a.delegated_bound).count() as u64;
+        let limit = |f: fn(&Limits) -> u64| sh.lanes.iter().map(|l| f(&l.limits)).sum::<u64>();
+        st.vlan_refused = limit(|l| l.vlan);
+        st.mac_refused = limit(|l| l.mac);
+        st.short_cycle_refused = limit(|l| l.short);
+        st.short_cycles = limit(|l| l.cycles);
+        st.locked_out = limit(|l| l.locked);
+        st
+    }
+
+    fn lockouts(&self, limit: usize) -> (usize, Vec<LockedOut>) {
+        let sh = guard(&self.0);
+        let total = sh.lanes.iter().map(|l| l.limits.locked as usize).sum();
+        let rows = sh
+            .lanes
+            .iter()
+            .flat_map(|l| l.lockouts.iter().cloned())
+            .take(limit)
+            .collect();
+        (total, rows)
+    }
+
+    fn lockout_clear(&self, mac: Option<MacAddr>) -> usize {
+        let mut sh = guard(&self.0);
+        let text = mac.map(|m| m.to_string());
+        let mut n = 0;
+        for l in &mut sh.lanes {
+            n += match &text {
+                Some(t) => l.lockouts.iter().filter(|r| r.caller_id == *t).count(),
+                None => l.limits.locked as usize,
+            };
+            if l.clear.len() < LOCKOUT_CLEARS {
+                l.clear.push(mac.map(|m| Mac(m.0)));
+            }
+            // What the list shows goes at once, not at the next tick.
+            match &text {
+                Some(t) => l.lockouts.retain(|r| r.caller_id != *t),
+                None => l.lockouts.clear(),
+            }
+        }
+        n
+    }
+
+    fn who(&self, ip: Ipv4Addr) -> Option<String> {
+        let sh = guard(&self.0);
+        let id = sh.by_ip.get(&ip)?;
+        sh.active.get(id).map(|a| a.name.clone())
+    }
+
+    /// G4.2i: walks the table in place and copies only the page.
+    fn pool_page(
+        &self,
+        keep: &dyn Fn(&ActiveSession) -> bool,
+        limit: usize,
+    ) -> (usize, Vec<ActiveSession>) {
+        let sh = guard(&self.0);
+        let mut hits: Vec<&ActiveSession> = sh
+            .active
+            .values()
+            .filter(|a| a.pool.is_some() && a.address.is_some() && keep(a))
+            .collect();
+        let total = hits.len();
+        corerouter_engine::ppp::first_by(&mut hits, limit, |a| a.address);
+        (total, hits.into_iter().cloned().collect())
+    }
+
+    /// One pass, no copy of a session; a pool name is allocated once.
+    fn pool_use(&self) -> std::collections::BTreeMap<String, u64> {
+        let sh = guard(&self.0);
+        let mut m = std::collections::BTreeMap::new();
+        for p in sh
+            .active
+            .values()
+            .filter_map(|a| a.address.and(a.pool.as_ref()))
+        {
+            match m.get_mut(p) {
+                Some(n) => *n += 1,
+                None => {
+                    m.insert(p.clone(), 1);
+                }
+            }
+        }
+        m
+    }
+
+    /// By the address index (O(1)).
+    fn pool_holder(&self, ip: Ipv4Addr) -> Option<ActiveSession> {
+        let sh = guard(&self.0);
+        let id = sh.by_ip.get(&ip)?;
+        sh.active.get(id).filter(|a| a.pool.is_some()).cloned()
+    }
+
+    fn who_vlan(&self, ip: Ipv4Addr) -> Option<(String, u16)> {
+        let sh = guard(&self.0);
+        let id = sh.by_ip.get(&ip)?;
+        sh.active
+            .get(id)
+            .map(|a| (a.name.clone(), a.vlan.unwrap_or(0)))
+    }
+
+    fn who_at(&self, ip: Ipv4Addr, at: u64) -> Option<String> {
+        let sh = guard(&self.0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        // A session that ended after `at` and began before it.
+        sh.history
+            .iter()
+            .rev()
+            .find(|h| {
+                h.address == Some(ip)
+                    && h.event == "down"
+                    && h.at >= at
+                    && h.at.saturating_sub(h.uptime_secs) <= at
+            })
+            .map(|h| h.name.clone())
+            .or_else(|| {
+                sh.active
+                    .values()
+                    .find(|a| a.address == Some(ip) && now.saturating_sub(a.uptime_secs) <= at)
+                    .map(|a| a.name.clone())
+            })
+    }
+}
+
+/// The RADIUS CoA/Disconnect owner (RFC 5176): matches the selector
+/// against the active sessions and queues the change for the BNG.
+pub(crate) struct Owner(pub Arc<Mutex<Shared>>);
+
+impl SessionOwner for Owner {
+    fn name(&self) -> &str {
+        "ppp"
+    }
+
+    fn handle(&self, req: &CoaRequest) -> CoaOutcome {
+        let mut sh = guard(&self.0);
+        let sel = &req.selector;
+        let caller = sel
+            .calling_station_id
+            .as_deref()
+            .map(|c| c.replace('-', ":"));
+        let matches = |a: &ActiveSession| {
+            sel.user_name.as_deref().is_none_or(|u| a.name == u)
+                && sel.framed_ip.is_none_or(|ip| a.address == Some(ip))
+                && caller
+                    .as_deref()
+                    .is_none_or(|c| a.caller_id.eq_ignore_ascii_case(c))
+                && sel
+                    .nas_port_id
+                    .as_deref()
+                    .is_none_or(|n| a.interface == n || a.circuit_id.as_deref() == Some(n))
+                && sel
+                    .acct_session_id
+                    .as_deref()
+                    .is_none_or(|s| sh.by_acct.get(s) == Some(&a.id))
+        };
+        // G4.3hb: by address or Acct-Session-Id (what billing systems
+        // send) from the indexes; a pass over every session held this
+        // lock 16 ms at 100 000 (debug, **medido**).
+        let indexed = match (sel.framed_ip, sel.acct_session_id.as_deref()) {
+            (Some(ip), _) => Some(sh.by_ip.get(&ip)),
+            (None, Some(s)) => Some(sh.by_acct.get(s)),
+            (None, None) => None,
+        };
+        let hits: Vec<String> = match indexed {
+            Some(id) => id
+                .and_then(|id| sh.active.get(id))
+                .filter(|a| matches(a))
+                .map(|a| a.id.clone())
+                .into_iter()
+                .collect(),
+            None => sh
+                .active
+                .values()
+                .filter(|a| matches(a))
+                .map(|a| a.id.clone())
+                .collect(),
+        };
+        let empty = sel.user_name.is_none()
+            && sel.framed_ip.is_none()
+            && sel.calling_station_id.is_none()
+            && sel.nas_port_id.is_none()
+            && sel.acct_session_id.is_none();
+        if hits.is_empty() || empty {
+            return CoaOutcome::NotMine;
+        }
+        match req.kind {
+            CoaKind::Disconnect => sh.terminate.extend(hits),
+            CoaKind::Coa => {
+                let rate = req
+                    .changes
+                    .iter()
+                    .find(|a| a.name == "Mikrotik-Rate-Limit")
+                    .map(|a| a.value.clone());
+                let list = req
+                    .changes
+                    .iter()
+                    .find(|a| a.name == "Mikrotik-Address-List")
+                    .map(|a| a.value.clone());
+                let new_ip = req.changes.iter().any(|a| a.name == "Framed-IP-Address");
+                let change = framed::route_change(&req.changes);
+                if let Some(c) = &change
+                    && !new_ip
+                {
+                    // RFC 5176 §3.5: the whole request or nothing, so the
+                    // routes are checked here, before the ACK.
+                    for h in &hits {
+                        let ip = sh.active.get(h).and_then(|a| a.address);
+                        if let Err(why) = framed::check_change(&sh.framed, &sh.forbidden, h, ip, c)
+                        {
+                            log::info!("ppp: CoA de rotas recusado: {why}");
+                            return CoaOutcome::Nak(407); // Invalid Attribute Value
+                        }
+                    }
+                }
+                if new_ip {
+                    // PPP cannot move an open IPCP to a new address: the
+                    // subscriber reconnects and gets it.
+                    sh.terminate.extend(hits);
+                } else if rate.is_some() || list.is_some() || change.is_some() {
+                    let bad_list = list.as_deref().is_some_and(|l| {
+                        !l.is_empty() && l.parse::<corerouter_model::firewall::Name>().is_err()
+                    });
+                    if rate
+                        .as_deref()
+                        .is_some_and(|r| r.parse::<RateLimit>().is_err())
+                        || bad_list
+                    {
+                        return CoaOutcome::Nak(407); // Invalid Attribute Value
+                    }
+                    for h in hits {
+                        if let Some(c) = &change {
+                            sh.route_changes.push((h.clone(), c.clone()));
+                        }
+                        if let Some(r) = &rate {
+                            // G4.3hk: RFC 5176 §3: the ACK says the change
+                            // was made, so the session shows it before the
+                            // ACK leaves (as the IPoE one does); the worker
+                            // programs the data plane on its next turn.
+                            if let Some(a) = sh.active.get_mut(&h) {
+                                a.rate_limit = Some(r.clone());
+                            }
+                            sh.rates.push((h.clone(), r.clone()));
+                        }
+                        if let Some(l) = &list {
+                            sh.lists.push((h, l.clone()));
+                        }
+                    }
+                } else if !req.authorize_only {
+                    return CoaOutcome::Nak(401); // Unsupported Attribute
+                }
+            }
+        }
+        CoaOutcome::Ack
+    }
+}
+
+/// Counters of one session for the RADIUS interims.
+struct Counters {
+    shared: Arc<Mutex<Shared>>,
+    id: String,
+}
+
+impl AcctSource for Counters {
+    fn counters(&self) -> Option<AcctCounters> {
+        let sh = guard(&self.shared);
+        let a = sh.active.get(&self.id)?;
+        Some(acct_counters(a))
+    }
+}
+
+fn acct_counters(a: &ActiveSession) -> AcctCounters {
+    AcctCounters {
+        // RFC 2866 §5.3/§5.4: from the NAS port's view: input = from the user.
+        input_octets: a.rx_bytes,
+        output_octets: a.tx_bytes,
+        input_packets: a.rx_packets,
+        output_packets: a.tx_packets,
+        session_time: u32::try_from(a.uptime_secs).unwrap_or(u32::MAX),
+    }
+}
+
+/// An `/ip pool` allocator of the PPP service. The pool's addresses the
+/// DHCP server hands out are not seen here: a pool belongs to one of them
+/// (a pool both use is the **DHCP + PPP** check, and `/ip pool used` marks
+/// an address both hold as a conflict, G4.2i; one shared allocator is
+/// G4.2k).
+#[derive(Default)]
+struct Pools {
+    used: HashSet<u32>,
+    cursor: HashMap<String, u32>,
+}
+
+impl Pools {
+    fn take(&mut self, pools: &IpPools, name: &str) -> Option<(Ipv4Addr, String)> {
+        for p in pools.chain(name) {
+            let size = p.size();
+            if size == 0 {
+                continue;
+            }
+            let start = self.cursor.get(&p.name).copied().unwrap_or(0);
+            let mut i = 0u64;
+            while i < size {
+                let at = (u64::from(start) + i) % size;
+                if let Some(ip) = nth(p, at)
+                    && !self.used.contains(&u32::from(ip))
+                {
+                    self.used.insert(u32::from(ip));
+                    self.cursor
+                        .insert(p.name.clone(), u32::try_from((at + 1) % size).unwrap_or(0));
+                    return Some((ip, p.name.clone()));
+                }
+                i += 1;
+            }
+        }
+        None
+    }
+
+    fn hold(&mut self, ip: Ipv4Addr) -> bool {
+        self.used.insert(u32::from(ip))
+    }
+
+    fn give_back(&mut self, ip: Ipv4Addr) {
+        self.used.remove(&u32::from(ip));
+    }
+}
+
+fn nth(p: &corerouter_model::ip_pool::IpPool, mut at: u64) -> Option<Ipv4Addr> {
+    for r in &p.ranges {
+        if at < r.len() {
+            let base = u64::from(u32::from(r.start));
+            return u32::try_from(base + at).ok().map(Ipv4Addr::from);
+        }
+        at -= r.len();
+    }
+    None
+}
+
+/// A token bucket of new sessions per second (`new_session_rate`).
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+    rate: u32,
+    tokens: f64,
+    at: Millis,
+}
+
+impl Bucket {
+    fn new(rate: u32, now: Millis) -> Self {
+        Self {
+            rate,
+            tokens: f64::from(rate.max(1)),
+            at: now,
+        }
+    }
+
+    fn allow(&mut self, now: Millis) -> bool {
+        if self.rate == 0 {
+            return true;
+        }
+        let dt = now.saturating_sub(self.at) as f64 / 1000.0;
+        self.at = now;
+        let cap = f64::from(self.rate);
+        self.tokens = (self.tokens + dt * cap).min(cap);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Bucket {
+    /// A new rate for the same bucket (`new_session_rate=auto`): the
+    /// tokens saved so far stay, capped at the new size.
+    fn set_rate(&mut self, rate: u32) {
+        self.rate = rate;
+        self.tokens = self.tokens.min(f64::from(rate.max(1)));
+    }
+}
+
+/// `new_session_rate=auto` (G4.3g): the session rate follows the RADIUS
+/// server's health, AIMD like TCP's window. It grows while answers come
+/// fast and the limit is what holds the wave back, and halves when they
+/// slow down or time out. A MK-Auth/IXC-class server is the usual
+/// bottleneck of a mass reconnect: a fixed number either buries it or
+/// keeps the CPEs waiting for nothing.
+pub(crate) const AUTO_START: f64 = 1000.0;
+pub(crate) const AUTO_MIN: f64 = 50.0;
+/// The ceiling: what one BNG thread sets up (lab: ~10 000/s), doubled.
+pub(crate) const AUTO_MAX: f64 = 20_000.0;
+/// The second's p90 answer slower than this halves the rate…
+const AUTO_SLOW_MS: u64 = 300;
+/// …and faster than this lets it grow, by this much a second.
+const AUTO_FAST_MS: u64 = 100;
+const AUTO_STEP: f64 = 500.0;
+/// Answers kept for the second's percentile.
+const AUTO_SAMPLES: usize = 4096;
+/// RADIUS questions in flight at most: the rate times this much time
+/// (Little's law). The window holds a wave back while the server is
+/// already busy, before its answers slow down (G4.3g: without it the
+/// queue of a 3000/s server filled with questions nobody waited for any
+/// more, and the latency the rate followed was the queue's).
+const AUTO_WINDOW_MS: f64 = 300.0;
+const AUTO_WINDOW_MIN: usize = 8;
+/// The window before the server's capacity is measured.
+const AUTO_WINDOW_START: usize = 64;
+
+pub(crate) struct Admission {
+    pub rate: f64,
+    pub reason: String,
+    /// Workers sharing the service's rate (each measures its own share).
+    pub lanes: u16,
+    latencies: Vec<u64>,
+    timeouts: u32,
+    held_before: u64,
+    /// Logins answered per second, last seconds (the whole service's,
+    /// estimated from this worker's share): the server's measured capacity.
+    delivered: VecDeque<f64>,
+    /// Fastest answer of each of the last seconds: the server's time with
+    /// no queue in front of it.
+    fastest: VecDeque<u64>,
+    /// Still finding the server's capacity (rate doubling each second).
+    startup: bool,
+    best: f64,
+    flat: u8,
+    cycle: u8,
+}
+
+impl Default for Admission {
+    fn default() -> Self {
+        Self {
+            rate: AUTO_START,
+            reason: "início".into(),
+            lanes: 1,
+            latencies: Vec::new(),
+            timeouts: 0,
+            held_before: 0,
+            delivered: VecDeque::new(),
+            fastest: VecDeque::new(),
+            startup: true,
+            best: 0.0,
+            flat: 0,
+            cycle: 0,
+        }
+    }
+}
+
+/// Seconds of the RADIUS server's measured capacity that may wait in the
+/// BNG (in the Authenticate phase) before PADIs are held back: well under
+/// the 30 s a login may take (`answer_timeout_ms`).
+const AUTO_BACKLOG_S: f64 = 10.0;
+/// Seconds of history the capacity and the base latency look back over.
+const AUTO_HISTORY: usize = 10;
+/// BBR's gain cycle (1.25 to probe for more, 0.9 to drain what the probe
+/// queued, then cruise), one step a second.
+const AUTO_GAINS: [f64; 8] = [1.25, 0.9, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+
+impl Admission {
+    /// One RADIUS answer: its round trip, or that it never came.
+    fn answer(&mut self, ms: u64, timeout: bool) {
+        if timeout {
+            self.timeouts = self.timeouts.saturating_add(1);
+        } else if self.latencies.len() < AUTO_SAMPLES {
+            self.latencies.push(ms);
+        }
+    }
+
+    /// The server's capacity in logins a second, as measured (0: unknown).
+    fn capacity(&self) -> f64 {
+        self.delivered.iter().copied().fold(0.0, f64::max)
+    }
+
+    fn base_ms(&self) -> Option<u64> {
+        self.fastest.iter().copied().min()
+    }
+
+    /// RADIUS questions this worker may have in flight (`lanes` workers
+    /// share it): the bandwidth-delay product, the measured capacity times
+    /// the base answer time (at least [`AUTO_WINDOW_MS`]), twice that while
+    /// still probing, as BBR's cwnd gain; [`AUTO_WINDOW_START`] before any
+    /// answer. Following the rate instead let the startup's
+    /// doubling put 3.6× the server's capacity in flight (G4.3g, VM round
+    /// 3: a 5503/s limit against ~1500 logins/s).
+    fn window(&self, lanes: u16) -> usize {
+        let cap = self.capacity();
+        if cap == 0.0 {
+            // Nothing measured yet: a small first window, as TCP's and
+            // BBR's, that the first answers open. The starting rate's
+            // (1000/s × 0.6 s) queued 2 s at a 300/s server, past the
+            // client's 1.1 s timeout: a copy of every login.
+            return (AUTO_WINDOW_START / usize::from(lanes.max(1))).max(AUTO_WINDOW_MIN);
+        }
+        let bw = cap;
+        let gain = if self.startup { 2.0 } else { 1.0 };
+        let base = self.base_ms().map_or(0.0, |b| b as f64).max(AUTO_WINDOW_MS);
+        let share = bw / f64::from(lanes.max(1));
+        ((share * gain * base / 1000.0) as usize).max(AUTO_WINDOW_MIN)
+    }
+
+    /// Logins this worker lets queue (sent or waiting for the window)
+    /// before it holds PADIs back: [`AUTO_BACKLOG_S`] of the measured
+    /// capacity, never under the window.
+    fn backlog(&self, lanes: u16) -> usize {
+        let share = self.capacity().max(self.rate) / f64::from(lanes.max(1));
+        ((share * AUTO_BACKLOG_S) as usize).max(self.window(lanes))
+    }
+
+    /// Once a second. `held`: sessions the limit has held back so far;
+    /// `pending`: questions still unanswered.
+    ///
+    /// Like BBR (Cardwell et al., 2016): the rate follows the measured
+    /// capacity (answers per second, the best of the last
+    /// [`AUTO_HISTORY`] s) with a gain, doubling while that capacity still
+    /// grows; a standing queue (answers much slower than the base) drains
+    /// it to 0.9×, a timeout cuts it to 0.75×. A plain AIMD on the latency
+    /// alone halved itself into a slow crawl (G4.3g: 100 000 in 517 s
+    /// against a 3000/s server).
+    fn second(&mut self, held: u64, pending: usize) {
+        let waiting = held > self.held_before;
+        self.held_before = held;
+        self.latencies.sort_unstable();
+        let p90 = self
+            .latencies
+            .get(self.latencies.len().saturating_mul(9) / 10)
+            .copied();
+        let lanes = f64::from(self.lanes.max(1));
+        let answered = self.latencies.len() as f64 * lanes;
+        self.delivered.push_back(answered);
+        if let Some(f) = self.latencies.first() {
+            self.fastest.push_back(*f);
+        }
+        while self.delivered.len() > AUTO_HISTORY {
+            self.delivered.pop_front();
+        }
+        while self.fastest.len() > AUTO_HISTORY {
+            self.fastest.pop_front();
+        }
+        let cap = self.capacity();
+        let base = self.base_ms();
+        // A standing queue: the p90 well above what the server takes with
+        // nothing in front (and above what anyone would call fast).
+        let queued = match (p90, base) {
+            (Some(p), Some(b)) => p > (2 * b + 50).max(AUTO_FAST_MS) || p > AUTO_SLOW_MS,
+            (Some(p), None) => p > AUTO_SLOW_MS,
+            _ => false,
+        };
+        if self.timeouts > 0 {
+            self.startup = false;
+            self.rate = (cap * 0.75).max(self.rate / 2.0).max(AUTO_MIN);
+            self.reason = format!("RADIUS sem resposta: {} timeouts", self.timeouts);
+        } else if p90.is_none() && pending > 0 {
+            // A whole second with questions out and no answer at all.
+            self.startup = false;
+            self.rate = (self.rate / 2.0).max(AUTO_MIN);
+            self.reason = format!("RADIUS parado: {pending} pedidos sem resposta");
+        } else if queued {
+            self.startup = false;
+            let p = p90.unwrap_or(0);
+            self.rate = if cap > 0.0 {
+                cap * 0.9
+            } else {
+                self.rate / 2.0
+            }
+            .max(AUTO_MIN);
+            self.reason = match base {
+                Some(b) => format!("RADIUS lento: {p} ms (sem fila: {b} ms)"),
+                None => format!("RADIUS lento: {p} ms"),
+            };
+        } else if !waiting {
+            self.reason = "sem fila".into();
+        } else if cap == 0.0 {
+            // Local secrets, no RADIUS answers to measure: grow as before.
+            self.rate = (self.rate + AUTO_STEP).min(AUTO_MAX);
+            self.reason = "subindo: sem RADIUS no caminho".into();
+        } else if self.startup {
+            // Still finding the ceiling: twice what was answered, while that
+            // keeps growing.
+            if cap > self.best * 1.25 {
+                self.best = cap;
+                self.flat = 0;
+            } else {
+                self.flat += 1;
+            }
+            if self.flat >= 3 {
+                self.startup = false;
+            }
+            self.rate = (cap * 2.0).clamp(AUTO_MIN, AUTO_MAX);
+            self.reason = format!("subindo: RADIUS responde {cap:.0}/s");
+        } else {
+            let gain = AUTO_GAINS
+                .get(usize::from(self.cycle))
+                .copied()
+                .unwrap_or(1.0);
+            self.cycle = (self.cycle + 1) % AUTO_GAINS.len() as u8;
+            self.rate = (cap * gain).clamp(AUTO_MIN, AUTO_MAX);
+            self.reason = format!("na capacidade do RADIUS: {cap:.0}/s");
+        }
+        self.latencies.clear();
+        self.timeouts = 0;
+    }
+}
+
+/// Slow path: subscriber address → the worker holding it.
+pub(crate) type Routes = Arc<std::sync::RwLock<HashMap<Ipv4Addr, u16>>>;
+/// Slow path, IPv6 (G4.3l): which worker holds each subscriber prefix.
+pub(crate) type Routes6 = Arc<std::sync::RwLock<Net6Index<u16>>>;
+
+/// A worker's share of a per-second rate (0 = no limit stays 0).
+fn share(rate: u32, lanes: u16) -> u32 {
+    if rate == 0 {
+        0
+    } else {
+        rate.div_ceil(u32::from(lanes.max(1))).max(1)
+    }
+}
+
+/// A port the driver opened for a server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PortInfo {
+    pub ifindex: u32,
+    pub mac: [u8; 6],
+}
+
+struct Slot {
+    cfg: PppoeServer,
+    port: PortInfo,
+    server: Server,
+    bucket: Bucket,
+    /// `cfg.service_table()`, kept (looked up at every login, G4.3k).
+    services: Vec<PppoeService>,
+}
+
+impl Slot {
+    /// The profile of the row a session asking for `name` lands on, if the
+    /// row names one (G4.3k).
+    fn profile_for(&self, name: &[u8]) -> Option<String> {
+        let row = |want: &ServiceName| self.services.iter().find(|r| r.name == *want);
+        let named = std::str::from_utf8(name).ok().filter(|n| !n.is_empty());
+        let hit = match named {
+            Some(n) => row(&ServiceName::Name(n.to_owned())).or_else(|| row(&ServiceName::Any)),
+            None if name.is_empty() => row(&ServiceName::Empty),
+            None => row(&ServiceName::Any),
+        };
+        hit.and_then(|r| r.profile.clone())
+    }
+}
+
+/// A session the BNG knows (from PADR to its Down).
+struct Sub {
+    slot: usize,
+    sref: SessionRef,
+    user: String,
+    mac: Mac,
+    stage: Stage,
+    effective: Effective,
+    radius: bool,
+    /// The address and the pool it came from (`None`: fixed).
+    ip: Option<Ipv4Addr>,
+    pool: Option<String>,
+    rate: Option<String>,
+    acct_id: String,
+    interim: Option<u32>,
+    /// RFC 2865 §5.25: the Accept's Class attributes, echoed byte for byte
+    /// in every Accounting-Request (and carried to the pair, G4.3ha).
+    class: Vec<Vec<u8>>,
+    xdp: Option<u32>,
+    up_at: Option<Millis>,
+    limit_in: u64,
+    limit_out: u64,
+    session_timeout: Option<u32>,
+    reply_message: Option<String>,
+    /// Why it was ended here, when the reason is ours (idle, limit).
+    cause: Option<(u32, &'static str)>,
+    last_bytes: (u64, u64),
+    /// Bytes and time of the last tick, for the rates.
+    prev: (u64, u64, Millis),
+    /// When its address-list entry was (re)made: dynamic entries last at
+    /// most 35 days, so a longer session gets it made again.
+    list_at: Millis,
+    idle_since: Millis,
+    /// The tags of the line (G4.3l: two in QinQ).
+    vlans: Vlans,
+    /// NAS-Port-Id for RADIUS: the circuit id (with
+    /// `use_circuit_id_in_nas_port_id`), else the port, with
+    /// `:<outer>-<inner>` for a QinQ line (Junos' form).
+    nas_port_id: String,
+    /// The RADIUS question in flight, to call off if the session ends.
+    auth_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    circuit_id: Option<String>,
+    remote_id: Option<String>,
+    /// G4.3k: the Service-Name asked for and the profile its row gives
+    /// (in `default_profile`'s place).
+    service_name: String,
+    fallback_profile: String,
+    mtu: u16,
+    /// G4.3e: what RADIUS said about IPv6, and the session's IPv6 once
+    /// IPv6CP is up.
+    radius6: RadiusV6,
+    v6: Option<Box<V6>>,
+    /// G4.3cd: the routes the secret or RADIUS gave (installed at Up), the
+    /// RADIUS texts already refused, and the routes installed.
+    want_routes: Vec<(FramedRoute, RouteOrigin)>,
+    want_refused: Vec<String>,
+    routes: Vec<(FramedRoute, RouteOrigin)>,
+    /// G4.3h: counters carried over from the other node of the pair
+    /// (rx bytes, tx bytes, rx packets, tx packets), under the data plane's.
+    base: [u64; 4],
+    /// G4.3w: one-session-per-host, the host's session this one takes
+    /// over once its credentials are good (ended in [`Bng::replace_old`]).
+    replaces: Option<SessionRef>,
+}
+
+/// What the hot paths look up in [`Bng::subs`] without walking it
+/// (G4.3g: a walk per PADI, per login and per slow-path packet made a
+/// session cost grow with the sessions up: 19 → 181 µs from 0 to 60 000).
+#[derive(Default)]
+struct SubIndex {
+    /// Sessions up, by address: the slow path's downstream lookup.
+    by_ip: HashMap<Ipv4Addr, (usize, u16)>,
+    /// Sessions up per login: `only-one`.
+    users_up: HashMap<String, u32>,
+    /// Sessions between authentication and Up, per (slot, MAC): the PADI's
+    /// `new_session_rate`.
+    pending: HashMap<(usize, [u8; 6]), u32>,
+}
+
+impl SubIndex {
+    /// Room for `n` more sessions up (a takeover's share, G4.3hh).
+    fn reserve(&mut self, n: usize) {
+        self.by_ip.reserve(n);
+        self.users_up.reserve(n);
+    }
+
+    fn add(&mut self, key: (usize, u16), sub: &Sub) {
+        if sub.up_at.is_some() {
+            *self.users_up.entry(sub.user.clone()).or_default() += 1;
+            if let Some(ip) = sub.ip {
+                self.by_ip.insert(ip, key);
+            }
+        } else {
+            *self.pending.entry((sub.slot, sub.mac.0)).or_default() += 1;
+        }
+    }
+
+    fn remove(&mut self, key: (usize, u16), sub: &Sub) {
+        fn dec<K: std::hash::Hash + Eq>(m: &mut HashMap<K, u32>, k: &K) {
+            if let Some(n) = m.get_mut(k) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    m.remove(k);
+                }
+            }
+        }
+        if sub.up_at.is_some() {
+            dec(&mut self.users_up, &sub.user);
+            if let Some(ip) = sub.ip
+                && self.by_ip.get(&ip) == Some(&key)
+            {
+                self.by_ip.remove(&ip);
+            }
+        } else {
+            dec(&mut self.pending, &(sub.slot, sub.mac.0));
+        }
+    }
+}
+
+/// An answer for the server, queued while its events are handled.
+enum Reply {
+    Auth(AuthVerdict),
+    Address(Option<Ipv4Assignment>),
+    Terminate,
+    Ipv6(Ipv6Mode),
+}
+
+/// A RADIUS answer on its way back to the BNG thread.
+pub(crate) struct AuthDone {
+    slot: usize,
+    sref: SessionRef,
+    asked: Millis,
+    reply: AuthReply,
+}
+
+/// The running config the BNG follows.
+#[derive(Clone, Default)]
+pub(crate) struct Snapshot {
+    pub ppp: Ppp,
+    pub pools: IpPools,
+    /// The daemon's RADIUS service, if any.
+    pub aaa: Option<Arc<dyn AaaBackend>>,
+    /// Unix time of `now` = 0 (the history's clock).
+    pub unix_base: u64,
+    /// G4.3e: `/ipv6 pool` (the profiles' IPv6 pools).
+    pub pools6: Vec<corerouter_model::dhcp6_server::Ipv6Pool>,
+    /// RFC 8064 secret of the IPv6CP identifiers (kept on disk by the
+    /// driver, so a line keeps its link-local across restarts); `None`:
+    /// one drawn from the seed, for this run.
+    pub iid_key: Option<[u8; 32]>,
+    /// G4.3n: opens the secrets' sealed passwords (`None`: only the ones
+    /// kept in clear open).
+    pub seal: Option<Arc<corerouter_engine::sealing::SealKey>>,
+    /// G4.9b: `/queue type`s, for the profiles' download queue.
+    pub queues: corerouter_model::queue::Queues,
+    /// G4.3cd: who holds each routed block (the router's, shared with
+    /// IPoE and the commands) and the space no route may take.
+    pub framed: FramedTable,
+    pub forbidden: Arc<Forbidden>,
+    /// `/system identity`: the PADO's AC-Name, as RouterOS sends it (a
+    /// CPE's `ac-name=` matches it; G3.9g).
+    pub identity: String,
+}
+
+/// G4.3h: this node is the active one of its redundant pair (set by the
+/// daemon's `ppp-ha` service; false until it says so: a node that boots
+/// keeps quiet until the pair decides).
+pub(crate) static HA_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// G4.3hk: may this node answer subscribers? `configured`: the service's
+/// copy of the config has redundancy on; `active`: the pair says this node
+/// answers. The `ppp-ha` loop and the PPPoE/IPoE services read the config
+/// each on its own second, so right after `ppp.redundancy.set` one of them
+/// has the pair and the other not yet. A standby whose PPPoE still ran
+/// without it answered PADIs from its own MAC while the active answered
+/// from the virtual one (the netns test: 5 of 48 runs, **medido**). Both
+/// must agree: no pair on either side answers as before; a pair on either
+/// side answers only when active and configured (from the virtual MAC).
+pub(crate) fn ha_may_answer(configured: bool, active: bool) -> bool {
+    may_answer(
+        configured,
+        HA_PAIRED.load(std::sync::atomic::Ordering::Acquire),
+        active,
+    )
+}
+
+pub(crate) fn may_answer(configured: bool, paired: bool, active: bool) -> bool {
+    if configured { active } else { !paired }
+}
+
+/// G4.3hk: the `ppp-ha` loop runs a pair (set by it, with [`HA_ACTIVE`]).
+pub(crate) static HA_PAIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) struct Bng {
+    slots: Vec<Slot>,
+    subs: HashMap<(usize, u16), Sub>,
+    /// Kept with `subs` (every insert, remove and Up goes through it).
+    index: SubIndex,
+    /// Shared by the workers: an address is lent once in the whole BNG.
+    pools: Arc<Mutex<Pools>>,
+    /// This worker's "Why?" table (also in `Shared::whys` for the reads).
+    why: Arc<Mutex<WhyTable>>,
+    /// Counters published in `tick` (no shared lock per frame).
+    counts: Counts,
+    /// This worker and how many there are (G4.3g): SESSION_IDs and XDP
+    /// slots are split by `lane`, frames come by the client's MAC.
+    lane: u16,
+    lanes: u16,
+    /// Slow path: which worker holds each subscriber address (the driver
+    /// hands it the packets the kernel routes to `bng0`).
+    routes: Routes,
+    routes6: Routes6,
+    /// Slow path, IPv6: the session of each /64 and delegated prefix.
+    net6: Net6Index<(usize, u16)>,
+    xdp_free: Vec<u32>,
+    xdp_next: u32,
+    pub shared: Arc<Mutex<Shared>>,
+    pub effects: Vec<Effect>,
+    /// Frames to send: (ifindex, bytes).
+    pub frames: Vec<(u32, Vec<u8>)>,
+    /// Slow path: subscribers' IPv4 packets for the stack.
+    pub upstream: Vec<Vec<u8>>,
+    replies: VecDeque<(usize, SessionRef, Reply)>,
+    auth_tx: Sender<AuthDone>,
+    auth_rx: Receiver<AuthDone>,
+    pending_auth: usize,
+    cfg: Snapshot,
+    seq: u64,
+    seed: [u8; 32],
+    out: ServerOutput,
+    /// The data plane takes the traffic (else the slow path does).
+    pub xdp: bool,
+    /// PADIs held back by `new_session_rate`.
+    padr_throttled: u64,
+    /// The rate of the servers with `new_session_rate=auto`.
+    pub admission: Admission,
+    /// auto: Access-Requests waiting for room in the window.
+    auth_queue: VecDeque<(usize, SessionRef, RadiusRequest)>,
+    queued_total: u64,
+    /// G4.3e: the /64s and delegated prefixes the sessions hold.
+    pools6: Arc<Mutex<Pools6>>,
+    /// IPv6 packets refused before reaching a session's control plane.
+    v6_dropped: u64,
+    /// G4.3h: what this worker publishes to the pair, and its takeovers.
+    pub(crate) ha: ha::HaState,
+}
+
+/// One discovery or session frame's code and source, read before the
+/// server sees it (`ppp.why` counts, the session-rate limit).
+fn peek(frame: &[u8]) -> Option<(Code, Mac, Vlans)> {
+    let d = discovery::parse(frame).ok()?;
+    Some((d.code, d.src, d.vlans))
+}
+
+fn mac_text(m: Mac) -> String {
+    MacAddr(m.0).to_string()
+}
+
+fn auth_set(list: &[PppAuth]) -> AuthSet {
+    let protos: Vec<AuthProto> = list
+        .iter()
+        .map(|a| match a {
+            PppAuth::Mschap2 => AuthProto::MsChapV2,
+            PppAuth::Mschap1 => AuthProto::MsChapV1,
+            PppAuth::Chap => AuthProto::ChapMd5,
+            PppAuth::Pap => AuthProto::Pap,
+        })
+        .collect();
+    AuthSet::new(&protos)
+}
+
+/// `proto-pppoe`'s configuration for one server entry.
+pub(crate) fn server_config(
+    v: &PppoeServer,
+    mac: [u8; 6],
+    local: Option<Ipv4Addr>,
+) -> ServerConfig {
+    let mut c = ServerConfig {
+        ac_mac: Mac(mac),
+        ac_name: b"CoreRouter".to_vec(),
+        services: service_table(&v.service_table()),
+        one_session_per_host: v.one_session_per_host,
+        auth: auth_set(&v.authentication),
+        max_mru: v.max_mru,
+        max_mtu: v.max_mtu,
+        require_cookie: v.ac_cookie,
+        padi_limit: v.padi_limit,
+        mac_padi_limit: v.mac_padi_limit,
+        local_ipv4: local,
+        ..ServerConfig::default()
+    };
+    // RouterOS keepalive-timeout: echoes from timeout/2, gone after timeout.
+    match v.keepalive_timeout {
+        Some(t) => {
+            c.keepalive_interval_ms = u64::from(t) * 500;
+            c.keepalive_misses = 2;
+        }
+        None => c.keepalive_interval_ms = 0,
+    }
+    let mut tiers: Vec<(u32, u32)> = vec![(0, v.pado_delay)];
+    tiers.extend(
+        v.pado_delay_by_load
+            .iter()
+            .map(|t| (t.sessions, v.pado_delay.saturating_add(t.delay_ms))),
+    );
+    tiers.retain(|t| t.1 > 0);
+    c.pado_delay = tiers;
+    // G4.3l: RFC 4638 and sessions per VLAN.
+    c.max_payload = v.max_payload;
+    c.max_per_vlan = v.max_sessions_per_vlan;
+    // G4.3m: sessions per MAC and short-cycle protection.
+    c.max_per_mac = v.max_sessions_per_mac;
+    c.short_cycle = v.short_cycle_protection.then(|| ShortCycle {
+        min_ms: u64::from(v.lockout_time_min) * 1000,
+        max_ms: u64::from(v.lockout_time_max) * 1000,
+    });
+    let ranges = |r: &[corerouter_model::ppp::VlanRange]| -> Vec<std::ops::RangeInclusive<u16>> {
+        r.iter().map(|x| x.first..=x.last).collect()
+    };
+    if v.vlan_mode == VlanMode::Stacked {
+        c.vlans = VlanFilter::Stacked {
+            outer: ranges(&v.outer_vlan_range),
+            inner: ranges(&v.inner_vlan_range),
+            tpid: v.outer_tpid.value(),
+            untagged: v.accept_untagged,
+        };
+        return c;
+    }
+    c.vlans = if v.pppoe_over_vlan_range.is_empty() {
+        VlanFilter::Untagged
+    } else {
+        let mut r: Vec<std::ops::RangeInclusive<u16>> = v
+            .pppoe_over_vlan_range
+            .iter()
+            .map(|x| x.first..=x.last)
+            .collect();
+        if v.accept_untagged {
+            r.push(0..=0);
+        }
+        VlanFilter::Ranges(r)
+    };
+    c
+}
+
+/// `proto-pppoe`'s Service-Name table of a server's rows (G4.3k).
+pub(crate) fn service_table(rows: &[PppoeService]) -> ServiceTable {
+    let rule = |r: &PppoeService| ServiceRule {
+        action: match r.action {
+            ServiceAction::Terminate => ProtoAction::Terminate,
+            ServiceAction::Delay => ProtoAction::Delay,
+            ServiceAction::Drop => ProtoAction::Drop,
+        },
+        delay_ms: r.pado_delay,
+        max_sessions: r.max_sessions,
+        padi_limit: r.padi_limit,
+    };
+    let find = |n: &ServiceName| {
+        rows.iter()
+            .find(|r| r.name == *n)
+            .map(rule)
+            .unwrap_or_default()
+    };
+    ServiceTable::new(
+        rows.iter().filter_map(|r| match &r.name {
+            ServiceName::Name(n) => Some((n.as_bytes().to_vec(), rule(r))),
+            _ => None,
+        }),
+        find(&ServiceName::Empty),
+        find(&ServiceName::Any),
+    )
+}
+
+/// What a session ending means, for the log, the history and RADIUS.
+/// The key `ppp.why` gives a refusal (G4.3m).
+fn refusal_key(r: Refusal) -> &'static str {
+    match r {
+        Refusal::Service => "service-limit",
+        Refusal::Vlan => "max-sessions-per-vlan",
+        Refusal::Mac => "max-sessions-per-mac",
+        Refusal::ShortCycle { .. } => "short-cycle",
+    }
+}
+
+/// What to do about a refusal, in Portuguese (the "Why?" panel).
+fn refusal_hint(r: Refusal) -> String {
+    match r {
+        Refusal::Service => "A linha do Service-Name recusou: ação drop, ou max_sessions/padi_limit da linha (interface.pppoe-server.server.service.list).".to_owned(),
+        Refusal::Vlan => "A VLAN já tem o máximo de sessões (max_sessions_per_vlan): outro CPE ocupa a linha, ou aumente o limite.".to_owned(),
+        Refusal::Mac => "Este MAC já tem o máximo de sessões (max_sessions_per_mac): veja ppp.active.list por este MAC.".to_owned(),
+        Refusal::ShortCycle { left_ms, strikes, cause } => {
+            let (last, hint, ..) = explain(cause);
+            format!(
+                "Reconexão em loop: {strikes} sessões curtas seguidas, bloqueado por mais {} s. A última caiu por {last}: {hint} Para liberar agora: ppp.lockout.clear.",
+                left_ms.div_ceil(1000)
+            )
+        }
+    }
+}
+
+pub(crate) fn explain(r: DownReason) -> (&'static str, &'static str, Stage, u32) {
+    // (reason, hint in Portuguese, stage, RFC 2866 §5.10 Acct-Terminate-Cause)
+    match r {
+        DownReason::PeerPadt => (
+            "peer-padt",
+            "O CPE encerrou a sessão (PADT). Normal ao desligar; se repete em loop, veja o CPE.",
+            Stage::Up,
+            1,
+        ),
+        DownReason::PeerTerminate => (
+            "peer-terminate",
+            "O CPE pediu o fim do enlace (LCP Terminate-Request).",
+            Stage::Up,
+            1,
+        ),
+        DownReason::Admin => (
+            "admin",
+            "Desconectado pelo operador (ppp.active.remove) ou por um Disconnect/CoA do RADIUS.",
+            Stage::Up,
+            6,
+        ),
+        DownReason::AuthFailed => (
+            "auth-failed",
+            "Usuário ou senha recusados: confira o secret (ppp.secret.list) ou a mensagem do RADIUS.",
+            Stage::Auth,
+            17,
+        ),
+        DownReason::AuthTimeout => (
+            "auth-timeout",
+            "A autenticação não respondeu a tempo: RADIUS lento ou fora (radius.monitor), ou o CPE não mandou as credenciais.",
+            Stage::Auth,
+            17,
+        ),
+        DownReason::LcpFailed => (
+            "lcp-failed",
+            "O LCP não fechou: MRU/MTU ou método de autenticação que o CPE não aceita (authentication do servidor).",
+            Stage::Lcp,
+            8,
+        ),
+        DownReason::NcpFailed => (
+            "ncp-failed",
+            "Sem endereço IP: pool cheio ou sem remote_address no perfil (ip.pool.print).",
+            Stage::Ncp,
+            8,
+        ),
+        DownReason::Keepalive => (
+            "keepalive",
+            "O CPE parou de responder ao LCP echo: queda de energia, do enlace ou CPE travado.",
+            Stage::Up,
+            2,
+        ),
+        DownReason::SetupTimeout => (
+            "setup-timeout",
+            "A sessão não subiu em 60 s depois do PADS.",
+            Stage::Lcp,
+            8,
+        ),
+        DownReason::SessionTimeout => (
+            "session-timeout",
+            "Fim do tempo de sessão (session_timeout do perfil ou Session-Timeout do RADIUS).",
+            Stage::Up,
+            5,
+        ),
+        DownReason::Replaced => (
+            "replaced",
+            "Nova sessão do mesmo MAC (one-session-per-host): o CPE reiniciou sem mandar PADT.",
+            Stage::Up,
+            10,
+        ),
+    }
+}
+
+impl Bng {
+    pub(crate) fn new(seed: [u8; 32]) -> Self {
+        let (auth_tx, auth_rx) = channel();
+        let why = Arc::new(Mutex::new(WhyTable {
+            lanes: 1,
+            ..WhyTable::default()
+        }));
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        guard(&shared).whys.push(why.clone());
+        Self {
+            slots: Vec::new(),
+            subs: HashMap::new(),
+            index: SubIndex::default(),
+            pools: Arc::new(Mutex::new(Pools::default())),
+            lane: 0,
+            lanes: 1,
+            routes: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            routes6: Arc::new(std::sync::RwLock::new(Net6Index::default())),
+            net6: Net6Index::default(),
+            xdp_free: Vec::new(),
+            xdp_next: 0,
+            shared,
+            why,
+            counts: Counts::default(),
+            effects: Vec::new(),
+            frames: Vec::new(),
+            upstream: Vec::new(),
+            replies: VecDeque::new(),
+            auth_tx,
+            auth_rx,
+            pending_auth: 0,
+            cfg: Snapshot::default(),
+            seq: 0,
+            seed,
+            out: ServerOutput::new(),
+            xdp: false,
+            padr_throttled: 0,
+            admission: Admission::default(),
+            auth_queue: VecDeque::new(),
+            queued_total: 0,
+            pools6: Arc::new(Mutex::new(Pools6::default())),
+            v6_dropped: 0,
+            ha: ha::HaState::default(),
+        }
+    }
+
+    /// Worker `lane` of `lanes`, sharing this one's tables: the active
+    /// table and history (`Shared`), the address pools and the slow path's
+    /// routes. Its own servers, sessions and timers (G4.3g).
+    pub(crate) fn sibling(&self, seed: [u8; 32], lane: u16, lanes: u16) -> Self {
+        let mut b = Self::new(seed);
+        b.shared = self.shared.clone();
+        guard(&b.why).lanes = usize::from(lanes.max(1));
+        guard(&b.shared).whys.push(b.why.clone());
+        b.pools = self.pools.clone();
+        b.pools6 = self.pools6.clone();
+        b.routes = self.routes.clone();
+        b.routes6 = self.routes6.clone();
+        b.lane = lane;
+        b.lanes = lanes.max(1);
+        b.admission.lanes = b.lanes;
+        b
+    }
+
+    /// The first of `lanes` workers.
+    pub(crate) fn first_of(seed: [u8; 32], lanes: u16) -> Self {
+        let mut b = Self::new(seed);
+        b.lanes = lanes.max(1);
+        b.admission.lanes = b.lanes;
+        let n = usize::from(b.lanes);
+        guard(&b.shared).lanes = vec![LaneStats::default(); n];
+        guard(&b.why).lanes = n;
+        b
+    }
+
+    /// The slow path's address → worker table, for the reader.
+    pub(crate) fn clone_routes(&self) -> Routes {
+        self.routes.clone()
+    }
+
+    /// The worker of slow-path address `ip`, if a session holds it.
+    pub(crate) fn route_lane_in(routes: &Routes, ip: Ipv4Addr) -> Option<u16> {
+        routes.read().ok().and_then(|r| r.get(&ip).copied())
+    }
+
+    pub(crate) fn clone_routes6(&self) -> Routes6 {
+        self.routes6.clone()
+    }
+
+    /// The worker of slow-path IPv6 address `ip` (longest prefix).
+    pub(crate) fn route6_lane_in(routes: &Routes6, ip: std::net::Ipv6Addr) -> Option<u16> {
+        routes.read().ok().and_then(|r| r.get(ip))
+    }
+
+    /// The worker of a frame from a client (its source MAC; RSS-like): a
+    /// multiplicative hash of the last four bytes of the MAC (frame bytes
+    /// 8..12), so a vendor's shared OUI and a power-of-two `lanes` still
+    /// spread.
+    pub(crate) fn lane_of(frame: &[u8], lanes: u16) -> u16 {
+        let b = |i: usize| frame.get(i).copied().unwrap_or(0);
+        let tpid =
+            |i: usize| matches!([b(i), b(i + 1)], [0x81, 0x00] | [0x88, 0xa8] | [0x91, 0x00]);
+        // G4.3l: a QinQ line (two tags) goes by its tags, so all of a
+        // line's CPEs meet on one worker and `max_sessions_per_vlan` holds
+        // exactly; everything else by the client's MAC.
+        let k = if tpid(12) && tpid(16) {
+            u32::from_be_bytes([b(14), b(15), b(18), b(19)]) & 0x0FFF_0FFF
+        } else {
+            u32::from_be_bytes([b(8), b(9), b(10), b(11)])
+        };
+        ((k.wrapping_mul(0x9E37_79B1) >> 16) % u32::from(lanes.max(1))) as u16
+    }
+
+    fn log(&mut self, error: bool, text: String) {
+        self.effects.push(Effect::Log { error, text });
+    }
+
+    /// Servers the config wants, with what the driver must open.
+    pub(crate) fn wanted(cfg: &Ppp) -> Vec<PppoeServer> {
+        cfg.pppoe_servers
+            .iter()
+            .filter(|v| !v.disabled)
+            .cloned()
+            .collect()
+    }
+
+    /// Follow the config: `ports` has the port of each wanted server the
+    /// driver opened (by server name). A server whose port or restart
+    /// fields changed starts over (its sessions end); other changes reach
+    /// new sessions.
+    pub(crate) fn configure(
+        &mut self,
+        now: Millis,
+        snap: Snapshot,
+        ports: &HashMap<String, PortInfo>,
+    ) {
+        let wanted = Self::wanted(&snap.ppp);
+        {
+            let mut sh = guard(&self.shared);
+            sh.framed = snap.framed.clone();
+            sh.forbidden = snap.forbidden.clone();
+        }
+        self.cfg = snap;
+        // G4.3hh: the secrets' name index is built on the first lookup; on
+        // a standby that is the takeover itself, in every worker at once
+        // (≈ 30 ms per worker with 100 000 secrets, **medido**). Built here.
+        let _ = self.cfg.ppp.secret("");
+        // Servers gone or restarted: end their sessions.
+        let mut keep: Vec<bool> = Vec::with_capacity(self.slots.len());
+        for s in &self.slots {
+            let same = wanted.iter().find(|w| w.id == s.cfg.id).is_some_and(|w| {
+                w.interface == s.cfg.interface
+                    && w.pppoe_over_vlan_range == s.cfg.pppoe_over_vlan_range
+                    && w.accept_untagged == s.cfg.accept_untagged
+                    && ports.get(&w.name) == Some(&s.port)
+            });
+            keep.push(same);
+        }
+        let mut i = self.slots.len();
+        while i > 0 {
+            i -= 1;
+            if keep.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            self.drop_slot(now, i);
+        }
+        for w in wanted {
+            let Some(port) = ports.get(&w.name).copied() else {
+                continue;
+            };
+            let local = match self
+                .cfg
+                .ppp
+                .profile(&w.default_profile)
+                .and_then(|p| p.local_address)
+            {
+                Some(AddrOrPool::Address(ip)) => Some(ip),
+                _ => None,
+            };
+            let mut sc = server_config(&w, port.mac, local);
+            if !self.cfg.identity.is_empty() {
+                sc.ac_name = self.cfg.identity.as_bytes().to_vec();
+            }
+            // G4.3g: this worker's share of the port's SESSION_IDs, of the
+            // PADI limit and of the load the PADO delay looks at (a MAC
+            // always comes to the same worker: its own limit stays).
+            sc.sid_lane = (self.lane, self.lanes);
+            let lanes = u32::from(self.lanes);
+            if sc.padi_limit > 0 {
+                sc.padi_limit = sc.padi_limit.div_ceil(lanes);
+            }
+            // The Service-Name rows' limits too (G4.3k): the MACs spread
+            // evenly over the workers.
+            let rows = w.service_table();
+            let mut named: Vec<(Vec<u8>, ServiceRule)> =
+                sc.services.named().map(|(n, r)| (n.to_vec(), *r)).collect();
+            let split = |r: &mut ServiceRule| {
+                for v in [&mut r.max_sessions, &mut r.padi_limit] {
+                    if *v > 0 {
+                        *v = v.div_ceil(lanes);
+                    }
+                }
+            };
+            named.iter_mut().for_each(|(_, r)| split(r));
+            let (mut empty, mut any) = (sc.services.empty, sc.services.any);
+            split(&mut empty);
+            split(&mut any);
+            sc.services = ServiceTable::new(named, empty, any);
+            for t in &mut sc.pado_delay {
+                t.0 = t.0.div_ceil(lanes);
+            }
+            // G4.3e: IPv6CP everywhere, each session as its profile says
+            // (`Reply::Ipv6` before the verdict); identifiers stable per line.
+            sc.ipv6 = true;
+            sc.ipv6_iid_key = Some(self.cfg.iid_key.unwrap_or(self.seed));
+            // G4.3m: with one tag a VLAN's subscribers split over the workers
+            // by MAC: `max_sessions_per_vlan` holds on a count they share.
+            if self.lanes > 1 {
+                sc.vlan_share = Some(
+                    guard(&self.shared)
+                        .vlan_shares
+                        .entry(w.id)
+                        .or_default()
+                        .clone(),
+                );
+            }
+            // G4.3h: both nodes of a pair accept each other's AC-Cookie.
+            let ha = &self.cfg.ppp.redundancy;
+            sc.cookie_secret = (ha.enabled && !ha.secret.is_empty())
+                .then(|| corerouter_proto_ha::hello::derive("ac-cookie", ha.secret.as_bytes()));
+            match self.slots.iter_mut().find(|s| s.cfg.id == w.id) {
+                Some(s) => {
+                    s.server.reconfigure(sc);
+                    s.services = rows;
+                    if w.new_session_rate_auto {
+                        // The tick moves it; switching to auto keeps the
+                        // tokens.
+                        s.bucket
+                            .set_rate(share(self.admission.rate as u32, self.lanes));
+                    } else if s.bucket.rate != share(w.new_session_rate, self.lanes)
+                        || s.cfg.new_session_rate_auto
+                    {
+                        s.bucket = Bucket::new(share(w.new_session_rate, self.lanes), now);
+                    }
+                    s.cfg = w;
+                }
+                None => {
+                    let mut seed = self.seed;
+                    if let Some(b) = seed.first_mut() {
+                        *b ^= (self.slots.len() as u8).wrapping_add(1);
+                    }
+                    let name = w.name.clone();
+                    let interface = w.interface.to_string();
+                    let rate = share(
+                        if w.new_session_rate_auto {
+                            self.admission.rate as u32
+                        } else {
+                            w.new_session_rate
+                        },
+                        self.lanes,
+                    );
+                    self.slots.push(Slot {
+                        bucket: Bucket::new(rate, now),
+                        server: Server::new(sc, seed, now),
+                        port,
+                        cfg: w,
+                        services: rows,
+                    });
+                    if self.lane == 0 {
+                        self.log(
+                            false,
+                            format!("PPPoE: servidor {name} atendendo em {interface}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Remove slot `i`, ending its sessions without frames (the port is
+    /// gone or restarts: the CPEs reconnect after their keepalive or our
+    /// PADT to their next frame).
+    fn drop_slot(&mut self, now: Millis, i: usize) {
+        let keys: Vec<(usize, u16)> = self.subs.keys().filter(|k| k.0 == i).copied().collect();
+        for k in keys {
+            if let Some(sub) = self.take_sub(k) {
+                self.ended(now, sub, DownReason::Admin, true);
+            }
+        }
+        if i < self.slots.len() {
+            let s = self.slots.remove(i);
+            if self.lane == 0 {
+                self.log(false, format!("PPPoE: servidor {} parado", s.cfg.name));
+            }
+        }
+        // Slots after `i` moved down one.
+        let moved: Vec<((usize, u16), Sub)> = self
+            .subs
+            .drain()
+            .map(|((slot, sid), mut sub)| {
+                let slot = if slot > i { slot - 1 } else { slot };
+                sub.slot = slot;
+                ((slot, sid), sub)
+            })
+            .collect();
+        self.subs.extend(moved);
+        // The slots were renumbered: index again (a server removed, rare).
+        self.index = SubIndex::default();
+        for (k, sub) in &self.subs {
+            self.index.add(*k, sub);
+        }
+    }
+
+    /// Remove a session, keeping the index.
+    fn take_sub(&mut self, key: (usize, u16)) -> Option<Sub> {
+        let sub = self.subs.remove(&key)?;
+        if let Some(c) = &sub.auth_cancel {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.index.remove(key, &sub);
+        if sub.up_at.is_some()
+            && let Some(ip) = sub.ip
+            && let Ok(mut r) = self.routes.write()
+            && r.get(&ip) == Some(&self.lane)
+        {
+            r.remove(&ip);
+        }
+        Some(sub)
+    }
+
+    /// The earliest time [`Bng::timers`] has work.
+    pub(crate) fn next_deadline(&self) -> Option<Millis> {
+        self.slots
+            .iter()
+            .filter_map(|s| s.server.next_deadline())
+            .min()
+    }
+
+    pub(crate) fn waiting_radius(&self) -> bool {
+        self.pending_auth > 0
+    }
+
+    /// A frame from the port `ifindex`.
+    pub(crate) fn frame(&mut self, now: Millis, ifindex: u32, frame: &[u8]) {
+        let Some(i) = self.slots.iter().position(|s| s.port.ifindex == ifindex) else {
+            return;
+        };
+        // G4.3hh: a session of a takeover not adopted yet is, now.
+        if self.ha_adopting() {
+            self.ha_adopt_for(now, frame);
+        }
+        if let Some((code, src, vlans)) = peek(frame) {
+            let key = mac_text(src);
+            let sessions = self.subs.len();
+            let at = self.cfg.unix_base + now / 1000;
+            let Some(slot) = self.slots.get_mut(i) else {
+                return;
+            };
+            let refused_full = |why: &Mutex<WhyTable>, server: &str| {
+                guard(why).refused(&key, at, server, Stage::Padi, "max-sessions", || {
+                    "O servidor está cheio (max_sessions): novas sessões só quando outra sair."
+                        .to_owned()
+                });
+            };
+            let full =
+                slot.cfg.max_sessions > 0 && slot.server.active() >= slot.cfg.max_sessions as usize;
+            match code {
+                Code::Padi => {
+                    self.counts.padi += 1;
+                    guard(&self.why).reach(&[&key], Stage::Padi);
+                    if full {
+                        refused_full(&self.why, &slot.cfg.name);
+                        return;
+                    }
+                    // G4.3m: a PADI the server's limits will refuse (a host
+                    // locked out, a full VLAN or MAC) spends no token of
+                    // `new_session_rate`: a CPE in a loop would otherwise eat
+                    // the place of those who get a session.
+                    let refused = slot.server.refuses(now, ifindex, vlans, src);
+                    // `new_session_rate` is spent at the PADI: no PADO, the
+                    // CPE asks again (RFC 2516 §5.1: PADI retransmitted with
+                    // back-off). At the PADR it would be worse: the CPE
+                    // repeats the PADR with an AC-Cookie that expires.
+                    let setting_up = self.index.pending.contains_key(&(i, src.0));
+                    // auto: the limit is the RADIUS server's, applied to the
+                    // logins queued here (about AUTO_BACKLOG_S of what it
+                    // answers), not to the PADIs: a CPE told "no" backs off
+                    // (RFC 2516 §5) and comes back late, idling the server.
+                    let (backlog, waiting) = (
+                        self.admission.backlog(self.lanes),
+                        self.pending_auth + self.auth_queue.len(),
+                    );
+                    let bucket = &mut slot.bucket;
+                    let auto = slot.cfg.new_session_rate_auto;
+                    let mut held = || {
+                        if auto {
+                            waiting >= backlog
+                        } else {
+                            !bucket.allow(now)
+                        }
+                    };
+                    let held = !refused && held();
+                    if !setting_up && held {
+                        self.padr_throttled += 1;
+                        return;
+                    }
+                }
+                Code::Padr => {
+                    self.counts.padr += 1;
+                    if full {
+                        refused_full(&self.why, &slot.cfg.name);
+                        return;
+                    }
+                    guard(&self.why).reach(&[&key], Stage::Padr);
+                }
+                Code::Padt => self.counts.padt_rx += 1,
+                _ => {}
+            }
+            let _ = sessions;
+        } else if let Ok(f) = wire_ppp::parse_session(frame)
+            && matches!(f.protocol, proto::IPV4 | proto::IPV6)
+        {
+            if f.protocol == proto::IPV6 {
+                // ND, DHCPv6 and Echo to our link-local (the XDP passes
+                // link-local and multicast up, `Stat::Ipv6Control`).
+                self.data6(now, i, &f);
+            } else {
+                // Slow path upstream: the XDP would have taken it.
+                self.data_up(i, &f);
+            }
+            return;
+        }
+        self.run(now, i, |srv, out| {
+            srv.handle_frame(now, ifindex, frame, out)
+        });
+    }
+
+    /// Upstream IPv4 of a session without XDP: checked (the session and its
+    /// address, the anti-spoofing of G4.3c) and counted; the driver sends
+    /// the packet into the stack.
+    fn data_up(&mut self, slot: usize, f: &wire_ppp::SessionFrame<'_>) {
+        let Some(sub) = self.subs.get(&(slot, f.session_id)) else {
+            return;
+        };
+        // The session's MAC on the session's line (G4.3l: a frame with
+        // another line's tags is not this session's).
+        if sub.mac != f.link.src || sub.vlans != f.link.vlans || sub.up_at.is_none() {
+            return;
+        }
+        let src = f.info.get(12..16).map(|b| {
+            Ipv4Addr::new(
+                b.first().copied().unwrap_or(0),
+                b.get(1).copied().unwrap_or(0),
+                b.get(2).copied().unwrap_or(0),
+                b.get(3).copied().unwrap_or(0),
+            )
+        });
+        let id = session_id(slot, &self.slots, f.session_id);
+        // A host of a block routed to the subscriber (G4.3cd) may send.
+        if src.is_none()
+            || (src != sub.ip
+                && src
+                    .and_then(|s| self.cfg.framed.holder_of(std::net::IpAddr::V4(s)))
+                    .is_none_or(|(_, h)| h.session != id))
+        {
+            return;
+        }
+        let len = f.info.len() as u64;
+        if let Some(a) = guard(&self.shared).active.get_mut(&id) {
+            a.rx_bytes += len;
+            a.rx_packets += 1;
+        }
+        self.upstream.push(f.info.to_vec());
+    }
+
+    /// A pseudo-random 32-bit value (RA spread; no security role).
+    fn next_rand(&mut self) -> u32 {
+        self.seq = self.seq.wrapping_add(1);
+        let mut x = self.seq.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ u64::from_le_bytes(self.seed.first_chunk::<8>().copied().unwrap_or([7; 8]));
+        x ^= x >> 29;
+        x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        (x >> 32) as u32
+    }
+
+    /// G4.3e: IPv6CP opened on a session: take its /64 and delegated
+    /// prefix (RADIUS over the profile, RFC 3162/4818/6911), start its RA
+    /// and DHCPv6, and, if it was already up on IPv4, show and account
+    /// the change (Interim-Update with the prefixes).
+    fn start_v6(
+        &mut self,
+        now: Millis,
+        i: usize,
+        sref: SessionRef,
+        d: &corerouter_proto_pppoe::descriptor::SessionDescriptor,
+    ) {
+        let (Some(peer), Some(local)) = (d.ipv6_iid, d.local_iid) else {
+            return;
+        };
+        let Some(port) = self.slots.get(i).map(|s| s.port) else {
+            return;
+        };
+        let rand = self.next_rand();
+        let Some(sub) = self.subs.get_mut(&(i, sref.sid)) else {
+            return;
+        };
+        if sub.v6.is_some() {
+            return;
+        }
+        let mut problems: Vec<String> = Vec::new();
+        let mut alloc = |fixed: Option<ipnet::Ipv6Net>, pool: Option<&str>, what: &str| {
+            if let Some(n) = fixed {
+                if guard(&self.pools6).hold(n) {
+                    return Some((n, Source::Radius));
+                }
+                problems.push(format!("{what} {n} do RADIUS já está em uso"));
+                return None;
+            }
+            let name = pool?;
+            match guard(&self.pools6).take(&self.cfg.pools6, name) {
+                Some(n) => Some((n, Source::Pool(name.to_owned()))),
+                None => {
+                    problems.push(format!("/ipv6 pool '{name}' sem {what} livre"));
+                    None
+                }
+            }
+        };
+        let r = &sub.radius6;
+        let e = &sub.effective;
+        let link = alloc(
+            r.framed_prefix,
+            r.framed_pool
+                .as_deref()
+                .or(e.remote_ipv6_prefix_pool.as_deref()),
+            "/64",
+        );
+        let delegated = alloc(
+            r.delegated,
+            r.delegated_pool.as_deref().or(e.dhcpv6_pd_pool.as_deref()),
+            "prefixo delegado",
+        );
+        let dns = if r.dns.is_empty() {
+            e.dns_server_ipv6.clone()
+        } else {
+            r.dns.clone()
+        };
+        let mut x = V6::new(
+            now,
+            local,
+            peer,
+            link,
+            delegated,
+            dns,
+            e.dhcpv6_lease_time,
+            d.mtu,
+            port.mac,
+        );
+        // RFC 4861 §6.2.4: the first RA right away (the link just came up).
+        if let Some(p) = x.due(now, rand) {
+            self.frames.push((
+                port.ifindex,
+                v6::frame(sub.mac.0, port.mac, sub.vlans, sref.sid, &p),
+            ));
+        }
+        let user = sub.user.clone();
+        let text = format!(
+            "PPP: {user} com IPv6 (link-local {}{}{}{})",
+            x.peer(),
+            x.global()
+                .map(|a| format!(", endereço {a}"))
+                .unwrap_or_default(),
+            x.link
+                .as_ref()
+                .map(|(n, _)| format!(", /64 {n}"))
+                .unwrap_or_default(),
+            x.delegated
+                .as_ref()
+                .map(|(n, _)| format!(", PD {n}"))
+                .unwrap_or_default()
+        );
+        let was_up = sub.up_at.is_some();
+        let attrs = x.acct_attributes();
+        let acct = (sub.radius || self.cfg.ppp.aaa.use_radius) && self.cfg.ppp.aaa.accounting;
+        let acct_id = sub.acct_id.clone();
+        let class = sub.class.clone();
+        let interim = sub.interim;
+        let nets: Vec<Ipv6Net> = [&x.link, &x.delegated]
+            .into_iter()
+            .flatten()
+            .map(|(n, _)| *n)
+            .collect();
+        sub.v6 = Some(Box::new(x));
+        self.ha.dirty.insert((i, sref.sid));
+        let fields = sub.v6.as_deref().map(active_v6);
+        let id = session_id(i, &self.slots, sref.sid);
+        self.slow_routes6((i, sref.sid), &nets, true);
+        for p in problems {
+            self.log(true, format!("PPP: {user}: {p}"));
+        }
+        self.log(false, text);
+        if !was_up {
+            // `up` puts the row and the Accounting-Start with these.
+            return;
+        }
+        if let (Some(f), Some(a)) = (fields, guard(&self.shared).active.get_mut(&id)) {
+            f.apply(a);
+        }
+        if acct && let Some(aaa) = &self.cfg.aaa {
+            let req = AcctRequest {
+                service: AaaService::Ppp,
+                status: AcctStatus::InterimUpdate,
+                session_id: acct_id,
+                user: user.clone(),
+                counters: None,
+                terminate_cause: None,
+                interim_secs: interim,
+                attributes: attrs,
+                class,
+            };
+            if let Err(e) = aaa.account(req, None) {
+                self.log(
+                    true,
+                    format!("PPP: Accounting-Interim (IPv6) de {user} não enviado: {e}"),
+                );
+            }
+        }
+    }
+
+    /// G4.3e: an IPv6 packet from a subscriber that reached the control
+    /// plane (link-local or multicast with XDP; everything without it):
+    /// RS, NS, Echo to our link-local and DHCPv6 are answered. Forwarded
+    /// IPv6 on the slow path is G4.3l.
+    fn data6(&mut self, now: Millis, i: usize, f: &wire_ppp::SessionFrame<'_>) {
+        let Some(port) = self.slots.get(i).map(|s| s.port) else {
+            return;
+        };
+        let rand = self.next_rand();
+        let id = session_id(i, &self.slots, f.session_id);
+        let Some(sub) = self.subs.get_mut(&(i, f.session_id)) else {
+            self.v6_dropped += 1;
+            return;
+        };
+        let Some(x) = sub
+            .v6
+            .as_deref_mut()
+            .filter(|_| sub.mac == f.link.src && sub.vlans == f.link.vlans)
+        else {
+            self.v6_dropped += 1;
+            return;
+        };
+        // G4.3l: without XDP, IPv6 to anything but the link is forwarded
+        // here, from the session's own prefixes only (the XDP's
+        // anti-spoofing, G4.3e).
+        if !self.xdp
+            && let Some((src, dst)) = slow6::addrs(f.info)
+            && !slow6::for_the_link(dst)
+        {
+            let own = [&x.link, &x.delegated]
+                .into_iter()
+                .flatten()
+                .any(|(n, _)| n.contains(&src));
+            if !own || sub.up_at.is_none() {
+                self.v6_dropped += 1;
+                return;
+            }
+            let len = f.info.len() as u64;
+            if let Some(a) = guard(&self.shared).active.get_mut(&id) {
+                a.rx_bytes += len;
+                a.rx_packets += 1;
+            }
+            self.upstream.push(f.info.to_vec());
+            return;
+        }
+        let before = x.dropped;
+        let Some(out) = x.handle(now, f.info, rand) else {
+            self.v6_dropped += 1;
+            return;
+        };
+        self.v6_dropped += x.dropped - before;
+        let changed = v6::pd_changed(&out.events);
+        let bound = x.pd_bound();
+        for p in &out.packets {
+            self.frames.push((
+                port.ifindex,
+                v6::frame(sub.mac.0, port.mac, sub.vlans, f.session_id, p),
+            ));
+        }
+        let mut sh = guard(&self.shared);
+        sh.stats.ipv6_dropped = self.v6_dropped;
+        if changed && let Some(a) = sh.active.get_mut(&id) {
+            a.delegated_bound = bound;
+        }
+    }
+
+    /// G4.3e: the unsolicited RAs that are due (RFC 4861 §6.2.4), once a
+    /// second.
+    fn ra_tick(&mut self, now: Millis) {
+        let mut due: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut rand = self.next_rand();
+        for ((slot, sid), sub) in self.subs.iter_mut() {
+            let Some(x) = sub.v6.as_deref_mut() else {
+                continue;
+            };
+            let Some(port) = self.slots.get(*slot).map(|s| s.port) else {
+                continue;
+            };
+            rand = rand.rotate_left(7) ^ u32::from(*sid).wrapping_mul(0x9e37_79b9);
+            if let Some(p) = x.due(now, rand) {
+                due.push((
+                    port.ifindex,
+                    v6::frame(sub.mac.0, port.mac, sub.vlans, *sid, &p),
+                ));
+            }
+        }
+        self.frames.extend(due);
+    }
+
+    /// Downstream IPv4 to a subscriber (slow path): encapsulated for its
+    /// session, or dropped when nobody has the address.
+    pub(crate) fn data_down(&mut self, packet: &[u8]) {
+        if packet.first().is_some_and(|b| b >> 4 == 6) {
+            self.data_down6(packet);
+            return;
+        }
+        let Some(dst) = packet.get(16..20) else {
+            return;
+        };
+        let dst = Ipv4Addr::new(
+            dst.first().copied().unwrap_or(0),
+            dst.get(1).copied().unwrap_or(0),
+            dst.get(2).copied().unwrap_or(0),
+            dst.get(3).copied().unwrap_or(0),
+        );
+        // The subscriber's address, else a block routed to it (G4.3cd).
+        let key = self.index.by_ip.get(&dst).copied().or_else(|| {
+            let (_, h) = self.cfg.framed.holder_of(std::net::IpAddr::V4(dst))?;
+            self.find(&h.session).map(|(i, sref)| (i, sref.sid))
+        });
+        let Some(((slot, sid), sub)) = key.and_then(|k| self.subs.get_key_value(&k)) else {
+            return;
+        };
+        let Some(port) = self.slots.get(*slot).map(|s| s.port) else {
+            return;
+        };
+        if packet.len() > usize::from(sub.mtu.max(576)) {
+            return;
+        }
+        let f = v6::session_frame(sub.mac.0, port.mac, sub.vlans, *sid, proto::IPV4, packet);
+        let id = session_id(*slot, &self.slots, *sid);
+        if let Some(a) = guard(&self.shared).active.get_mut(&id) {
+            a.tx_bytes += packet.len() as u64;
+            a.tx_packets += 1;
+        }
+        self.frames.push((port.ifindex, f));
+    }
+
+    /// Slow path, IPv6 (G4.3l): a packet the kernel routed to a
+    /// subscriber's prefix, into its session.
+    fn data_down6(&mut self, packet: &[u8]) {
+        let Some((_, dst)) = slow6::addrs(packet) else {
+            return;
+        };
+        let Some(key) = self.net6.get(dst) else {
+            return;
+        };
+        let Some(sub) = self.subs.get(&key) else {
+            return;
+        };
+        let Some(port) = self.slots.get(key.0).map(|s| s.port) else {
+            return;
+        };
+        if packet.len() > usize::from(sub.mtu.max(1280)) {
+            return;
+        }
+        let f = v6::frame(sub.mac.0, port.mac, sub.vlans, key.1, packet);
+        let id = session_id(key.0, &self.slots, key.1);
+        if let Some(a) = guard(&self.shared).active.get_mut(&id) {
+            a.tx_bytes += packet.len() as u64;
+            a.tx_packets += 1;
+        }
+        self.frames.push((port.ifindex, f));
+    }
+
+    /// Slow path, IPv6: route a session's prefixes to `bng0` (`add`) or
+    /// take them away, and index them for the packets coming back.
+    fn slow_routes6(&mut self, key: (usize, u16), nets: &[Ipv6Net], add: bool) {
+        if self.xdp {
+            return;
+        }
+        for &net in nets {
+            if add {
+                self.net6.insert(net, key);
+            } else if self.net6.get(net.network()) == Some(key) {
+                self.net6.remove(net);
+            } else {
+                continue;
+            }
+            if let Ok(mut r) = self.routes6.write() {
+                if add {
+                    r.insert(net, self.lane);
+                } else {
+                    r.remove(net);
+                }
+            }
+            self.effects.push(Effect::Route6 { net, add });
+        }
+    }
+
+    /// Call server `i`, handle what it says, then the answers that
+    /// produced, until nothing is left.
+    fn run(&mut self, now: Millis, i: usize, f: impl FnOnce(&mut Server, &mut ServerOutput)) {
+        let mut out = std::mem::take(&mut self.out);
+        if let Some(slot) = self.slots.get_mut(i) {
+            f(&mut slot.server, &mut out);
+        }
+        self.absorb(now, i, &mut out);
+        while let Some((j, sref, reply)) = self.replies.pop_front() {
+            if let Some(slot) = self.slots.get_mut(j) {
+                let srv = &mut slot.server;
+                match reply {
+                    Reply::Auth(v) => {
+                        srv.auth_reply(now, sref, v, &mut out);
+                    }
+                    Reply::Address(a) => {
+                        srv.address_reply(now, sref, a, &mut out);
+                    }
+                    Reply::Terminate => {
+                        srv.terminate(now, sref, &mut out);
+                    }
+                    Reply::Ipv6(m) => {
+                        srv.set_ipv6(now, sref, m, &mut out);
+                    }
+                }
+            }
+            self.absorb(now, j, &mut out);
+        }
+        self.out = out;
+    }
+
+    fn absorb(&mut self, now: Millis, i: usize, out: &mut ServerOutput) {
+        for (ifindex, f) in out.frames() {
+            if let Ok(d) = discovery::parse(f) {
+                match d.code {
+                    Code::Pado => self.counts.pado += 1,
+                    Code::Pads if d.session_id != 0 => {
+                        self.counts.pads += 1;
+                        guard(&self.why).reach(&[&mac_text(d.dst)], Stage::Lcp);
+                    }
+                    Code::Padt => self.counts.padt_tx += 1,
+                    _ => {}
+                }
+            }
+            self.frames.push((ifindex, f.to_vec()));
+        }
+        let events: Vec<Event> = std::mem::take(&mut out.events);
+        out.clear();
+        for ev in events {
+            self.event(now, i, ev);
+        }
+    }
+
+    fn event(&mut self, now: Millis, i: usize, ev: Event) {
+        match ev {
+            Event::Authenticate {
+                session,
+                replaces,
+                request,
+            } => self.authenticate(now, i, session, replaces, &request),
+            Event::NeedAddress { session } => {
+                let a = self.subs.get_mut(&(i, session.sid)).and_then(|sub| {
+                    let pool =
+                        sub.pool
+                            .clone()
+                            .or_else(|| match &sub.effective.remote_address {
+                                Some(AddrOrPool::Pool(p)) => Some(p.clone()),
+                                _ => None,
+                            })?;
+                    let (ip, from) = guard(&self.pools).take(&self.cfg.pools, &pool)?;
+                    sub.ip = Some(ip);
+                    sub.pool = Some(from);
+                    Some(assignment(ip, &sub.effective.dns_server))
+                });
+                self.replies.push_back((i, session, Reply::Address(a)));
+            }
+            Event::Up {
+                session,
+                descriptor,
+            } => {
+                // IPv6 first, so the Accounting-Start names the prefixes.
+                self.start_v6(now, i, session, &descriptor);
+                self.up(now, i, session, &descriptor);
+            }
+            Event::Changed {
+                session,
+                descriptor,
+            } => {
+                self.start_v6(now, i, session, &descriptor);
+                if let Some(sub) = self.subs.get(&(i, session.sid))
+                    && let Some(idx) = sub.xdp
+                {
+                    let shape =
+                        corerouter_engine::queue::shape_of(&self.cfg.queues, &sub.effective);
+                    let s = xdp_session(&descriptor, sub.rate.as_deref(), sub.v6.as_deref(), shape);
+                    self.effects.push(Effect::Xdp(PppoeOp::Upsert(idx, s)));
+                }
+            }
+            Event::Down {
+                session,
+                key,
+                reason,
+                was_up,
+                ..
+            } => {
+                if let Some(sub) = self.take_sub((i, session.sid)) {
+                    self.ended(now, sub, reason, was_up);
+                } else {
+                    // Before authentication (LCP failed, setup timeout): no
+                    // login yet, the MAC tells who.
+                    self.failed_early(now, i, key.client_mac, reason);
+                }
+            }
+            Event::Refused { mac, refusal, .. } => self.refused(now, i, mac, refusal),
+            Event::LockedOut {
+                mac,
+                strikes,
+                left_ms,
+                cause,
+                ..
+            } => {
+                // Past the third in a row it is a loop, worth a log line; one
+                // per lockout, not per PADI.
+                if strikes >= LOCKOUT_LOG_FROM {
+                    let (why, ..) = explain(cause);
+                    self.log(
+                        false,
+                        format!(
+                            "PPP: {} reconectando em loop ({why}, {strikes} seguidas): bloqueado por {} s",
+                            mac_text(mac),
+                            left_ms.div_ceil(1000)
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    /// A limit refused a PADI or PADR: what `ppp.why` says (G4.3m). Only in
+    /// the "Why?" table, not in `ppp.history`: a CPE locked out asks several
+    /// times a minute, and a flood would push the history out.
+    fn refused(&mut self, now: Millis, i: usize, mac: Mac, refusal: Refusal) {
+        let at = self.cfg.unix_base + now / 1000;
+        let server = self
+            .slots
+            .get(i)
+            .map(|s| s.cfg.name.as_str())
+            .unwrap_or_default();
+        let key = mac_text(mac);
+        guard(&self.why).refused(&key, at, server, Stage::Padi, refusal_key(refusal), || {
+            refusal_hint(refusal)
+        });
+    }
+
+    fn reject(&mut self, i: usize, sref: SessionRef, why: &str) {
+        self.counts.auth_reject += 1;
+        if let Some(sub) = self.subs.get_mut(&(i, sref.sid)) {
+            sub.reply_message = Some(why.to_owned());
+        }
+        self.replies.push_back((
+            i,
+            sref,
+            Reply::Auth(AuthVerdict::Reject {
+                message: why.as_bytes().into(),
+            }),
+        ));
+    }
+
+    fn authenticate(
+        &mut self,
+        now: Millis,
+        i: usize,
+        sref: SessionRef,
+        replaces: Option<SessionRef>,
+        req: &corerouter_proto_pppoe::server::AuthRequest,
+    ) {
+        let user = String::from_utf8_lossy(&req.username).into_owned();
+        let mac = req.client_mac;
+        let Some(slot) = self.slots.get(i) else {
+            return;
+        };
+        // G4.3k: the row's profile takes `default_profile`'s place, and
+        // that of a secret left on the built-in `default`.
+        let row_profile = slot.profile_for(&req.service);
+        let default_profile = row_profile
+            .clone()
+            .unwrap_or_else(|| slot.cfg.default_profile.clone());
+        let service_name = String::from_utf8_lossy(&req.service).into_owned();
+        let circuit_text = req.circuit_id.as_deref().map(agent::text);
+        let nas_port_id = match &circuit_text {
+            Some(c) if self.cfg.ppp.aaa.use_circuit_id_in_nas_port_id => c.clone(),
+            _ => nas_port(&slot.cfg.interface.to_string(), req.vlans),
+        };
+        let fresh = Sub {
+            slot: i,
+            sref,
+            user: user.clone(),
+            mac,
+            stage: Stage::Auth,
+            effective: self
+                .cfg
+                .ppp
+                .effective(None, &default_profile, &default_profile),
+            radius: false,
+            ip: None,
+            pool: None,
+            rate: None,
+            acct_id: String::new(),
+            interim: None,
+            class: Vec::new(),
+            xdp: None,
+            up_at: None,
+            limit_in: 0,
+            limit_out: 0,
+            session_timeout: None,
+            reply_message: None,
+            cause: None,
+            last_bytes: (0, 0),
+            prev: (0, 0, now),
+            list_at: now,
+            idle_since: now,
+            vlans: req.vlans,
+            nas_port_id,
+            auth_cancel: None,
+            circuit_id: circuit_text,
+            remote_id: req.remote_id.as_deref().map(agent::text),
+            service_name,
+            fallback_profile: default_profile.clone(),
+            mtu: 1480,
+            radius6: RadiusV6::default(),
+            v6: None,
+            want_routes: Vec::new(),
+            want_refused: Vec::new(),
+            routes: Vec::new(),
+            base: [0; 4],
+            replaces,
+        };
+        self.index.add((i, sref.sid), &fresh);
+        if let Some(old) = self.subs.insert((i, sref.sid), fresh) {
+            // Authenticated again (LCP renegotiated): the old entry's
+            // place in the index goes.
+            self.index.remove((i, sref.sid), &old);
+        }
+        guard(&self.why).reach(&[&user, &mac_text(mac)], Stage::Auth);
+        // O(1): the list's name index (`corerouter_model::ppp_secrets`).
+        match self.cfg.ppp.secret(&user).cloned() {
+            Some(sec) if sec.disabled => self.reject(i, sref, "secret disabled"),
+            Some(sec) => {
+                let first = match &row_profile {
+                    Some(p) if sec.profile == DEFAULT_PROFILE => p.clone(),
+                    _ => sec.profile.clone(),
+                };
+                self.local(now, i, sref, req, &sec, &first, &default_profile)
+            }
+            None => match self.cfg.aaa.clone().filter(|_| self.cfg.ppp.aaa.use_radius) {
+                Some(aaa) => self.ask_radius(now, i, sref, req, &user, &aaa),
+                None => self.reject(i, sref, "no such user"),
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn local(
+        &mut self,
+        now: Millis,
+        i: usize,
+        sref: SessionRef,
+        req: &corerouter_proto_pppoe::server::AuthRequest,
+        sec: &corerouter_model::ppp::PppSecret,
+        profile: &str,
+        default_profile: &str,
+    ) {
+        if !sec.service.allows(PppService::Pppoe) {
+            return self.reject(i, sref, "service not allowed for this secret");
+        }
+        if sec.caller_id.is_some_and(|m| m.0 != req.client_mac.0) {
+            return self.reject(i, sref, "caller-id mismatch");
+        }
+        let e = self.cfg.ppp.effective(Some(sec), profile, default_profile);
+        // G4.3n: sealed in the config; opened per login (0.5 µs, measured).
+        let Some(password) =
+            corerouter_engine::sealing::open_with(self.cfg.seal.as_deref(), &sec.password)
+        else {
+            return self.reject(
+                i,
+                sref,
+                "password cannot be opened (secret-key of another router?)",
+            );
+        };
+        let Some(mschap2) = req.verify_local(&password) else {
+            return self.reject(i, sref, "wrong password");
+        };
+        // G4.3w: the password is good, so the host's old session goes now
+        // (one-session-per-host), before `only-one` counts the user's
+        // sessions: a CPE that rebooted is let back in. Checked after the
+        // password, so an unauthenticated try learns nothing either.
+        self.replace_old(now, i, sref);
+        if e.only_one && self.index.users_up.contains_key(&sec.name) {
+            return self.reject(i, sref, "only-one: the user is already connected");
+        }
+        let (limit_in, limit_out) = (sec.limit_bytes_in, sec.limit_bytes_out);
+        let fixed = match &e.remote_address {
+            Some(AddrOrPool::Address(ip)) => Some(*ip),
+            _ => None,
+        };
+        let pool = match &e.remote_address {
+            Some(AddrOrPool::Pool(p)) => Some(p.clone()),
+            _ => None,
+        };
+        let rate = e.rate_limit.clone();
+        let timeout = e.session_timeout;
+        if let Some(sub) = self.subs.get_mut(&(i, sref.sid)) {
+            sub.effective = e;
+            sub.limit_in = limit_in;
+            sub.limit_out = limit_out;
+            sub.want_routes = sec
+                .routes
+                .iter()
+                .map(|r| (*r, RouteOrigin::Secret))
+                .collect();
+        }
+        self.accept(i, sref, mschap2, fixed, pool, rate, timeout, false, None);
+    }
+
+    /// G4.3w: one-session-per-host. Session `sref` proved its credentials:
+    /// the host's old session ends now (PADT, its `Down` handled here: the
+    /// address, the login and the accounting go first), so that a fixed
+    /// address or `only-one` sees it gone. The server would end it anyway
+    /// when the verdict is applied; this only puts it first.
+    fn replace_old(&mut self, now: Millis, i: usize, sref: SessionRef) {
+        let Some(sub) = self.subs.get_mut(&(i, sref.sid)).filter(|s| s.sref == sref) else {
+            return;
+        };
+        if sub.replaces.take().is_none() {
+            return;
+        }
+        let mut out = ServerOutput::new();
+        if let Some(slot) = self.slots.get_mut(i) {
+            slot.server.replace_now(now, sref, &mut out);
+        }
+        self.absorb(now, i, &mut out);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accept(
+        &mut self,
+        i: usize,
+        sref: SessionRef,
+        mschap2: Option<[u8; AUTH_STRING_LEN]>,
+        fixed: Option<Ipv4Addr>,
+        pool: Option<String>,
+        rate: Option<String>,
+        timeout: Option<u32>,
+        radius: bool,
+        interim: Option<u32>,
+    ) {
+        let Some(sub) = self.subs.get_mut(&(i, sref.sid)) else {
+            return;
+        };
+        // A fixed address held by another session: refuse rather than
+        // hand one address to two subscribers.
+        let ipv4 = match fixed {
+            Some(ip) if !guard(&self.pools).hold(ip) => {
+                sub.reply_message = Some(format!("address {ip} is in use"));
+                self.replies.push_back((
+                    i,
+                    sref,
+                    Reply::Auth(AuthVerdict::Reject {
+                        message: format!("address {ip} is in use").into_bytes().into(),
+                    }),
+                ));
+                return;
+            }
+            Some(ip) => {
+                sub.ip = Some(ip);
+                Some(assignment(ip, &sub.effective.dns_server))
+            }
+            None => match pool
+                .as_deref()
+                .and_then(|p| guard(&self.pools).take(&self.cfg.pools, p))
+            {
+                Some((ip, from)) => {
+                    sub.ip = Some(ip);
+                    sub.pool = Some(from);
+                    Some(assignment(ip, &sub.effective.dns_server))
+                }
+                // Asked again at IPCP (`NeedAddress`); none then = NCP fails.
+                None => {
+                    sub.pool = pool;
+                    None
+                }
+            },
+        };
+        sub.rate = rate.clone();
+        sub.radius = radius;
+        sub.interim = interim;
+        sub.session_timeout = timeout;
+        self.counts.auth_accept += 1;
+        let mode = match sub.effective.use_ipv6 {
+            corerouter_model::ppp::UseIpv6::No => Ipv6Mode::Off,
+            corerouter_model::ppp::UseIpv6::Require => Ipv6Mode::Require,
+            _ => Ipv6Mode::On,
+        };
+        self.replies.push_back((i, sref, Reply::Ipv6(mode)));
+        let auth = Authorization {
+            mschap2_success: mschap2,
+            message: Box::default(),
+            ipv4,
+            rate_limit: rate.as_deref().and_then(|r| r.parse::<RateLimit>().ok()),
+            session_timeout: timeout,
+        };
+        self.replies
+            .push_back((i, sref, Reply::Auth(AuthVerdict::Accept(auth))));
+    }
+
+    fn ask_radius(
+        &mut self,
+        now: Millis,
+        i: usize,
+        sref: SessionRef,
+        req: &corerouter_proto_pppoe::server::AuthRequest,
+        user: &str,
+        aaa: &Arc<dyn AaaBackend>,
+    ) {
+        let credentials = match &req.method {
+            AuthMethod::Pap { password } => Credentials::Pap {
+                password: String::from_utf8_lossy(password).into_owned(),
+            },
+            AuthMethod::Chap {
+                id,
+                challenge,
+                response,
+            } => Credentials::Chap {
+                id: *id,
+                challenge: challenge.to_vec(),
+                response: response.to_vec(),
+            },
+            AuthMethod::MsChapV2 {
+                id,
+                challenge,
+                response,
+            } => Credentials::MsChapV2 {
+                ident: *id,
+                challenge: challenge.to_vec(),
+                peer_challenge: response.peer_challenge.to_vec(),
+                nt_response: response.nt_response.to_vec(),
+            },
+            AuthMethod::MsChapV1 { .. } => {
+                return self.reject(
+                    i,
+                    sref,
+                    "MS-CHAPv1 is not sent to RADIUS: use mschap2, chap or pap",
+                );
+            }
+        };
+        let Some(sub) = self.subs.get(&(i, sref.sid)) else {
+            return;
+        };
+        let nas_port_id = sub.nas_port_id.clone();
+        let mut attributes = vec![
+            Attribute::new("Service-Type", "2"),
+            Attribute::new("Framed-Protocol", "1"),
+            Attribute::new("NAS-Port-Type", "5"),
+        ];
+        // G4.3l, RFC 4679 §3 (TR-101): the access line as the access node
+        // named it, in its own attributes.
+        attributes.extend(line_attributes(sub));
+        let r = RadiusRequest {
+            service: AaaService::Ppp,
+            user: user.to_owned(),
+            credentials,
+            nas_port_id: Some(nas_port_id),
+            nas_port: Some(u32::from(sref.sid)),
+            calling_station_id: Some(mac_text(req.client_mac)),
+            // RouterOS: the Service-Name the subscriber asked for.
+            called_station_id: (!req.service.is_empty())
+                .then(|| String::from_utf8_lossy(&req.service).into_owned()),
+            // RFC 2865 §5.6 Framed (2), §5.7 PPP (1), §5.41 Virtual (5):
+            // what a PPPoE NAS sends (RFC 4679 §4 for the DSL ones).
+            attributes,
+        };
+        // auto: no more questions out than the window; the rest wait here,
+        // their CPEs in the Authenticate phase (repeats ignored while one
+        // is pending), and go as answers come back.
+        if self
+            .slots
+            .get(i)
+            .is_some_and(|s| s.cfg.new_session_rate_auto)
+            && self.pending_auth >= self.admission.window(self.lanes)
+        {
+            self.auth_queue.push_back((i, sref, r));
+            self.queued_total += 1;
+            return;
+        }
+        self.send_radius(now, i, sref, r, aaa);
+    }
+
+    /// One Access-Request out, called off if the session ends first.
+    fn send_radius(
+        &mut self,
+        now: Millis,
+        i: usize,
+        sref: SessionRef,
+        r: RadiusRequest,
+        aaa: &Arc<dyn AaaBackend>,
+    ) {
+        let tx = self.auth_tx.clone();
+        self.pending_auth += 1;
+        // Called off if the session ends first (the CPE gave up, LCP or the
+        // setup timed out): the server is not spent on it (G4.3g).
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(sub) = self.subs.get_mut(&(i, sref.sid)) {
+            sub.auth_cancel = Some(cancel.clone());
+        }
+        aaa.authenticate_until(
+            r,
+            Box::new(move |reply| {
+                // The BNG's thread reads it; nothing else happens here.
+                let _ = tx.send(AuthDone {
+                    slot: i,
+                    sref,
+                    asked: now,
+                    reply,
+                });
+            }),
+            cancel,
+        );
+    }
+
+    /// Queued Access-Requests out while the window has room; those of
+    /// sessions that ended meanwhile are dropped.
+    fn drain_auth_queue(&mut self, now: Millis) {
+        let Some(aaa) = self.cfg.aaa.clone() else {
+            self.auth_queue.clear();
+            return;
+        };
+        while self.pending_auth < self.admission.window(self.lanes) {
+            let Some((i, sref, r)) = self.auth_queue.pop_front() else {
+                break;
+            };
+            if self
+                .subs
+                .get(&(i, sref.sid))
+                .is_some_and(|s| s.sref == sref && s.up_at.is_none())
+            {
+                self.send_radius(now, i, sref, r, &aaa);
+            }
+        }
+    }
+
+    /// RADIUS answers that arrived, then what the window lets out.
+    pub(crate) fn radius(&mut self, now: Millis) {
+        self.radius_answers(now);
+        self.drain_auth_queue(now);
+    }
+
+    fn radius_answers(&mut self, now: Millis) {
+        while let Ok(done) = self.auth_rx.try_recv() {
+            self.pending_auth = self.pending_auth.saturating_sub(1);
+            let late = now.saturating_sub(done.asked);
+            self.admission.answer(
+                late,
+                matches!(done.reply.outcome, AuthOutcome::Timeout) || late > RADIUS_GRACE_MS,
+            );
+            let key = (done.slot, done.sref.sid);
+            if self.subs.get(&key).is_none_or(|s| s.sref != done.sref)
+                || now.saturating_sub(done.asked) > RADIUS_GRACE_MS
+            {
+                continue;
+            }
+            let (i, sref) = (done.slot, done.sref);
+            let attr = |name: &str| {
+                done.reply
+                    .attributes
+                    .iter()
+                    .find(|a| a.name == name)
+                    .map(|a| a.value.clone())
+            };
+            let message = attr("Reply-Message").or_else(|| done.reply.message.clone());
+            if let Some(sub) = self.subs.get_mut(&key) {
+                sub.reply_message = message.clone();
+            }
+            match done.reply.outcome {
+                AuthOutcome::Accept => {
+                    let profile = attr("Mikrotik-Group");
+                    let default_profile = self
+                        .subs
+                        .get(&key)
+                        .map(|s| s.fallback_profile.clone())
+                        .unwrap_or_default();
+                    let e = self.cfg.ppp.effective(
+                        None,
+                        profile.as_deref().unwrap_or(&default_profile),
+                        &default_profile,
+                    );
+                    let fixed = attr("Framed-IP-Address").and_then(|v| v.parse::<Ipv4Addr>().ok());
+                    let pool = attr("Framed-Pool").or(match &e.remote_address {
+                        Some(AddrOrPool::Pool(p)) => Some(p.clone()),
+                        _ => None,
+                    });
+                    let fixed = fixed.or(match &e.remote_address {
+                        Some(AddrOrPool::Address(ip)) if pool.is_none() => Some(*ip),
+                        _ => None,
+                    });
+                    let rate = attr("Mikrotik-Rate-Limit")
+                        .filter(|r| r.parse::<RateLimit>().is_ok())
+                        .or(e.rate_limit.clone());
+                    let timeout = attr("Session-Timeout")
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .or(e.session_timeout);
+                    let interim = attr("Acct-Interim-Interval").and_then(|v| v.parse::<u32>().ok());
+                    let mschap2 = attr("MS-CHAP2-Success").and_then(|v| success_string(&v));
+                    let list = attr("Mikrotik-Address-List");
+                    let r6 = RadiusV6::of(
+                        done.reply
+                            .attributes
+                            .iter()
+                            .map(|a| (a.name.as_str(), a.value.as_str())),
+                    );
+                    let (want, refused) = framed::from_radius(
+                        done.reply
+                            .attributes
+                            .iter()
+                            .map(|a| (a.name.as_str(), a.value.as_str())),
+                    );
+                    if let Some(sub) = self.subs.get_mut(&key) {
+                        sub.want_routes = want;
+                        sub.want_refused = refused;
+                        sub.radius6 = r6;
+                        sub.effective = e;
+                        sub.class = corerouter_engine::radius::reply_classes(&done.reply);
+                        if list.is_some() {
+                            sub.effective.address_list = list;
+                        }
+                    }
+                    // G4.3w: RADIUS accepted the login: the host's old
+                    // session (one-session-per-host) goes before its address
+                    // is reserved again.
+                    self.replace_old(now, i, sref);
+                    self.accept(i, sref, mschap2, fixed, pool, rate, timeout, true, interim);
+                }
+                AuthOutcome::Reject | AuthOutcome::Challenge => {
+                    let m = message.unwrap_or_else(|| "rejected by RADIUS".into());
+                    self.reject(i, sref, &m);
+                }
+                AuthOutcome::Timeout | AuthOutcome::Error => {
+                    let m = message.unwrap_or_else(|| "RADIUS did not answer".into());
+                    self.reject(i, sref, &format!("RADIUS: {m}"));
+                }
+            }
+            self.run(now, i, |_, _| {});
+        }
+    }
+
+    fn up(
+        &mut self,
+        now: Millis,
+        i: usize,
+        sref: SessionRef,
+        d: &corerouter_proto_pppoe::descriptor::SessionDescriptor,
+    ) {
+        let id = session_id(i, &self.slots, sref.sid);
+        let Some(slot) = self.slots.get(i) else {
+            return;
+        };
+        let server = slot.cfg.name.clone();
+        let interface = slot.cfg.interface.to_string();
+        let unix = self.cfg.unix_base + now / 1000;
+        self.seq += 1;
+        // RFC 2866 §5.5: unique per session. Each worker counts its own
+        // `seq`: the worker goes in the id too (before G4.3h two workers
+        // gave the same id in the same second, found by the HA lab).
+        let acct_id = format!(
+            "{:08X}{:02X}{:04X}",
+            unix as u32, self.lane as u8, self.seq as u16
+        );
+        let xdp = if self.xdp { self.slot_index() } else { None };
+        let Some(sub) = self.subs.get_mut(&(i, sref.sid)) else {
+            return;
+        };
+        self.index.remove((i, sref.sid), sub);
+        sub.up_at = Some(now);
+        sub.list_at = now;
+        sub.stage = Stage::Up;
+        sub.idle_since = now;
+        sub.acct_id = acct_id.clone();
+        sub.mtu = d.mtu;
+        sub.xdp = xdp;
+        if sub.ip.is_none() {
+            sub.ip = d.ipv4;
+        }
+        self.index.add((i, sref.sid), sub);
+        if xdp.is_none()
+            && let Some(ip) = sub.ip
+            && let Ok(mut r) = self.routes.write()
+        {
+            r.insert(ip, self.lane);
+        }
+        let ip = sub.ip;
+        let user = sub.user.clone();
+        let mac = mac_text(sub.mac);
+        match xdp {
+            Some(idx) => self.effects.push(Effect::Xdp(PppoeOp::Upsert(
+                idx,
+                xdp_session(
+                    d,
+                    sub.rate.as_deref(),
+                    sub.v6.as_deref(),
+                    corerouter_engine::queue::shape_of(&self.cfg.queues, &sub.effective),
+                ),
+            ))),
+            None => {
+                if let Some(ip) = ip {
+                    self.effects.push(Effect::Route { ip, add: true });
+                }
+            }
+        }
+        // G4.3cd: the blocks routed to the subscriber, after its session
+        // (the XDP index or the /32 exists first).
+        let holder = Holder {
+            session: id.clone(),
+            user: user.clone(),
+            origin: RouteOrigin::Secret,
+            lane: self.lane,
+            service: "pppoe",
+        };
+        let want = std::mem::take(&mut sub.want_routes);
+        let mut refused = std::mem::take(&mut sub.want_refused);
+        let adm = framed::admit(
+            &self.cfg.framed,
+            &self.cfg.forbidden,
+            &want,
+            &holder,
+            ip,
+            v6_refusal(xdp.is_some()),
+        );
+        refused.extend(adm.refused.iter().cloned());
+        sub.routes = adm.routes.clone();
+        let route_rows = adm.rows();
+        for (r, _) in &adm.routes {
+            self.effects.push(route_effect(xdp, r, true));
+        }
+        let a = ActiveSession {
+            id: id.clone(),
+            name: user.clone(),
+            service: "pppoe".into(),
+            service_name: Some(sub.service_name.clone()),
+            caller_id: mac.clone(),
+            address: ip,
+            // G4.2i: `/ip pool used` lists it under its pool.
+            pool: ip.and(sub.pool.clone()),
+            session_id: sref.sid,
+            server: server.clone(),
+            interface: interface.clone(),
+            vlan: (sub.vlans.outer != 0).then_some(sub.vlans.outer),
+            inner_vlan: (sub.vlans.inner != 0).then_some(sub.vlans.inner),
+            circuit_id: sub.circuit_id.clone(),
+            remote_id: sub.remote_id.clone(),
+            rate_limit: sub.rate.clone(),
+            profile: sub.effective.profile.clone(),
+            encoding: d
+                .auth
+                .map(|a| match a {
+                    AuthProto::Pap => "pap",
+                    AuthProto::ChapMd5 => "chap",
+                    AuthProto::MsChapV1 => "mschap1",
+                    AuthProto::MsChapV2 => "mschap2",
+                })
+                .unwrap_or("none")
+                .into(),
+            radius: sub.radius,
+            mtu: d.mtu,
+            limit_bytes_in: (sub.limit_in > 0).then_some(sub.limit_in),
+            limit_bytes_out: (sub.limit_out > 0).then_some(sub.limit_out),
+            routes: route_rows.clone(),
+            refused_routes: refused.clone(),
+            ..ActiveSession::default()
+        };
+        let mut a = a;
+        if let Some(f) = sub.v6.as_deref().map(active_v6) {
+            f.apply(&mut a);
+        }
+        let v6_attrs = sub
+            .v6
+            .as_deref()
+            .map(V6::acct_attributes)
+            .unwrap_or_default();
+        let radius_acct = sub.radius || self.cfg.ppp.aaa.use_radius;
+        let interim = sub.interim;
+        let list = sub.effective.address_list.clone();
+        let hooks = sub.effective.on_up.clone();
+        {
+            let h = HistoryEntry {
+                at: unix,
+                name: user.clone(),
+                caller_id: mac.clone(),
+                server: server.clone(),
+                event: "up".into(),
+                stage: Some(Stage::Up),
+                address: ip,
+                routes: route_rows.clone(),
+                refused_routes: refused.clone(),
+                ..HistoryEntry::default()
+            };
+            {
+                let mut w = guard(&self.why);
+                w.reach(&[&user, &mac], Stage::Up);
+                w.record(&[&user, &mac], &h);
+            }
+            let mut sh = guard(&self.shared);
+            sh.active.insert(id.clone(), a);
+            sh.by_acct.insert(acct_id.clone(), id.clone());
+            if let Some(ip) = ip {
+                sh.by_ip.insert(ip, id.clone());
+            }
+            sh.record(h);
+        }
+        if radius_acct
+            && self.cfg.ppp.aaa.accounting
+            && let Some(aaa) = &self.cfg.aaa
+        {
+            let src: Arc<dyn AcctSource> = Arc::new(Counters {
+                shared: self.shared.clone(),
+                id: id.clone(),
+            });
+            let req = AcctRequest {
+                service: AaaService::Ppp,
+                status: AcctStatus::Start,
+                session_id: acct_id,
+                user: user.clone(),
+                counters: None,
+                terminate_cause: None,
+                interim_secs: interim,
+                attributes: {
+                    let mut a = acct_attributes(ip, &mac, sub);
+                    a.extend(v6_attrs);
+                    a.extend(route_attributes(&adm.routes));
+                    a
+                },
+                class: sub.class.clone(),
+            };
+            if let Err(e) = aaa.account(req, Some(src)) {
+                self.log(
+                    true,
+                    format!("PPP: Accounting-Start de {user} não enviado: {e}"),
+                );
+            }
+        }
+        if let (Some(l), Some(ip)) = (list, ip) {
+            self.effects.push(Effect::AddressList {
+                list: l,
+                ip,
+                add: true,
+                comment: format!("ppp {user}"),
+            });
+        }
+        self.hooks(&hooks, &user, ip, &mac, &interface);
+        self.ha_dirty((i, sref.sid));
+        self.log(
+            false,
+            format!(
+                "PPP: {user} conectado ({mac}, {}, {server})",
+                ip.map_or_else(|| "sem IPv4".into(), |i| i.to_string())
+            ),
+        );
+        for row in &route_rows {
+            self.log(
+                false,
+                format!("PPP: {user}: rota {} ({})", row.route, row.origin.label()),
+            );
+        }
+        for why in refused {
+            self.log(true, format!("PPP: {user}: rota recusada: {why}"));
+        }
+    }
+
+    fn hooks(
+        &mut self,
+        hooks: &[PppHook],
+        user: &str,
+        ip: Option<Ipv4Addr>,
+        mac: &str,
+        interface: &str,
+    ) {
+        let local = match self
+            .cfg
+            .ppp
+            .profile(corerouter_model::ppp::DEFAULT_PROFILE)
+            .and_then(|p| p.local_address)
+        {
+            Some(AddrOrPool::Address(ip)) => ip.to_string(),
+            _ => String::new(),
+        };
+        let vars = [
+            ("$user", user.to_owned()),
+            (
+                "$remote-address",
+                ip.map(|i| i.to_string()).unwrap_or_default(),
+            ),
+            ("$local-address", local),
+            ("$caller-id", mac.to_owned()),
+            ("$interface", interface.to_owned()),
+            ("$service", "pppoe".to_owned()),
+        ];
+        for h in hooks {
+            self.effects.push(Effect::Run {
+                command: h.command.clone(),
+                params: expand_hook(&h.params, &vars),
+            });
+        }
+    }
+
+    /// A free XDP slot of this worker's lane (slots `lane`, `lane +
+    /// lanes`, …: no lock between workers).
+    fn slot_index(&mut self) -> Option<u32> {
+        if let Some(i) = self.xdp_free.pop() {
+            return Some(i);
+        }
+        let idx = self
+            .xdp_next
+            .checked_mul(u32::from(self.lanes))?
+            .checked_add(u32::from(self.lane))?;
+        (idx < XDP_SLOTS).then(|| {
+            self.xdp_next += 1;
+            idx
+        })
+    }
+
+    /// A session is gone: undo everything [`Bng::up`] did.
+    fn ended(&mut self, now: Millis, sub: Sub, reason: DownReason, was_up: bool) {
+        self.ha_gone(&sub);
+        // G4.3h: handed to the pair's other node, the session goes on
+        // there: no Accounting-Stop (it would end it in the RADIUS server)
+        // and no on-down hooks.
+        let handed_over = self.ha.handed_over;
+        let (mut key, mut hint, stage, mut cause) = explain(reason);
+        if let Some((c, k)) = sub.cause {
+            cause = c;
+            key = k;
+            hint = match k {
+                "idle-timeout" => "Sem tráfego pelo idle_timeout do perfil.",
+                "limit-bytes" => "Atingiu limit_bytes_in/out do secret.",
+                _ => hint,
+            };
+        }
+        let id = session_id(sub.slot, &self.slots, sub.sref.sid);
+        // G4.3cd: the routed blocks go first (a block left behind would
+        // send its traffic to a session that is no more: a blackhole).
+        for (r, _) in &sub.routes {
+            self.effects.push(route_effect(sub.xdp, r, false));
+        }
+        framed::release_all(&self.cfg.framed, &sub.routes, &id);
+        if !sub.routes.is_empty() {
+            self.log(
+                false,
+                format!(
+                    "PPP: {}: {} rota(s) removida(s)",
+                    sub.user,
+                    sub.routes.len()
+                ),
+            );
+        }
+        if let Some(idx) = sub.xdp {
+            self.effects.push(Effect::Xdp(PppoeOp::Remove(idx)));
+            self.xdp_free.push(idx);
+        } else if let (Some(ip), true) = (sub.ip, was_up) {
+            self.effects.push(Effect::Route { ip, add: false });
+        }
+        if let Some(x) = &sub.v6 {
+            let nets: Vec<Ipv6Net> = [&x.link, &x.delegated]
+                .into_iter()
+                .flatten()
+                .map(|(n, _)| *n)
+                .collect();
+            self.slow_routes6((sub.slot, sub.sref.sid), &nets, false);
+        }
+        if let Some(ip) = sub.ip {
+            guard(&self.pools).give_back(ip);
+        }
+        if let Some(x) = &sub.v6 {
+            for (n, src) in [&x.link, &x.delegated].into_iter().flatten() {
+                let pool = match src {
+                    Source::Pool(p) => Some(p.as_str()),
+                    Source::Radius => None,
+                };
+                guard(&self.pools6).give_back(*n, pool);
+            }
+        }
+        let mac = mac_text(sub.mac);
+        let server = self
+            .slots
+            .get(sub.slot)
+            .map(|s| s.cfg.name.clone())
+            .unwrap_or_default();
+        let interface = self
+            .slots
+            .get(sub.slot)
+            .map(|s| s.cfg.interface.to_string())
+            .unwrap_or_default();
+        let unix = self.cfg.unix_base + now / 1000;
+        // G4.3hh: adopted, its bookkeeping not done yet.
+        self.ha_adopt_now(now, &sub);
+        let gone = {
+            let mut sh = guard(&self.shared);
+            let gone = sh.active.remove(&id);
+            sh.by_acct.remove(&sub.acct_id);
+            if let Some(ip) = sub.ip
+                && sh.by_ip.get(&ip) == Some(&id)
+            {
+                sh.by_ip.remove(&ip);
+            }
+            gone
+        };
+        let uptime = sub.up_at.map_or(0, |t| now.saturating_sub(t) / 1000);
+        if was_up {
+            if !handed_over
+                && (sub.radius || self.cfg.ppp.aaa.use_radius)
+                && self.cfg.ppp.aaa.accounting
+                && let Some(aaa) = &self.cfg.aaa
+            {
+                let mut counters = gone.as_ref().map(acct_counters).unwrap_or_default();
+                counters.session_time = u32::try_from(uptime).unwrap_or(u32::MAX);
+                let req = AcctRequest {
+                    service: AaaService::Ppp,
+                    status: AcctStatus::Stop,
+                    session_id: sub.acct_id.clone(),
+                    user: sub.user.clone(),
+                    counters: Some(counters),
+                    terminate_cause: Some(cause),
+                    interim_secs: None,
+                    attributes: {
+                        let mut a = acct_attributes(sub.ip, &mac, &sub);
+                        if let Some(x) = &sub.v6 {
+                            a.extend(x.acct_attributes());
+                        }
+                        a.extend(route_attributes(&sub.routes));
+                        a
+                    },
+                    class: sub.class.clone(),
+                };
+                if let Err(e) = aaa.account(req, None) {
+                    self.log(
+                        true,
+                        format!("PPP: Accounting-Stop de {} não enviado: {e}", sub.user),
+                    );
+                }
+            }
+            if let (Some(l), Some(ip)) = (&sub.effective.address_list, sub.ip) {
+                self.effects.push(Effect::AddressList {
+                    list: l.clone(),
+                    ip,
+                    add: false,
+                    comment: String::new(),
+                });
+            }
+            if !handed_over {
+                let hooks = sub.effective.on_down.clone();
+                self.hooks(&hooks, &sub.user, sub.ip, &mac, &interface);
+            }
+        }
+        let failed_stage = if was_up {
+            Stage::Up
+        } else if stage == Stage::Up {
+            sub.stage
+        } else {
+            stage
+        };
+        let h = HistoryEntry {
+            at: unix,
+            name: sub.user.clone(),
+            caller_id: mac.clone(),
+            server,
+            event: if was_up {
+                "down".into()
+            } else {
+                "failed".into()
+            },
+            stage: Some(failed_stage),
+            reason: key.into(),
+            hint: hint.into(),
+            reply_message: sub.reply_message.clone(),
+            address: sub.ip,
+            uptime_secs: uptime,
+            rx_bytes: gone.as_ref().map_or(0, |a| a.rx_bytes),
+            tx_bytes: gone.as_ref().map_or(0, |a| a.tx_bytes),
+            routes: gone.as_ref().map(|a| a.routes.clone()).unwrap_or_default(),
+            refused_routes: Vec::new(),
+        };
+        guard(&self.why).record(&[&sub.user, &mac], &h);
+        guard(&self.shared).record(h);
+        if was_up {
+            self.log(
+                false,
+                format!("PPP: {} desconectado ({key}, {uptime} s): {hint}", sub.user),
+            );
+        } else {
+            let msg = sub
+                .reply_message
+                .as_deref()
+                .map(|m| format!(" — {m}"))
+                .unwrap_or_default();
+            self.log(
+                false,
+                format!(
+                    "PPP: login de {} ({mac}) falhou em {}{msg}: {hint}",
+                    sub.user,
+                    failed_stage.as_str()
+                ),
+            );
+        }
+    }
+
+    /// A session that ended before authentication: the history line and
+    /// the "Why?" of its MAC.
+    fn failed_early(&mut self, now: Millis, i: usize, mac: Mac, reason: DownReason) {
+        let (mut key, mut hint, stage, _) = explain(reason);
+        let mut stage = if stage == Stage::Up {
+            Stage::Lcp
+        } else {
+            stage
+        };
+        if reason == DownReason::AuthFailed {
+            // No credentials ever came: the CPE refused every method the
+            // server offered in LCP (RFC 1661 §6.2, Authentication-Protocol).
+            key = "auth-protocol";
+            hint = "O CPE recusou todos os métodos de autenticação do servidor no LCP: habilite no servidor (authentication) um que o CPE aceite, como chap ou pap.";
+            stage = Stage::Lcp;
+        }
+        let mac = mac_text(mac);
+        let server = self
+            .slots
+            .get(i)
+            .map(|s| s.cfg.name.clone())
+            .unwrap_or_default();
+        let h = HistoryEntry {
+            at: self.cfg.unix_base + now / 1000,
+            name: String::new(),
+            caller_id: mac.clone(),
+            server,
+            event: "failed".into(),
+            stage: Some(stage),
+            reason: key.into(),
+            hint: hint.into(),
+            ..HistoryEntry::default()
+        };
+        guard(&self.why).record(&[&mac], &h);
+        guard(&self.shared).record(h);
+        self.log(
+            false,
+            format!("PPP: sessão de {mac} caiu antes do login ({key}): {hint}"),
+        );
+    }
+
+    /// The servers' timers.
+    pub(crate) fn timers(&mut self, now: Millis) {
+        for i in 0..self.slots.len() {
+            let due = self
+                .slots
+                .get(i)
+                .and_then(|s| s.server.next_deadline())
+                .is_some_and(|d| d <= now);
+            if due {
+                self.run(now, i, |srv, out| srv.handle_timers(now, out));
+            }
+        }
+    }
+
+    /// Once a second: counters (from XDP when it carries the traffic),
+    /// uptime, idle and byte limits, and what the commands and the RADIUS
+    /// service asked for.
+    pub(crate) fn tick(&mut self, now: Millis, xdp: &[(u32, PppoeCounters)]) {
+        self.ra_tick(now);
+        let by_idx: HashMap<u32, PppoeCounters> = xdp.iter().copied().collect();
+        // PADIs the servers' limiters held back count as throttled too.
+        let limited: u64 = self
+            .slots
+            .iter()
+            .map(|s| s.server.stats().padi_limited)
+            .sum();
+        let throttled = self.padr_throttled + limited;
+        let (limits, lockouts) = self.limits(now);
+        // new_session_rate=auto: one AIMD step a second.
+        self.admission
+            .second(self.padr_throttled + self.queued_total, self.pending_auth);
+        let rate = share(self.admission.rate as u32, self.lanes);
+        let mut auto = false;
+        for s in self
+            .slots
+            .iter_mut()
+            .filter(|s| s.cfg.new_session_rate_auto)
+        {
+            s.bucket.set_rate(rate);
+            auto = true;
+        }
+        {
+            let mut sh = guard(&self.shared);
+            let lane = usize::from(self.lane);
+            if sh.lanes.len() <= lane {
+                sh.lanes.resize(lane + 1, LaneStats::default());
+            }
+            if let Some(l) = sh.lanes.get_mut(lane) {
+                l.throttled = throttled;
+                l.admission_rate = if auto { rate } else { 0 };
+                l.admission_reason = auto.then(|| self.admission.reason.clone());
+                l.counts = self.counts;
+                l.limits = limits;
+                l.lockouts = lockouts;
+            }
+        }
+        let mut ending: Vec<(usize, SessionRef, (u32, &'static str))> = Vec::new();
+        // G4.3h: the counters for the pair's standby, in this same pass.
+        let ha_counters = self.ha_counters_due(now);
+        {
+            let mut sh = guard(&self.shared);
+            for ((slot, sid), sub) in self.subs.iter_mut() {
+                let Some(up) = sub.up_at else { continue };
+                let id = session_id(*slot, &self.slots, *sid);
+                let Some(a) = sh.active.get_mut(&id) else {
+                    continue;
+                };
+                if let Some(c) = sub.xdp.and_then(|i| by_idx.get(&i)) {
+                    // G4.3h: plus what the session had on the node that
+                    // opened it (a takeover).
+                    let [rx, tx, rxp, txp] = sub.base;
+                    a.rx_bytes = rx + c.up_bytes;
+                    a.rx_packets = rxp + c.up_packets;
+                    a.tx_bytes = tx + c.down_bytes;
+                    a.tx_packets = txp + c.down_packets;
+                    a.queue_us = c.down_queue_us;
+                    a.drops = c.up_policed + c.down_policed;
+                }
+                a.uptime_secs = now.saturating_sub(up) / 1000;
+                let dt = now.saturating_sub(sub.prev.2);
+                if dt > 0 {
+                    let bps =
+                        |now: u64, was: u64| now.saturating_sub(was).saturating_mul(8_000) / dt;
+                    a.rx_bps = bps(a.rx_bytes, sub.prev.0);
+                    a.tx_bps = bps(a.tx_bytes, sub.prev.1);
+                }
+                sub.prev = (a.rx_bytes, a.tx_bytes, now);
+                if ha_counters {
+                    self.ha.counters((*slot, *sid), a);
+                }
+                if let (Some(l), Some(ip)) = (&sub.effective.address_list, sub.ip)
+                    && now.saturating_sub(sub.list_at) >= LIST_REFRESH_MS
+                {
+                    sub.list_at = now;
+                    self.effects.push(Effect::AddressList {
+                        list: l.clone(),
+                        ip,
+                        add: false,
+                        comment: String::new(),
+                    });
+                    self.effects.push(Effect::AddressList {
+                        list: l.clone(),
+                        ip,
+                        add: true,
+                        comment: format!("ppp {}", sub.user),
+                    });
+                }
+                let bytes = (a.rx_bytes, a.tx_bytes);
+                if bytes != sub.last_bytes {
+                    sub.last_bytes = bytes;
+                    sub.idle_since = now;
+                }
+                if sub.cause.is_some() {
+                    continue;
+                }
+                if let Some(idle) = sub.effective.idle_timeout
+                    && now.saturating_sub(sub.idle_since) >= u64::from(idle) * 1000
+                {
+                    sub.cause = Some((4, "idle-timeout"));
+                } else if (sub.limit_in > 0 && a.rx_bytes >= sub.limit_in)
+                    || (sub.limit_out > 0 && a.tx_bytes >= sub.limit_out)
+                {
+                    sub.cause = Some((10, "limit-bytes"));
+                }
+                if let Some(c) = sub.cause {
+                    ending.push((*slot, sub.sref, c));
+                }
+            }
+        }
+        for (i, sref, _) in ending {
+            self.replies.push_back((i, sref, Reply::Terminate));
+            self.run(now, i, |_, _| {});
+        }
+        self.requests(now);
+    }
+
+    /// `ppp.active.remove`, Disconnect and CoA rate changes.
+    /// The counts of G4.3m and the hosts locked out now, for the shared
+    /// state (once a second: a walk of the fixed table, ~16 000 entries).
+    fn limits(&self, now: Millis) -> (Limits, Vec<LockedOut>) {
+        let mut l = Limits::default();
+        let mut rows = Vec::new();
+        for s in &self.slots {
+            let st = s.server.stats();
+            l.vlan += st.vlan_refused;
+            l.mac += st.mac_refused;
+            l.short += st.short_cycle_refused;
+            l.cycles += st.short_cycles;
+            for x in s.server.lockouts(now) {
+                l.locked += 1;
+                if rows.len() < LOCKOUT_ROWS {
+                    rows.push(LockedOut {
+                        caller_id: mac_text(x.mac),
+                        server: s.cfg.name.clone(),
+                        vlan: (x.vlans.outer != 0).then_some(x.vlans.outer),
+                        inner_vlan: (x.vlans.inner != 0).then_some(x.vlans.inner),
+                        strikes: x.strikes,
+                        left_secs: x.left_ms.div_ceil(1000),
+                        reason: explain(x.cause).0.to_owned(),
+                    });
+                }
+            }
+        }
+        (l, rows)
+    }
+
+    /// `ppp.lockout.clear` for this worker.
+    fn lockout_clears(&mut self, now: Millis, clears: Vec<Option<Mac>>) {
+        for c in clears {
+            for s in &mut self.slots {
+                s.server.clear_lockouts(now, c);
+            }
+        }
+    }
+
+    pub(crate) fn requests(&mut self, now: Millis) {
+        // Each worker takes the requests for its own SESSION_IDs and leaves
+        // the rest for the others (the id says which: `*server-sid`).
+        let (lane, lanes) = (self.lane, self.lanes);
+        let mine = |id: &str| parse_session_id(id).is_none_or(|(_, sid)| sid % lanes == lane);
+        let (ids, rates, lists, changes) = {
+            let mut sh = guard(&self.shared);
+            let clears = sh
+                .lanes
+                .get_mut(usize::from(lane))
+                .map(|l| std::mem::take(&mut l.clear))
+                .unwrap_or_default();
+            if !clears.is_empty() {
+                drop(sh);
+                self.lockout_clears(now, clears);
+                sh = guard(&self.shared);
+            }
+            if sh.terminate.is_empty()
+                && sh.rates.is_empty()
+                && sh.lists.is_empty()
+                && sh.route_changes.is_empty()
+            {
+                return;
+            }
+            let (changes, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut sh.route_changes)
+                .into_iter()
+                .partition(|(id, _)| mine(id));
+            sh.route_changes = rest;
+            let (ids, rest): (Vec<String>, Vec<String>) = std::mem::take(&mut sh.terminate)
+                .into_iter()
+                .partition(|id| mine(id));
+            sh.terminate = rest;
+            let (rates, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut sh.rates)
+                .into_iter()
+                .partition(|(id, _)| mine(id));
+            sh.rates = rest;
+            let (lists, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut sh.lists)
+                .into_iter()
+                .partition(|(id, _)| mine(id));
+            sh.lists = rest;
+            (ids, rates, lists, changes)
+        };
+        for (id, change) in changes {
+            self.change_routes(&id, &change);
+        }
+        for (id, list) in lists {
+            let Some((i, sref)) = self.find(&id) else {
+                continue;
+            };
+            let Some(sub) = self.subs.get_mut(&(i, sref.sid)) else {
+                continue;
+            };
+            let Some(ip) = sub.ip else { continue };
+            let user = sub.user.clone();
+            let new = (!list.is_empty()).then(|| list.clone());
+            let old = std::mem::replace(&mut sub.effective.address_list, new);
+            if let Some(o) = old {
+                self.effects.push(Effect::AddressList {
+                    list: o,
+                    ip,
+                    add: false,
+                    comment: String::new(),
+                });
+            }
+            if !list.is_empty() {
+                self.effects.push(Effect::AddressList {
+                    list: list.clone(),
+                    ip,
+                    add: true,
+                    comment: format!("ppp {user}"),
+                });
+            }
+            self.log(false, format!("PPP: {user} na address-list '{list}' (CoA)"));
+        }
+        for id in ids {
+            if let Some((i, sref)) = self.find(&id) {
+                self.replies.push_back((i, sref, Reply::Terminate));
+                self.run(now, i, |_, _| {});
+            }
+        }
+        for (id, rate) in rates {
+            let Some((i, sref)) = self.find(&id) else {
+                continue;
+            };
+            let Some(srv) = self.slots.get(i).map(|s| &s.server) else {
+                continue;
+            };
+            let Some(d) = srv.session(sref.sid) else {
+                continue;
+            };
+            if let Some(sub) = self.subs.get_mut(&(i, sref.sid)) {
+                sub.rate = Some(rate.clone());
+                self.ha.dirty.insert((i, sref.sid));
+                if let Some(idx) = sub.xdp {
+                    // CoA: the rate changes, the queue (its clock) stays.
+                    let shape =
+                        corerouter_engine::queue::shape_of(&self.cfg.queues, &sub.effective);
+                    self.effects.push(Effect::Xdp(PppoeOp::Upsert(
+                        idx,
+                        xdp_session(&d, Some(&rate), sub.v6.as_deref(), shape),
+                    )));
+                }
+                let user = sub.user.clone();
+                if let Some(a) = guard(&self.shared).active.get_mut(&id) {
+                    a.rate_limit = Some(rate.clone());
+                }
+                self.log(
+                    false,
+                    format!("PPP: {user} com rate-limit novo {rate} (CoA)"),
+                );
+            }
+        }
+    }
+
+    /// G4.3cd: a CoA's routes for session `id`, without dropping it: the
+    /// new blocks are claimed and installed first, then the old ones of
+    /// the families the CoA names are removed (traffic to a block kept by
+    /// both never stops).
+    fn change_routes(&mut self, id: &str, c: &RouteChange) {
+        if let Some((slot, sref)) = self.find(id) {
+            self.ha.dirty.insert((slot, sref.sid));
+        }
+        let Some((i, sref)) = self.find(id) else {
+            return;
+        };
+        let Some(sub) = self.subs.get_mut(&(i, sref.sid)) else {
+            return;
+        };
+        let replaced = |r: &FramedRoute| if r.is_v6() { c.v6 } else { c.v4 };
+        let (old, kept): (Vec<_>, Vec<_>) =
+            sub.routes.iter().copied().partition(|(r, _)| replaced(r));
+        let holder = Holder {
+            session: id.to_owned(),
+            user: sub.user.clone(),
+            origin: RouteOrigin::FramedRoute,
+            lane: self.lane,
+            service: "pppoe",
+        };
+        // Blocks kept by both stay claimed; the rest is claimed anew.
+        let fresh: Vec<_> = c
+            .routes
+            .iter()
+            .copied()
+            .filter(|n| !old.iter().any(|o| o.0.dst == n.0.dst))
+            .collect();
+        let adm = framed::admit(
+            &self.cfg.framed,
+            &self.cfg.forbidden,
+            &fresh,
+            &holder,
+            sub.ip,
+            v6_refusal(sub.xdp.is_some()),
+        );
+        let xdp = sub.xdp;
+        let mut now_routes = kept;
+        now_routes.extend(
+            old.iter()
+                .copied()
+                .filter(|o| c.routes.iter().any(|n| n.0.dst == o.0.dst)),
+        );
+        now_routes.extend(adm.routes.iter().copied());
+        let gone: Vec<_> = old
+            .iter()
+            .copied()
+            .filter(|o| !c.routes.iter().any(|n| n.0.dst == o.0.dst))
+            .collect();
+        sub.routes = now_routes;
+        let user = sub.user.clone();
+        let rows = framed::rows(&sub.routes);
+        for (r, _) in &adm.routes {
+            self.effects.push(route_effect(xdp, r, true));
+        }
+        for (r, _) in &gone {
+            self.effects.push(route_effect(xdp, r, false));
+        }
+        framed::release_all(&self.cfg.framed, &gone, id);
+        if let Some(a) = guard(&self.shared).active.get_mut(id) {
+            a.routes = rows.clone();
+            a.refused_routes = adm.refused.clone();
+        }
+        let text = if rows.is_empty() {
+            "nenhuma".to_owned()
+        } else {
+            rows.iter()
+                .map(|r| r.route.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        self.log(
+            false,
+            format!("PPP: {user}: rotas trocadas por CoA: {text}"),
+        );
+        for why in adm.refused {
+            self.log(true, format!("PPP: {user}: rota recusada (CoA): {why}"));
+        }
+    }
+
+    /// The session of an id from `ppp.active` (`*server-sid`), in O(1)
+    /// (a walk of every session per id made removing N sessions O(N²)).
+    fn find(&self, id: &str) -> Option<(usize, SessionRef)> {
+        let (server, sid) = parse_session_id(id)?;
+        let slot = self.slots.iter().position(|s| s.cfg.id.0 == server)?;
+        self.subs.get(&(slot, sid)).map(|s| (s.slot, s.sref))
+    }
+
+    /// G4.3h: answer subscribers now — redundancy is off, or this node is
+    /// the active one of its pair ([`HA_ACTIVE`]).
+    pub(crate) fn serving(&self) -> bool {
+        ha_may_answer(
+            self.cfg.ppp.redundancy.enabled,
+            HA_ACTIVE.load(std::sync::atomic::Ordering::Acquire) && !self.ha_pending(),
+        )
+    }
+
+    /// G4.3h: the pair's role went to the peer. Every session ends here
+    /// without a frame (the address back, the data plane cleaned, the
+    /// accounting Stop); the servers come back at the next configure, to
+    /// answer if the role returns.
+    pub(crate) fn abandon(&mut self, now: Millis) {
+        // Hot standby: the peer goes on with them (no Acct-Stop).
+        self.ha.handed_over = self.cfg.ppp.redundancy.enabled
+            && self.cfg.ppp.redundancy.mode == corerouter_model::ppp_redundancy::HaMode::HotStandby;
+        let mut i = self.slots.len();
+        while i > 0 {
+            i -= 1;
+            self.drop_slot(now, i);
+        }
+        self.ha.handed_over = false;
+        self.log(
+            false,
+            "PPPoE: o par assumiu; as sessões deste nó foram encerradas sem aviso ao CPE".into(),
+        );
+    }
+
+    /// End every session (service stopping): Terminate and PADT to each.
+    pub(crate) fn shutdown(&mut self, now: Millis) {
+        let all: Vec<(usize, SessionRef)> = self.subs.values().map(|s| (s.slot, s.sref)).collect();
+        for (i, sref) in all {
+            self.replies.push_back((i, sref, Reply::Terminate));
+            self.run(now, i, |_, _| {});
+        }
+    }
+
+    /// XDP slots of the sessions up, for the counters.
+    pub(crate) fn xdp_slots(&self) -> Vec<u32> {
+        self.subs.values().filter_map(|s| s.xdp).collect()
+    }
+
+    /// Debug builds and tests: the servers' indexes agree.
+    #[cfg(test)]
+    pub(crate) fn check(&self) -> Result<(), String> {
+        for s in &self.slots {
+            s.server.check_invariants()?;
+        }
+        let ips: Vec<u32> = self
+            .subs
+            .values()
+            .filter_map(|s| s.ip)
+            .map(u32::from)
+            .collect();
+        let unique: HashSet<u32> = ips.iter().copied().collect();
+        if unique.len() != ips.len() {
+            return Err("an address is held by two sessions".into());
+        }
+        let mut again = SubIndex::default();
+        for (k, sub) in &self.subs {
+            again.add(*k, sub);
+        }
+        if again.by_ip != self.index.by_ip
+            || again.users_up != self.index.users_up
+            || again.pending != self.index.pending
+        {
+            return Err("the session index disagrees with the sessions".into());
+        }
+        // G4.3e: every prefix taken is a live session's, once.
+        let v6: Vec<ipnet::Ipv6Net> = self
+            .subs
+            .values()
+            .filter_map(|s| s.v6.as_deref())
+            .flat_map(|x| [x.link.as_ref(), x.delegated.as_ref()])
+            .flatten()
+            .map(|p| p.0)
+            .collect();
+        let unique6: HashSet<_> = v6.iter().copied().collect();
+        // The pools are shared by the workers: their count is everyone's.
+        let taken = guard(&self.pools6).taken();
+        if unique6.len() != v6.len() || (self.lanes == 1 && v6.len() != taken) {
+            return Err(format!(
+                "IPv6 prefixes: {} held, {} distinct, {taken} taken",
+                v6.len(),
+                unique6.len(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The IPv6 columns of a session's `ppp.active` row.
+struct ActiveV6 {
+    prefix: Option<ipnet::Ipv6Net>,
+    delegated: Option<ipnet::Ipv6Net>,
+    bound: bool,
+    link_local: std::net::Ipv6Addr,
+}
+
+impl ActiveV6 {
+    fn apply(self, a: &mut ActiveSession) {
+        a.ipv6_prefix = self.prefix;
+        a.delegated_prefix = self.delegated;
+        a.delegated_bound = self.bound;
+        a.link_local = Some(self.link_local);
+    }
+}
+
+fn active_v6(x: &V6) -> ActiveV6 {
+    ActiveV6 {
+        prefix: x.link.as_ref().map(|l| l.0),
+        delegated: x.delegated.as_ref().map(|d| d.0),
+        bound: x.pd_bound(),
+        link_local: x.peer(),
+    }
+}
+
+fn session_id(slot: usize, slots: &[Slot], sid: u16) -> String {
+    let server = slots.get(slot).map_or(0, |s| s.cfg.id.0);
+    format!("*{server:X}-{sid}")
+}
+
+/// [`session_id`] read back: (server id, SESSION_ID).
+fn parse_session_id(id: &str) -> Option<(u32, u16)> {
+    let (server, sid) = id.strip_prefix('*')?.split_once('-')?;
+    Some((u32::from_str_radix(server, 16).ok()?, sid.parse().ok()?))
+}
+
+fn assignment(ip: Ipv4Addr, dns: &[Ipv4Addr]) -> Ipv4Assignment {
+    Ipv4Assignment {
+        address: ip,
+        dns: [dns.first().copied(), dns.get(1).copied()],
+        nbns: [None, None],
+    }
+}
+
+fn acct_attributes(ip: Option<Ipv4Addr>, mac: &str, sub: &Sub) -> Vec<Attribute> {
+    let mut v = vec![
+        Attribute::new("Calling-Station-Id", mac),
+        Attribute::new("NAS-Port-Id", sub.nas_port_id.as_str()),
+        Attribute::new("Framed-Protocol", "1"),
+    ];
+    if let Some(ip) = ip {
+        v.push(Attribute::new("Framed-IP-Address", ip.to_string()));
+    }
+    v.extend(line_attributes(sub));
+    v
+}
+
+/// G4.3cd: the routes of a session in the Accounting-Request (RFC 2866
+/// §5.13: the attributes of the Access-Accept may go along).
+fn route_attributes(routes: &[(FramedRoute, RouteOrigin)]) -> Vec<Attribute> {
+    routes
+        .iter()
+        .map(|(r, _)| {
+            let name = if r.is_v6() {
+                "Framed-IPv6-Route"
+            } else {
+                "Framed-Route"
+            };
+            Attribute::new(name, r.to_string())
+        })
+        .collect()
+}
+
+/// Why an IPv6 route cannot be had: without XDP there is no IPv6 slow
+/// path (G4.3l).
+fn v6_refusal(xdp: bool) -> Option<&'static str> {
+    (!xdp).then_some("IPv6 só com o plano de dados XDP (sem XDP, G4.3l)")
+}
+
+/// Where a route goes: the XDP LPM of session `xdp`, or (IPv4, no XDP) a
+/// kernel route through `bng0`.
+fn route_effect(xdp: Option<u32>, r: &FramedRoute, add: bool) -> Effect {
+    match (xdp, r.dst) {
+        (Some(idx), dst) => Effect::Xdp(PppoeOp::Route { dst, idx, add }),
+        (None, ipnet::IpNet::V4(dst)) => Effect::Block { dst, add },
+        // Never admitted without XDP (`framed::admit` refuses IPv6 there).
+        (None, ipnet::IpNet::V6(_)) => Effect::Log {
+            error: true,
+            text: format!("PPP: rota {r}: IPv6 sem XDP"),
+        },
+    }
+}
+
+/// RFC 4679 §3 (TR-101): Agent-Circuit-Id and Agent-Remote-Id of the line,
+/// as the access node put them in the PADI (G4.3l).
+fn line_attributes(sub: &Sub) -> Vec<Attribute> {
+    let mut v = Vec::new();
+    if let Some(c) = &sub.circuit_id {
+        v.push(Attribute::new("ADSL-Agent-Circuit-Id", c.as_str()));
+    }
+    if let Some(r) = &sub.remote_id {
+        v.push(Attribute::new("ADSL-Agent-Remote-Id", r.as_str()));
+    }
+    v
+}
+
+/// NAS-Port-Id of a line without a circuit id: the port, and for a QinQ
+/// line `:<outer>-<inner>` (Junos' `ge-1/0/0:120-3044`), so RADIUS tells
+/// the lines apart (G4.3l). A single tag keeps the port alone, as before.
+fn nas_port(interface: &str, v: Vlans) -> String {
+    if v.inner != 0 {
+        format!("{interface}:{}-{}", v.outer, v.inner)
+    } else {
+        interface.to_owned()
+    }
+}
+
+/// The `S=…` string of an MS-CHAP2-Success attribute (RFC 2548 §2.3.3:
+/// Ident, then 42 octets), shown as text or as hex.
+fn success_string(v: &str) -> Option<[u8; AUTH_STRING_LEN]> {
+    let bytes: Vec<u8> = if let Some(at) = v.find("S=") {
+        v.get(at..)?.as_bytes().to_vec()
+    } else {
+        let hex = v.strip_prefix("0x").unwrap_or(v);
+        let raw: Vec<u8> = (0..hex.len() / 2)
+            .filter_map(|i| {
+                hex.get(i * 2..i * 2 + 2)
+                    .and_then(|b| u8::from_str_radix(b, 16).ok())
+            })
+            .collect();
+        raw.get(1..)?.to_vec()
+    };
+    bytes.get(..AUTH_STRING_LEN)?.try_into().ok()
+}
+
+fn rate_dir(r: &RateLimit, up: bool) -> Rate {
+    let pick = |p: corerouter_proto_radius::rate_limit::Pair<u64>| if up { p.rx } else { p.tx };
+    Rate {
+        rate_bps: pick(r.rate),
+        burst_bps: r.burst_rate.map_or(0, pick),
+        threshold_bps: r.burst_threshold.map_or(0, pick),
+        burst_secs: r.burst_time.map_or(0, |t| if up { t.rx } else { t.tx }),
+    }
+}
+
+/// The XDP map entry of a session (G4.3c): downstream in XDP, or, shaped
+/// (G4.9b), through the kernel and `bng0` to the shaper on the access port;
+/// upstream through the kernel so `forward` and the queues see it.
+fn xdp_session(
+    d: &corerouter_proto_pppoe::descriptor::SessionDescriptor,
+    rate: Option<&str>,
+    v6: Option<&V6>,
+    shape: Option<corerouter_hal::queue::Kind>,
+) -> PppoeSession {
+    let r = rate
+        .and_then(|t| t.parse::<RateLimit>().ok())
+        .or(d.rate_limit);
+    PppoeSession {
+        ifindex: d.ifindex,
+        sid: d.sid,
+        vlan: d.vlan,
+        inner_vlan: d.inner_vlan,
+        outer_tpid: d.outer_tpid,
+        mtu: d.mtu,
+        client_mac: d.client_mac.0,
+        server_mac: d.server_mac.0,
+        ipv4: d.ipv4,
+        up: r.as_ref().map(|r| rate_dir(r, true)).unwrap_or_default(),
+        down: r.as_ref().map(|r| rate_dir(r, false)).unwrap_or_default(),
+        fast_up: false,
+        fast_down: true,
+        ipoe: false,
+        ipv6_prefix: v6
+            .and_then(|x| x.link.as_ref())
+            .map(|(n, _)| v6::high64(*n)),
+        delegated: v6
+            .and_then(|x| x.delegated.as_ref())
+            .map(|(n, _)| (v6::high64(*n), n.prefix_len())),
+        shape,
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    // The bench includes this file with cfg(test) and no test harness.
+    #[allow(unused_imports)]
+    use super::*;
+
+    #[test]
+    fn why_evicts_the_least_recently_used_not_everything() {
+        let mut sh = WhyTable {
+            why_cap: 3,
+            ..WhyTable::default()
+        };
+        for k in ["a", "b", "c"] {
+            sh.reach(&[k], Stage::Padi);
+        }
+        sh.reach(&["a"], Stage::Auth);
+        sh.reach(&["d"], Stage::Padi);
+        let mut keys: Vec<&str> = sh.why.keys().map(|k| &**k).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["a", "c", "d"], "b was the oldest unused");
+        // A flood of new keys keeps the table at its size.
+        for i in 0..10_000 {
+            sh.reach(&[&format!("m{i}")], Stage::Padi);
+        }
+        assert_eq!(sh.why.len(), 3);
+        assert!(sh.why_order.len() <= 2 * 3 + 1024 + 1);
+        assert!(sh.why.contains_key("m9999"));
+    }
+
+    #[test]
+    fn auto_rate_follows_the_radius_server() {
+        let mut held = 0;
+        // One second: `n` answers in `ms`, a timeout or not, CPEs waiting
+        // or not.
+        let mut second = |a: &mut Admission, n: usize, ms: u64, timeout: bool, waiting: bool| {
+            for _ in 0..n {
+                a.answer(ms, false);
+            }
+            if timeout {
+                a.answer(1100, true);
+            }
+            if waiting {
+                held += 10;
+            }
+            a.second(held, 0);
+        };
+        let mut a = Admission::default();
+        // Startup: twice what the server answered, while that keeps growing
+        // (not twice the last rate: that ran to 3.6× the capacity).
+        second(&mut a, 100, 20, false, true);
+        assert_eq!(a.rate, 200.0);
+        assert!(a.reason.contains("100/s"), "{}", a.reason);
+        // The answers stop growing (the server's capacity: 100/s): after
+        // three such seconds the rate is that capacity times BBR's gains.
+        for _ in 0..4 {
+            second(&mut a, 100, 20, false, true);
+        }
+        assert!(!a.startup);
+        assert!((90.0..=125.0).contains(&a.rate), "{}", a.rate);
+        assert!(
+            a.reason.contains("capacidade do RADIUS: 100/s"),
+            "{}",
+            a.reason
+        );
+        // A standing queue (380 ms against 20 ms with none): 0.9× the capacity.
+        second(&mut a, 100, 380, false, true);
+        assert_eq!(a.rate, 90.0);
+        assert_eq!(a.reason, "RADIUS lento: 380 ms (sem fila: 20 ms)");
+        // A timeout: 0.75× the capacity, never the floor while it answers.
+        second(&mut a, 100, 20, true, true);
+        assert_eq!(a.rate, 75.0);
+        assert!(a.reason.starts_with("RADIUS sem resposta"), "{}", a.reason);
+        // No queue: it holds.
+        let r = a.rate;
+        second(&mut a, 100, 20, false, false);
+        assert_eq!(a.rate, r);
+        assert_eq!(a.reason, "sem fila");
+        // Questions out and a whole second without an answer: halved.
+        a.second(1 << 40, 40);
+        assert_eq!(a.rate, (r / 2.0).max(AUTO_MIN));
+        assert!(a.reason.starts_with("RADIUS parado"), "{}", a.reason);
+        // Local secrets (no RADIUS answers ever) and CPEs waiting: it grows.
+        let mut b = Admission::default();
+        second(&mut b, 0, 0, false, true);
+        assert_eq!(b.rate, AUTO_START + AUTO_STEP);
+        // The window: a small one before any answer; then the capacity
+        // times the base answer time (at least 300 ms), twice while
+        // probing, shared by the workers; the backlog: 10 s of capacity.
+        b.rate = 2000.0;
+        assert_eq!(b.window(1), AUTO_WINDOW_START);
+        assert_eq!(b.window(4), AUTO_WINDOW_START / 4);
+        b.delivered.push_back(2000.0);
+        b.startup = false;
+        assert_eq!(b.window(1), 600);
+        assert_eq!(b.window(4), 150);
+        b.startup = true;
+        assert_eq!(b.window(1), 1200);
+        b.startup = false;
+        b.delivered.clear();
+        assert_eq!(b.backlog(1), 20_000);
+        b.rate = AUTO_MIN;
+        assert_eq!(b.window(8), AUTO_WINDOW_MIN);
+    }
+
+    /// G4.2i: `/ip pool used` over 100 000 sessions: the page in address
+    /// order cut to the limit with the whole count, the per-pool counts in
+    /// one pass, and the holder of an address by the index; fixed
+    /// addresses (no pool) stay out.
+    #[test]
+    fn pool_used_pages_counts_and_finds_the_holder() {
+        let mut sh = Shared::default();
+        let n = 100_000u32;
+        for i in 0..n {
+            let id = format!("s{i}");
+            // Inserted from the top down: the page must sort, not trust
+            // the table's order.
+            let ip = Ipv4Addr::from(0x6440_0000 + (n - 1 - i));
+            let pool = match i % 10 {
+                0 => None,
+                1..=3 => Some("b".to_owned()),
+                _ => Some("a".to_owned()),
+            };
+            sh.active.insert(
+                id.clone(),
+                ActiveSession {
+                    id: id.clone(),
+                    name: format!("u{i}"),
+                    address: Some(ip),
+                    pool,
+                    ..ActiveSession::default()
+                },
+            );
+            sh.by_ip.insert(ip, id);
+        }
+        let b = Backend(Arc::new(Mutex::new(sh)));
+        let t = std::time::Instant::now();
+        let (total, page) = b.pool_page(&|_| true, 10_000);
+        let page_took = t.elapsed();
+        assert_eq!(total, 90_000);
+        assert_eq!(page.len(), 10_000);
+        assert!(page.windows(2).all(|w| w[0].address < w[1].address));
+        assert!(page.iter().all(|a| a.pool.is_some()));
+        let (total_b, _) = b.pool_page(&|a| a.pool.as_deref() == Some("b"), 10);
+        assert_eq!(total_b, 30_000);
+        let t = std::time::Instant::now();
+        let used = b.pool_use();
+        let use_took = t.elapsed();
+        assert_eq!(used.get("a"), Some(&60_000));
+        assert_eq!(used.get("b"), Some(&30_000));
+        // s0 has the top address and a fixed one: not a pool's.
+        assert!(b.pool_holder(Ipv4Addr::from(0x6440_0000 + n - 1)).is_none());
+        assert_eq!(
+            b.pool_holder(Ipv4Addr::from(0x6440_0000 + n - 2))
+                .map(|a| a.name),
+            Some("u1".to_owned())
+        );
+        eprintln!("100 000 sessions: page of 10 000 {page_took:?}, counts per pool {use_took:?}");
+    }
+
+    /// G4.3hb: a CoA naming a session by Framed-IP-Address or
+    /// Acct-Session-Id finds it in the indexes, not by a pass over every
+    /// session (100 000 here); the other selectors still match as before.
+    #[test]
+    fn a_coa_by_address_or_session_id_does_not_scan_the_table() {
+        use corerouter_model::radius::CoaSelector;
+        let mut sh = Shared::default();
+        let n = 100_000u32;
+        for i in 0..n {
+            let id = format!("s{i}");
+            let ip = Ipv4Addr::from(0x6440_0000 + i);
+            sh.active.insert(
+                id.clone(),
+                ActiveSession {
+                    id: id.clone(),
+                    name: format!("u{i}"),
+                    address: Some(ip),
+                    caller_id: format!("02:00:00:00:{:02X}:{:02X}", i >> 8 & 0xff, i & 0xff),
+                    interface: "ether2".into(),
+                    ..ActiveSession::default()
+                },
+            );
+            sh.by_ip.insert(ip, id.clone());
+            sh.by_acct.insert(format!("A{i}"), id);
+        }
+        let owner = Owner(Arc::new(Mutex::new(sh)));
+        let coa = |sel: CoaSelector| CoaRequest {
+            kind: CoaKind::Coa,
+            from: "127.0.0.1:1".parse().unwrap(),
+            selector: sel,
+            changes: vec![Attribute::new("Mikrotik-Rate-Limit", "1M/1M")],
+            authorize_only: false,
+            packet: Vec::new(),
+        };
+        let by_ip = coa(CoaSelector {
+            framed_ip: Some(Ipv4Addr::from(0x6440_0000 + 777)),
+            ..CoaSelector::default()
+        });
+        let t = std::time::Instant::now();
+        for _ in 0..100 {
+            assert_eq!(owner.handle(&by_ip), CoaOutcome::Ack);
+        }
+        let per = t.elapsed() / 100;
+        eprintln!("CoA by Framed-IP-Address, 100 000 sessions: {per:?} each");
+        let by_acct = coa(CoaSelector {
+            acct_session_id: Some("A99999".into()),
+            user_name: Some("u99999".into()),
+            ..CoaSelector::default()
+        });
+        assert_eq!(owner.handle(&by_acct), CoaOutcome::Ack);
+        // The index finds it; the other attributes must still match.
+        let wrong_user = coa(CoaSelector {
+            acct_session_id: Some("A5".into()),
+            user_name: Some("u6".into()),
+            ..CoaSelector::default()
+        });
+        assert_eq!(owner.handle(&wrong_user), CoaOutcome::NotMine);
+        let nobody = coa(CoaSelector {
+            framed_ip: Some(Ipv4Addr::new(198, 18, 0, 1)),
+            ..CoaSelector::default()
+        });
+        assert_eq!(owner.handle(&nobody), CoaOutcome::NotMine);
+        // By user name: still the pass over the table.
+        let by_user = coa(CoaSelector {
+            user_name: Some("u42".into()),
+            ..CoaSelector::default()
+        });
+        assert_eq!(owner.handle(&by_user), CoaOutcome::Ack);
+        let sh = guard(&owner.0);
+        assert_eq!(sh.rates.len(), 102);
+        assert_eq!(sh.rates.last().map(|r| r.0.as_str()), Some("s42"));
+        assert!(per < std::time::Duration::from_millis(1), "{per:?}");
+    }
+}

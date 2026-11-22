@@ -1,0 +1,887 @@
+//! /system package (G1.6b): the A/B image. Like RouterOS `/system package
+//! update`, an update installs and reboots; unlike it, the new image boots
+//! once on trial (UEFI `BootNext`) and becomes the default only when it is
+//! confirmed — by the daemon once it is up and the management interfaces
+//! run again (`confirm=auto`), or by an operator (`confirm=manual`, like
+//! Junos `commit confirmed`). Without confirmation in `timeout` seconds,
+//! init reboots and the firmware boots the previous slot, with the
+//! configuration it had. The work runs on the daemon's `package` service:
+//! these commands queue it (`system.package.print` shows the progress).
+//!
+//! G1.6e: `system.package.upload.*` sends the package over the control
+//! channel instead of naming a file on the router: `start` declares its
+//! size and queues the job, `chunk` carries it in order (base64, ≤ 4 MiB
+//! each), and the service writes it to the inactive slot as it arrives
+//! (signature checked before the first byte is written, hashes and the
+//! verity tree before the slot is activated). `abort` stops it; a client
+//! that disappears is dropped after 60 s without a chunk.
+
+use base64::Engine as _;
+use serde_json::{Value, json};
+
+use super::args::{opt_bool, opt_str, opt_u32, req_str};
+use super::{CommandSpec, always};
+use crate::package::{
+    Job, JobKind, Packages, Pushed, UPLOAD_CHUNK, Upload, push_chunk, reachable_ports, status,
+};
+use crate::{EngineError, Result, Session};
+
+pub(super) const COMMANDS: &[CommandSpec] = &[
+    cmd!(query "system.package.print", "Packages", ["System", "Packages"], None,
+        "{} → {supported, reason?, firmware, lab, running, primary, fallback, slots: [{slot, state, running, primary, next, version, build, commit, channel, kernel, verified, verity, signed_by, boot_entry, cmdline, size, rootfs_size, kernel_size}], trial: {slot, from, version, reason, confirm, timeout_s, remaining_s?} | null, last, snapshots: [{name, slot, version, format_version, at_unix, files, bytes, own_bytes}], partials: [{name, own_bytes}], config_space: {total?, free?, snapshot_need?, snapshot_fits?, usage: [{path, bytes, kind}], usage_rows}, keys, job: {id, kind, phase, done, total} | null, result, root: {in_ram, bytes, copy_ms, disk?, note?} | null (G1.6zn: where this boot's root came from), system_disk_removed?: string (G1.6zn: the system disk went away), to_ram: bool (system.boot's choice for the next boot)}",
+        always, print),
+    cmd!(
+        "system.package.update",
+        "Install and Reboot",
+        [],
+        None,
+        "{path: string (package file on the router), confirm?: auto|manual, timeout?: u32 (30..3600 s, default 300), reboot?: bool (default yes), force?: bool (reboot even in Safe Mode, which the reboot undoes, or with uncommitted changes, which are lost)} → {job, kind, checkpoint?: {name, revision, rotated} | {error} (G0.33b: the automatic checkpoint saved before the image changes)}",
+        always,
+        update
+    ),
+    cmd!(
+        "system.package.downgrade",
+        "Downgrade",
+        [],
+        None,
+        "{path?: string (older package; without it the other slot boots), confirm?: auto|manual, timeout?: u32 (30..3600 s), reboot?: bool, force?: bool (reboot even in Safe Mode, which the reboot undoes, or with uncommitted changes, which are lost)} → {job, kind, checkpoint?: {name, revision, rotated} | {error} (G0.33b: the automatic checkpoint saved before the image changes)}",
+        always,
+        downgrade
+    ),
+    cmd!(
+        "system.package.confirm",
+        "Confirm Update",
+        [],
+        None,
+        "{} → {job, kind}",
+        always,
+        confirm
+    ),
+    cmd!(
+        "system.package.cancel",
+        "Cancel Update",
+        [],
+        None,
+        "{} → {job, kind}",
+        always,
+        cancel
+    ),
+    // G0.3f: checking a file changes nothing on the router.
+    cmd!(quiet "system.package.check", "Check Package", [], None,
+        "{path: string} → {job, kind}",
+        always, check),
+    cmd!(
+        "system.package.upload.start",
+        "Upload Package",
+        [],
+        None,
+        "{size: u64 (bytes of the .crpkg), check?: bool (only check it, default no), downgrade?: bool (an older package), confirm?: auto|manual, timeout?: u32 (30..3600 s, default 300), reboot?: bool (default yes), force?: bool (reboot even in Safe Mode, which the reboot undoes, or with uncommitted changes, which are lost)} → {job, kind, checkpoint?: {name, revision, rotated} | {error} (G0.33b: the automatic checkpoint saved before the image changes), upload, chunk}",
+        always,
+        upload_start
+    ),
+    cmd!(quiet "system.package.upload.chunk", "Upload Chunk", [], None,
+        "{upload: u64 (the job from upload.start), offset: u64 (bytes sent before this chunk), data: string (base64, ≤ 4 MiB decoded)} → {received, size, busy}",
+        always, upload_chunk),
+    cmd!(
+        "system.package.upload.abort",
+        "Abort Upload",
+        [],
+        None,
+        "{upload?: u64} → {job, aborted}",
+        always,
+        upload_abort
+    ),
+    cmd!(
+        "system.package.download",
+        "Download Package",
+        [],
+        None,
+        "{url: string (http:// or https:// of a .crpkg), check?: bool (only check it), downgrade?: bool, ssl_verify?: bool (default yes), confirm?: auto|manual, timeout?: u32 (30..3600 s), reboot?: bool, force?: bool (reboot even in Safe Mode, which the reboot undoes, or with uncommitted changes, which are lost)} → {job, kind, checkpoint?: {name, revision, rotated} | {error} (G0.33b: the automatic checkpoint saved before the image changes)}",
+        always,
+        download
+    ),
+    cmd!(
+        "system.package.snapshot.remove",
+        "Remove Snapshot",
+        [],
+        None,
+        "{name?: string (config-a, config-b, or a partial config-a.new / config-b.new; without it every partial copy), all?: bool (without name: every snapshot too, not only partial copies), dry_run?: bool (only say what would go)} → {dry_run, job?, snapshots: [{name, own_bytes, remove, kept?}], freed}",
+        always,
+        snapshot_remove
+    ),
+    cmd!(
+        "system.package.scrub",
+        "Scrub Slot",
+        [],
+        None,
+        "{slot: a|b} → {job, kind}",
+        always,
+        scrub
+    ),
+];
+
+pub const TIMEOUT_DEFAULT: u64 = 300;
+const TIMEOUT_MIN: u32 = 30;
+const TIMEOUT_MAX: u32 = 3600;
+const MAX_PATH: usize = 4096;
+/// The largest package the format allows (kernel 128 MiB, rootfs 4 GiB,
+/// header): the slot's own size is checked by the service.
+pub const MAX_UPLOAD: u64 = (4 << 30) + (128 << 20) + (1 << 20);
+/// Largest chunk the engine takes (decoded): 4 MiB is a 5.6 MB line, well
+/// under the control channel's 16 MiB.
+pub const MAX_CHUNK: usize = 4 * UPLOAD_CHUNK;
+
+fn print(s: &mut Session, _: &Value) -> Result<Value> {
+    let mut v = status(s);
+    let now = s.hal_mut().now_unix();
+    if let (Some(trial), Some(now)) = (v.get_mut("trial").and_then(Value::as_object_mut), now)
+        && let Some(deadline) = trial.get("deadline_unix").and_then(Value::as_u64)
+    {
+        trial.insert("remaining_s".into(), json!(deadline.saturating_sub(now)));
+    }
+    let p = s.ext::<Packages>();
+    let job = p.and_then(|p| {
+        p.running
+            .as_ref()
+            .map(|(id, kind, phase, done, total)| {
+                json!({"id": id, "kind": kind, "phase": phase, "done": done, "total": total})
+            })
+            .or_else(|| {
+                p.queued
+                    .as_ref()
+                    .map(|j| json!({"id": j.id, "kind": j.kind.name(), "phase": "queued", "done": 0, "total": 0}))
+            })
+    });
+    let result = p.and_then(|p| p.result.clone());
+    if let Some(o) = v.as_object_mut() {
+        o.insert("job".into(), job.unwrap_or(Value::Null));
+        o.insert("result".into(), result.unwrap_or(Value::Null));
+        o.insert("to_ram".into(), json!(s.store().candidate().system.boot.to_ram));
+    }
+    Ok(v)
+}
+
+fn path(p: &Value, key: &str) -> Result<Option<String>> {
+    let Some(raw) = opt_str(p, key)? else {
+        return Ok(None);
+    };
+    let clip: String = raw.chars().take(64).collect();
+    if raw.len() > MAX_PATH || !raw.starts_with('/') || raw.contains('\0') {
+        return Err(EngineError::bad(
+            key,
+            format!("'{clip}' is not an absolute path on the router"),
+        ));
+    }
+    if raw.split('/').any(|c| c == "..") {
+        return Err(EngineError::bad(key, format!("'{clip}': no '..' in the path")));
+    }
+    Ok(Some(raw.to_owned()))
+}
+
+fn confirm_mode(p: &Value) -> Result<String> {
+    match opt_str(p, "confirm")? {
+        None | Some("auto") => Ok("auto".into()),
+        Some("manual") => Ok("manual".into()),
+        Some(_) => Err(EngineError::bad("confirm", "must be auto or manual")),
+    }
+}
+
+fn timeout(p: &Value) -> Result<u64> {
+    match opt_u32(p, "timeout")? {
+        None => Ok(TIMEOUT_DEFAULT),
+        Some(t) if (TIMEOUT_MIN..=TIMEOUT_MAX).contains(&t) => Ok(u64::from(t)),
+        Some(t) => Err(EngineError::bad(
+            "timeout",
+            format!("{t} s: between {TIMEOUT_MIN} and {TIMEOUT_MAX} seconds"),
+        )),
+    }
+}
+
+/// Not now: another job, a pending trial (the command is fine, the moment
+/// is not).
+fn conflict(reason: impl Into<String>) -> EngineError {
+    EngineError::Disabled {
+        id: "system.package".into(),
+        reason: reason.into(),
+    }
+}
+
+fn supported(s: &Session) -> Result<()> {
+    let st = status(s);
+    // G1.6zn: the slots and /config are on the disk that went away.
+    if let Some(line) = st.get("system_disk_removed").and_then(Value::as_str) {
+        return Err(EngineError::NotSaved(line.to_owned()));
+    }
+    if st.get("supported").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    let why = st
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("A/B updates are not available here");
+    Err(EngineError::bad("path", why.to_owned()))
+}
+
+/// Queues `kind`; the slot-changing jobs need the A/B image and no other
+/// job nor trial in the way.
+pub(crate) fn queue(s: &mut Session, kind: JobKind, p: &Value) -> Result<Value> {
+    supported(s)?;
+    let confirm = confirm_mode(p)?;
+    let timeout_s = timeout(p)?;
+    let reboot = opt_bool(p, "reboot")?.unwrap_or(true);
+    if let Some(busy) = s.ext::<Packages>().and_then(Packages::busy) {
+        return Err(conflict(format!("busy: {busy}")));
+    }
+    if kind.arms_trial()
+        && let Some(t) = status(s).get("trial").filter(|t| !t.is_null())
+    {
+        return Err(conflict(format!(
+            "a trial boot of slot {} is pending: confirm or cancel it first",
+            t.get("slot").and_then(Value::as_str).unwrap_or("?")
+        )));
+    }
+    // G4.3x: a job that reboots refuses Safe Mode and uncommitted changes
+    // as `system.reboot` does (on a notebook, dev.607, an update rebooted
+    // with Safe Mode on and the tuning profile applied under it was gone in
+    // silence).
+    if kind.arms_trial() && reboot {
+        let force = opt_bool(p, "force")?.unwrap_or(false);
+        super::system_power::restart_guard(s, "reboot of the update", force)?;
+    }
+    let mgmt = if kind.arms_trial() { reachable_ports(s) } else { Vec::new() };
+    let tuning: Vec<(String, String)> = s
+        .store()
+        .running()
+        .system
+        .tuning
+        .boot
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    // G0.33b: the config as it is before the image changes, as a
+    // checkpoint (auto-<date>, the newest 4 kept): the A/B snapshot goes
+    // with the slot, this one stays on /config whatever boots next.
+    let checkpoint = kind
+        .replaces_image()
+        .then(|| super::config_checkpoint::before_change(s, &kind.describe()));
+    let p = s
+        .ext_mut::<Packages>()
+        .ok_or_else(|| EngineError::Internal("package state".into()))?;
+    p.next_id += 1;
+    let id = p.next_id;
+    let name = kind.name();
+    p.queued = Some(Job {
+        id,
+        kind,
+        confirm,
+        timeout_s,
+        reboot,
+        mgmt,
+        tuning,
+        config_format: corerouter_model::FORMAT_VERSION,
+    });
+    let mut out = json!({"job": id, "kind": name});
+    if let (Some(c), Some(o)) = (checkpoint, out.as_object_mut()) {
+        o.insert("checkpoint".into(), c);
+    }
+    Ok(out)
+}
+
+fn update(s: &mut Session, p: &Value) -> Result<Value> {
+    let path = path(p, "path")?.ok_or_else(|| EngineError::bad("path", "required"))?;
+    queue(s, JobKind::Update { path }, p)
+}
+
+fn downgrade(s: &mut Session, p: &Value) -> Result<Value> {
+    let path = path(p, "path")?;
+    queue(s, JobKind::Downgrade { path }, p)
+}
+
+fn confirm(s: &mut Session, p: &Value) -> Result<Value> {
+    let st = status(s);
+    let trial = st.get("trial").filter(|t| !t.is_null()).ok_or_else(|| {
+        conflict("no trial boot to confirm")
+    })?;
+    if trial.get("slot") != st.get("running") {
+        return Err(conflict(
+            "the trial slot has not booted yet: confirm after the reboot (or cancel)",
+        ));
+    }
+    queue(s, JobKind::Confirm, p)
+}
+
+fn cancel(s: &mut Session, p: &Value) -> Result<Value> {
+    queue(s, JobKind::Cancel, p)
+}
+
+fn check(s: &mut Session, p: &Value) -> Result<Value> {
+    let path = path(p, "path")?.ok_or_else(|| EngineError::bad("path", "required"))?;
+    queue(s, JobKind::Check { path }, p)
+}
+
+fn scrub(s: &mut Session, p: &Value) -> Result<Value> {
+    let slot = req_str(p, "slot")?;
+    if !matches!(slot, "a" | "b") {
+        return Err(EngineError::bad("slot", "must be a or b"));
+    }
+    queue(s, JobKind::Scrub { slot: slot.into() }, p)
+}
+
+/// G1.6u: the plan comes from the service's last status (what exists, the
+/// bytes each frees, what a trial needs); the removal itself is a job, and
+/// the service checks the trial again before it deletes anything.
+fn snapshot_remove(s: &mut Session, p: &Value) -> Result<Value> {
+    let name = opt_str(p, "name")?;
+    let all = opt_bool(p, "all")?.unwrap_or(false);
+    let dry_run = opt_bool(p, "dry_run")?.unwrap_or(false);
+    if let Some(n) = name {
+        let base = n.strip_suffix(".new").unwrap_or(n);
+        if !matches!(base, "config-a" | "config-b") {
+            return Err(EngineError::bad(
+                "name",
+                format!(
+                    "'{}' is not a snapshot: config-a, config-b, config-a.new or config-b.new",
+                    n.chars().take(32).collect::<String>()
+                ),
+            ));
+        }
+        if all {
+            return Err(EngineError::bad("all", "give a name or all, not both"));
+        }
+    }
+    supported(s)?;
+    let st = status(s);
+    let rows = |key: &str| -> Vec<(String, u64)> {
+        st.get(key)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|r| {
+                        Some((
+                            r.get("name")?.as_str()?.to_owned(),
+                            r.get("own_bytes").and_then(Value::as_u64).unwrap_or(0),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let snapshots = rows("snapshots");
+    let partials = rows("partials");
+    let protected: Vec<String> = st
+        .get("trial")
+        .filter(|t| !t.is_null())
+        .map(|t| {
+            ["config_backup", "config_swap"]
+                .iter()
+                .filter_map(|k| t.get(*k).and_then(Value::as_str).map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let picked: Vec<(String, Option<u64>)> = match name {
+        Some(n) => {
+            let found = snapshots.iter().chain(&partials).find(|(x, _)| x == n);
+            vec![(n.to_owned(), found.map(|(_, b)| *b))]
+        }
+        None => partials
+            .iter()
+            .chain(if all { snapshots.as_slice() } else { &[] })
+            .map(|(n, b)| (n.clone(), Some(*b)))
+            .collect(),
+    };
+    let mut freed = 0;
+    let plan: Vec<Value> = picked
+        .iter()
+        .map(|(n, bytes)| {
+            let kept = if protected.contains(n) {
+                Some("the trial boot in progress needs it to go back")
+            } else if bytes.is_none() {
+                Some("no such snapshot")
+            } else {
+                None
+            };
+            if kept.is_none() {
+                freed += bytes.unwrap_or(0);
+            }
+            let mut r = json!({"name": n, "own_bytes": bytes.unwrap_or(0), "remove": kept.is_none()});
+            if let (Some(k), Some(o)) = (kept, r.as_object_mut()) {
+                o.insert("kept".into(), json!(k));
+            }
+            r
+        })
+        .collect();
+    let mut out = json!({"dry_run": dry_run, "snapshots": plan, "freed": freed});
+    let go: Vec<String> = plan
+        .iter()
+        .filter(|r| r.get("remove") == Some(&json!(true)))
+        .filter_map(|r| r.get("name").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    if dry_run || go.is_empty() {
+        return Ok(out);
+    }
+    let job = queue(s, JobKind::SnapshotRemove { names: go }, &json!({}))?;
+    if let (Some(o), Some(id)) = (out.as_object_mut(), job.get("job")) {
+        o.insert("job".into(), id.clone());
+    }
+    Ok(out)
+}
+
+fn req_u64(p: &Value, key: &str) -> Result<u64> {
+    opt_u64(p, key)?.ok_or_else(|| EngineError::bad(key, "is required"))
+}
+
+fn opt_u64(p: &Value, key: &str) -> Result<Option<u64>> {
+    match p.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| EngineError::bad(key, "must be a non-negative integer")),
+    }
+}
+
+fn upload_start(s: &mut Session, p: &Value) -> Result<Value> {
+    let size = req_u64(p, "size")?;
+    if size == 0 || size > MAX_UPLOAD {
+        return Err(EngineError::bad(
+            "size",
+            format!("{size} bytes: a package is 1..={MAX_UPLOAD} bytes"),
+        ));
+    }
+    let check = opt_bool(p, "check")?.unwrap_or(false);
+    let downgrade = opt_bool(p, "downgrade")?.unwrap_or(false);
+    let kind = JobKind::Upload {
+        size,
+        downgrade,
+        check,
+    };
+    let mut out = queue(s, kind, p)?;
+    let job = out.get("job").and_then(Value::as_u64).unwrap_or(0);
+    let pk = s
+        .ext_mut::<Packages>()
+        .ok_or_else(|| EngineError::Internal("package state".into()))?;
+    pk.upload = Some(Upload::new(job, size));
+    if let Some(o) = out.as_object_mut() {
+        o.insert("upload".into(), json!(job));
+        o.insert("chunk".into(), json!(UPLOAD_CHUNK));
+    }
+    Ok(out)
+}
+
+/// Longest URL taken.
+const MAX_URL: usize = 2048;
+
+fn download(s: &mut Session, p: &Value) -> Result<Value> {
+    let url = req_str(p, "url")?;
+    let clip: String = url.chars().take(64).collect();
+    let scheme_ok = url.starts_with("https://") || url.starts_with("http://");
+    if !scheme_ok || url.len() > MAX_URL || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(EngineError::bad(
+            "url",
+            format!("'{clip}': an http:// or https:// address without spaces, up to {MAX_URL} characters"),
+        ));
+    }
+    let kind = JobKind::Download {
+        url: url.to_owned(),
+        verify: opt_bool(p, "ssl_verify")?.unwrap_or(true),
+        downgrade: opt_bool(p, "downgrade")?.unwrap_or(false),
+        check: opt_bool(p, "check")?.unwrap_or(false),
+    };
+    queue(s, kind, p)
+}
+
+fn upload_chunk(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = req_u64(p, "upload")?;
+    let offset = req_u64(p, "offset")?;
+    let text = req_str(p, "data")?;
+    if text.len() > MAX_CHUNK.div_ceil(3) * 4 {
+        return Err(EngineError::bad(
+            "data",
+            format!("{} characters: a chunk is at most {MAX_CHUNK} bytes", text.len()),
+        ));
+    }
+    let up = s
+        .ext_mut::<Packages>()
+        .and_then(|pk| pk.upload.as_mut())
+        .filter(|u| u.job == id)
+        .ok_or_else(|| conflict(format!("no upload {id} in progress (finished, aborted or never started)")))?;
+    if offset != up.received {
+        return Err(EngineError::bad(
+            "offset",
+            format!("{offset}: upload {id} has received {} bytes; send from there", up.received),
+        ));
+    }
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .map_err(|e| EngineError::bad("data", format!("not base64: {e}")))?;
+    if data.is_empty() || up.received + data.len() as u64 > up.size {
+        return Err(EngineError::bad(
+            "data",
+            format!(
+                "{} bytes at {offset}: the upload declared {} bytes",
+                data.len(),
+                up.size
+            ),
+        ));
+    }
+    let pushed = push_chunk(up, data).map_err(conflict)?;
+    Ok(json!({"received": up.received, "size": up.size, "busy": pushed == Pushed::Busy}))
+}
+
+fn upload_abort(s: &mut Session, p: &Value) -> Result<Value> {
+    let want = opt_u64(p, "upload")?;
+    let pk = s
+        .ext_mut::<Packages>()
+        .ok_or_else(|| EngineError::Internal("package state".into()))?;
+    let up = pk
+        .upload
+        .take_if(|u| want.is_none_or(|w| w == u.job))
+        .ok_or_else(|| conflict("no upload in progress"))?;
+    // Not taken yet: the job goes with it. Taken: the service sees the
+    // stream end early and fails the job ("upload aborted").
+    if pk.queued.as_ref().is_some_and(|j| j.id == up.job) {
+        let kind = pk.queued.take().map_or("upload", |j| j.kind.name());
+        crate::package::finish(s, up.job, kind, Err("upload aborted".into()));
+    }
+    Ok(json!({"job": up.job, "aborted": true}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::package::{feed_status, finish, take_job};
+
+    fn ab(s: &mut Session) {
+        feed_status(
+            s,
+            json!({"supported": true, "running": "a", "trial": null, "slots": []}),
+        );
+    }
+
+    /// G1.6u: the test VM's `/config`: two snapshots and a partial copy,
+    /// a trial that needs `config-a`.
+    fn full(s: &mut Session, trial: bool) {
+        let t = if trial {
+            json!({"slot": "b", "from": "a", "config_backup": "config-a", "config_swap": null})
+        } else {
+            Value::Null
+        };
+        feed_status(
+            s,
+            json!({"supported": true, "running": "a", "trial": t, "slots": [],
+                "snapshots": [{"name": "config-a", "own_bytes": 13_811_709u64},
+                              {"name": "config-b", "own_bytes": 13_811_960u64}],
+                "partials": [{"name": "config-a.new", "own_bytes": 9_000_000u64}]}),
+        );
+    }
+
+    #[test]
+    fn snapshot_remove_plans_then_queues() {
+        let mut s = Session::virtual_lab();
+        full(&mut s, true);
+        // Dry run, everything: the trial's backup stays.
+        let v = s
+            .execute("system.package.snapshot.remove", &json!({"all": true, "dry_run": true}))
+            .unwrap();
+        assert_eq!(v["dry_run"], true);
+        assert_eq!(v["freed"], 9_000_000u64 + 13_811_960);
+        assert_eq!(v["snapshots"][1]["name"], "config-a");
+        assert_eq!(v["snapshots"][1]["remove"], false);
+        assert!(v["snapshots"][1]["kept"].as_str().unwrap().contains("trial"));
+        assert!(v.get("job").is_none());
+        assert!(take_job(&mut s).is_none(), "a dry run queues nothing");
+        // No name: the partial copy only, as a job.
+        let v = s.execute("system.package.snapshot.remove", &json!({})).unwrap();
+        assert_eq!(v["freed"], 9_000_000u64);
+        let job = take_job(&mut s).unwrap();
+        assert_eq!(job.kind, JobKind::SnapshotRemove { names: vec!["config-a.new".into()] });
+        assert_eq!(v["job"], json!(job.id));
+        finish(&mut s, job.id, "snapshot-remove", Ok(json!({"freed": 9_000_000u64})));
+        // By name: the protected one is planned as kept and nothing queued.
+        let v = s
+            .execute("system.package.snapshot.remove", &json!({"name": "config-a"}))
+            .unwrap();
+        assert_eq!(v["freed"], 0);
+        assert!(take_job(&mut s).is_none());
+        let v = s
+            .execute("system.package.snapshot.remove", &json!({"name": "config-c.new"}))
+            .unwrap_err();
+        assert!(v.to_string().contains("not a snapshot"), "{v}");
+        let v = s
+            .execute("system.package.snapshot.remove", &json!({"name": "../running.json"}))
+            .unwrap_err();
+        assert!(v.to_string().contains("not a snapshot"), "{v}");
+        let v = s
+            .execute("system.package.snapshot.remove", &json!({"name": "config-b", "all": true}))
+            .unwrap_err();
+        assert!(v.to_string().contains("not both"), "{v}");
+        // Without a trial, config-a goes too.
+        full(&mut s, false);
+        let v = s
+            .execute("system.package.snapshot.remove", &json!({"name": "config-a"}))
+            .unwrap();
+        assert_eq!(v["snapshots"][0]["remove"], true);
+        assert_eq!(
+            take_job(&mut s).unwrap().kind,
+            JobKind::SnapshotRemove { names: vec!["config-a".into()] }
+        );
+    }
+
+    /// G4.3x: an update reboots, so it refuses Safe Mode and uncommitted
+    /// changes as `system.reboot` does (on a notebook, dev.607, a tuning
+    /// profile applied under Safe Mode was undone in silence by an upload);
+    /// `force` passes, and a job that does not reboot never asks.
+    #[test]
+    fn a_rebooting_job_refuses_safe_mode_and_uncommitted_changes() {
+        let mut s = Session::virtual_lab();
+        ab(&mut s);
+        s.execute("config.safe-mode.enter", &json!({})).unwrap();
+        for (id, p) in [
+            ("system.package.update", json!({"path": "/tmp/x.crpkg"})),
+            ("system.package.upload.start", json!({"size": 1000})),
+            ("system.package.download", json!({"url": "https://x/y.crpkg"})),
+            ("system.package.downgrade", json!({})),
+            ("system.tuning.boot.apply", json!({})),
+        ] {
+            let e = s.execute(id, &p).unwrap_err().to_string();
+            assert!(e.contains("Safe Mode is on") && e.contains("force=true"), "{id}: {e}");
+        }
+        assert!(take_job(&mut s).is_none());
+        // Only checking, or not rebooting: no question.
+        s.execute("system.package.upload.start", &json!({"size": 1000, "check": true}))
+            .unwrap();
+        let job = take_job(&mut s).unwrap();
+        finish(&mut s, job.id, "upload", Ok(json!({})));
+        s.execute("system.package.update", &json!({"path": "/tmp/x.crpkg", "reboot": false}))
+            .unwrap();
+        let job = take_job(&mut s).unwrap();
+        finish(&mut s, job.id, "update", Ok(json!({})));
+        // Forced: queued.
+        s.execute("system.package.update", &json!({"path": "/tmp/x.crpkg", "force": true}))
+            .unwrap();
+        let job = take_job(&mut s).unwrap();
+        finish(&mut s, job.id, "update", Ok(json!({})));
+        s.execute("config.safe-mode.exit", &json!({})).unwrap();
+        // Uncommitted changes of a transaction.
+        s.execute("config.mode.set", &json!({"mode": "transactional"})).unwrap();
+        s.execute("system.identity.set", &json!({"name": "pending"})).unwrap();
+        let e = s
+            .execute("system.package.update", &json!({"path": "/tmp/x.crpkg"}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("uncommitted changes"), "{e}");
+    }
+
+    #[test]
+    fn update_queues_one_job() {
+        let mut s = Session::virtual_lab();
+        // No service: refused with the reason.
+        let e = s
+            .execute("system.package.update", &json!({"path": "/tmp/x.crpkg"}))
+            .unwrap_err();
+        assert!(e.to_string().contains("not reported"), "{e}");
+        ab(&mut s);
+        let out = s
+            .execute(
+                "system.package.update",
+                &json!({"path": "/tmp/x.crpkg", "timeout": 60, "confirm": "manual"}),
+            )
+            .unwrap();
+        assert_eq!(out["kind"], "update");
+        // G0.33b: the config before the update, as an automatic checkpoint.
+        let name = out["checkpoint"]["name"].as_str().unwrap().to_owned();
+        assert!(name.starts_with("auto-"), "{out}");
+        let list = s.execute("config.checkpoint.list", &json!({})).unwrap();
+        assert_eq!(list[0]["name"], name.as_str());
+        assert_eq!(list[0]["comment"], "before system.package.update /tmp/x.crpkg");
+        let busy = s
+            .execute("system.package.check", &json!({"path": "/tmp/y"}))
+            .unwrap_err();
+        assert!(busy.to_string().contains("busy"), "{busy}");
+        let v = s.execute("system.package.print", &json!({})).unwrap();
+        assert_eq!(v["job"]["phase"], "queued");
+        let job = take_job(&mut s).unwrap();
+        assert_eq!(job.kind, JobKind::Update { path: "/tmp/x.crpkg".into() });
+        assert_eq!((job.timeout_s, job.confirm.as_str(), job.reboot), (60, "manual", true));
+        finish(&mut s, job.id, "update", Err("bad signature".into()));
+        let v = s.execute("system.package.print", &json!({})).unwrap();
+        assert_eq!(v["result"]["error"], "bad signature");
+        assert_eq!(v["job"], Value::Null);
+    }
+
+    #[test]
+    fn validation() {
+        let mut s = Session::virtual_lab();
+        ab(&mut s);
+        let mut err = |id: &str, p: Value| s.execute(id, &p).unwrap_err().to_string();
+        assert!(err("system.package.update", json!({"path": "x.crpkg"})).contains("absolute"));
+        assert!(err("system.package.update", json!({"path": "/a/../etc/shadow"})).contains(".."));
+        assert!(err("system.package.update", json!({"path": "/x", "timeout": 5})).contains("between"));
+        assert!(err("system.package.update", json!({"path": "/x", "confirm": "later"})).contains("auto or manual"));
+        assert!(err("system.package.scrub", json!({"slot": "c"})).contains("a or b"));
+        assert!(err("system.package.confirm", json!({})).contains("no trial"));
+        assert!(err("system.package.update", json!({"path": "/x", "bogus": 1})).contains("bogus"));
+    }
+
+    #[test]
+    fn trial_blocks_a_second_update_and_confirm_needs_the_reboot() {
+        let mut s = Session::virtual_lab();
+        feed_status(
+            &mut s,
+            json!({"supported": true, "running": "a", "trial": {"slot": "b"}}),
+        );
+        let e = s
+            .execute("system.package.downgrade", &json!({}))
+            .unwrap_err();
+        assert!(e.to_string().contains("pending"), "{e}");
+        assert!(s.execute("system.package.confirm", &json!({})).unwrap_err().to_string().contains("not booted"));
+        // Cancel is allowed (it is what clears the armed trial).
+        assert_eq!(s.execute("system.package.cancel", &json!({})).unwrap()["kind"], "cancel");
+        take_job(&mut s);
+        feed_status(
+            &mut s,
+            json!({"supported": true, "running": "b", "trial": {"slot": "b", "deadline_unix": u64::MAX}}),
+        );
+        finish(&mut s, 1, "cancel", Ok(json!({})));
+        assert_eq!(s.execute("system.package.confirm", &json!({})).unwrap()["kind"], "confirm");
+        // The journal recorded who asked; the configuration did not change.
+        let rev = s.store().current_revision();
+        assert_eq!(s.store().current_revision(), rev);
+    }
+
+    fn b64(b: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(b)
+    }
+
+    #[test]
+    fn upload_streams_chunks_in_order_through_a_bounded_queue() {
+        let mut s = Session::virtual_lab();
+        ab(&mut s);
+        let out = s
+            .execute("system.package.upload.start", &json!({"size": 14, "confirm": "manual"}))
+            .unwrap();
+        let id = out["upload"].as_u64().unwrap();
+        assert_eq!(out["kind"], "upload");
+        // Another job meanwhile: busy.
+        assert!(s.execute("system.package.check", &json!({"path": "/x"})).unwrap_err().to_string().contains("busy"));
+        let chunk = |s: &mut Session, off: u64, data: &[u8]| {
+            s.execute("system.package.upload.chunk", &json!({"upload": id, "offset": off, "data": b64(data)}))
+        };
+        let r = chunk(&mut s, 0, b"abcd").unwrap();
+        assert_eq!((r["received"].as_u64(), r["busy"].as_bool()), (Some(4), Some(false)));
+        // Out of order, past the declared size, other upload, not base64.
+        assert!(chunk(&mut s, 0, b"x").unwrap_err().to_string().contains("received 4"));
+        assert!(chunk(&mut s, 4, b"0123456789a").unwrap_err().to_string().contains("declared 14"));
+        let e = s.execute("system.package.upload.chunk", &json!({"upload": id + 1, "offset": 4, "data": "AA=="})).unwrap_err();
+        assert!(e.to_string().contains("no upload"), "{e}");
+        let e = s.execute("system.package.upload.chunk", &json!({"upload": id, "offset": 4, "data": "!!"})).unwrap_err();
+        assert!(e.to_string().contains("base64"), "{e}");
+        // The service takes the job and its stream.
+        let job = take_job(&mut s).unwrap();
+        assert_eq!(job.kind, JobKind::Upload { size: 14, downgrade: false, check: false });
+        assert!(job.kind.arms_trial());
+        let rx = crate::package::take_upload(&mut s, job.id).unwrap();
+        // Queue full: the same chunk comes back busy, nothing is lost.
+        for i in 1..crate::package::UPLOAD_QUEUE as u64 {
+            chunk(&mut s, 4 + (i - 1), b"e").unwrap();
+        }
+        let off = 4 + crate::package::UPLOAD_QUEUE as u64 - 1;
+        let r = chunk(&mut s, off, b"f").unwrap();
+        assert_eq!(r["busy"], true);
+        assert_eq!(r["received"].as_u64(), Some(off));
+        let got: Vec<Vec<u8>> = rx.try_iter().collect();
+        assert_eq!(got.len(), crate::package::UPLOAD_QUEUE);
+        assert_eq!(got[0], b"abcd");
+        chunk(&mut s, off, b"f").unwrap();
+        // The last bytes end the stream.
+        let r = chunk(&mut s, off + 1, b"gh").unwrap();
+        assert_eq!(r["received"].as_u64(), Some(14));
+        assert_eq!(rx.try_iter().count(), 2);
+        assert!(rx.recv().is_err(), "sender dropped: end of stream");
+        finish(&mut s, job.id, "upload", Ok(json!({"slot": "b"})));
+        assert!(chunk(&mut s, 14, b"h").unwrap_err().to_string().contains("no upload"));
+    }
+
+    #[test]
+    fn download_queues_a_job() {
+        let mut s = Session::virtual_lab();
+        ab(&mut s);
+        let mut err = |p: Value| s.execute("system.package.download", &p).unwrap_err().to_string();
+        assert!(err(json!({"url": "ftp://x/y.crpkg"})).contains("http"));
+        assert!(err(json!({"url": "https://x/a b"})).contains("without spaces"));
+        assert!(err(json!({"url": format!("https://x/{}", "a".repeat(3000))})).contains("2048"));
+        assert!(err(json!({})).contains("required"));
+        let out = s
+            .execute("system.package.download", &json!({"url": "https://up.example/b.crpkg", "ssl_verify": false}))
+            .unwrap();
+        assert_eq!(out["kind"], "download");
+        let job = take_job(&mut s).unwrap();
+        assert_eq!(
+            job.kind,
+            JobKind::Download { url: "https://up.example/b.crpkg".into(), verify: false, downgrade: false, check: false }
+        );
+        assert!(job.kind.arms_trial());
+    }
+
+    #[test]
+    fn upload_validation_and_abort() {
+        let mut s = Session::virtual_lab();
+        // Off the image: refused with the reason, nothing queued.
+        let e = s.execute("system.package.upload.start", &json!({"size": 10})).unwrap_err();
+        assert!(e.to_string().contains("not reported"), "{e}");
+        ab(&mut s);
+        let mut err = |p: Value| s.execute("system.package.upload.start", &p).unwrap_err().to_string();
+        assert!(err(json!({"size": 0})).contains("1..="));
+        assert!(err(json!({"size": MAX_UPLOAD + 1})).contains("1..="));
+        assert!(err(json!({"size": -1})).contains("non-negative"));
+        assert!(err(json!({})).contains("required"));
+        assert!(err(json!({"size": 5, "timeout": 1})).contains("between"));
+        // Abort before the service took it: the job goes too.
+        let id = s.execute("system.package.upload.start", &json!({"size": 5, "check": true})).unwrap()["upload"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(s.execute("system.package.upload.abort", &json!({})).unwrap()["job"].as_u64(), Some(id));
+        assert!(take_job(&mut s).is_none());
+        let v = s.execute("system.package.print", &json!({})).unwrap();
+        assert_eq!(v["result"]["error"], "upload aborted");
+        assert!(s.execute("system.package.upload.abort", &json!({})).unwrap_err().to_string().contains("no upload"));
+        // Abort while the service reads: its stream ends early.
+        let id = s.execute("system.package.upload.start", &json!({"size": 5})).unwrap()["upload"].as_u64().unwrap();
+        let job = take_job(&mut s).unwrap();
+        let rx = crate::package::take_upload(&mut s, job.id).unwrap();
+        s.execute("system.package.upload.abort", &json!({"upload": id})).unwrap();
+        assert!(rx.recv().is_err());
+        // A chunk too large is refused before decoding.
+        let big = "A".repeat(MAX_CHUNK / 3 * 4 + 8);
+        let e = s.execute("system.package.upload.chunk", &json!({"upload": id, "offset": 0, "data": big})).unwrap_err();
+        assert!(e.to_string().contains("at most"), "{e}");
+    }
+
+    /// G0.33b: only the jobs that change the image save one; a failed
+    /// save never stops the update, and a URL's password stays out.
+    #[test]
+    fn which_jobs_save_an_automatic_checkpoint() {
+        let mut s = Session::virtual_lab();
+        ab(&mut s);
+        let out = s.execute("system.package.check", &json!({"path": "/tmp/y"})).unwrap();
+        assert!(out.get("checkpoint").is_none(), "{out}");
+        let job = take_job(&mut s).unwrap();
+        finish(&mut s, job.id, "check", Ok(json!({})));
+        assert!(s.execute("config.checkpoint.list", &json!({})).unwrap().as_array().unwrap().is_empty());
+        let kind = JobKind::Download {
+            url: "https://op:secret@pkgs.example/x.crpkg".into(),
+            verify: true,
+            downgrade: false,
+            check: false,
+        };
+        assert_eq!(kind.describe(), "system.package.download https://pkgs.example/x.crpkg");
+        // Safe Mode with force: the reboot undoes it; nothing to keep, the
+        // update goes on and says why there is no checkpoint.
+        s.execute("config.safe-mode.enter", &json!({})).unwrap();
+        let out = s
+            .execute("system.package.downgrade", &json!({"force": true}))
+            .unwrap();
+        assert!(out["checkpoint"]["error"].as_str().unwrap().contains("Safe Mode"), "{out}");
+        assert_eq!(out["kind"], "downgrade");
+    }
+}

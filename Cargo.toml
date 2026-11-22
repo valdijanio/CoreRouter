@@ -1,0 +1,255 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*", "xtask"]
+# The XDP programs build only for BPF with a pinned nightly (`cargo xtask ebpf`).
+exclude = ["crates/dataplane-ebpf"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/valdijanio/CoreRouter"
+
+[workspace.dependencies]
+# Workspace crates (path deps; the layer table lives in xtask/src/layers.rs).
+corerouter-model = { path = "crates/model" }
+corerouter-buildinfo = { path = "crates/buildinfo" }
+corerouter-cgnat-map = { path = "crates/cgnat-map" }
+corerouter-hal = { path = "crates/hal" }
+corerouter-hal-linux = { path = "crates/hal-linux" }
+corerouter-hal-frr = { path = "crates/hal-frr" }
+corerouter-firewall = { path = "crates/firewall" }
+corerouter-proto-bgp = { path = "crates/proto-bgp" }
+corerouter-proto-ospf = { path = "crates/proto-ospf" }
+corerouter-proto-mpls = { path = "crates/proto-mpls" }
+corerouter-proto-cgnat = { path = "crates/proto-cgnat" }
+corerouter-proto-dns = { path = "crates/proto-dns" }
+corerouter-proto-dhcp = { path = "crates/proto-dhcp" }
+corerouter-proto-discovery = { path = "crates/proto-discovery" }
+corerouter-proto-lldp = { path = "crates/proto-lldp" }
+corerouter-proto-mndp = { path = "crates/proto-mndp" }
+corerouter-proto-ntp = { path = "crates/proto-ntp" }
+corerouter-proto-bfd = { path = "crates/proto-bfd" }
+corerouter-proto-iperf = { path = "crates/proto-iperf" }
+corerouter-proto-syslog = { path = "crates/proto-syslog" }
+corerouter-proto-flow = { path = "crates/proto-flow" }
+corerouter-proto-pppoe = { path = "crates/proto-pppoe" }
+corerouter-proto-radius = { path = "crates/proto-radius" }
+corerouter-proto-ha = { path = "crates/proto-ha" }
+corerouter-netsim = { path = "crates/netsim" }
+corerouter-engine = { path = "crates/engine" }
+corerouter-control = { path = "crates/control" }
+corerouter-mcp = { path = "crates/mcp" }
+corerouter-storage-fs = { path = "crates/storage-fs" }
+corerouter-discovery = { path = "crates/discovery" }
+corerouter-ui = { path = "crates/ui" }
+corerouter-shell = { path = "crates/shell" }
+corerouter-dataplane-ebpf-common = { path = "crates/dataplane-ebpf-common" }
+corerouter-sysupdate = { path = "crates/sysupdate" }
+
+# External: heavy crates enter with default-features = false.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+log = "0.4.34"
+env_logger = { version = "0.11.11", default-features = false, features = ["auto-color"] }
+ipnet = { version = "2.12.2", features = ["serde"] }
+egui = { version = "0.37.0", default-features = false, features = ["default_fonts"] }
+eframe = { version = "0.37.0", default-features = false }
+# Tools > Ping / MTR charts (0.38 is the egui 0.37 line).
+egui_plot = { version = "0.38.0", default-features = false }
+png = "0.18.1"
+base64 = "0.23.1"
+proptest = "1.12.0"
+# G0.9: benchmarks (dev-dependency only; no plots, no rayon: a summary comes from xtask).
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+# Synchronous WebSocket (daemon server for the web GUI); no async runtime.
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+# SIGINT/SIGTERM for the daemon's graceful shutdown: `flag::register` (safe API, unix and
+# Windows; the iterator is unix-only).
+signal-hook = { version = "0.3.18", default-features = false }
+# G1.31: WireGuard keys in the engine (it compiles for wasm32): Curve25519 to derive a public
+# key from a private one, pure Rust (dalek, BSD-3). The data plane is the kernel's.
+x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
+# G1.31b: the WireGuard client config as a QR code in the GUI (MIT/Apache, no deps without features).
+qrcode = { version = "0.14.1", default-features = false }
+# Line editor of `corerouter-cli shell` (history file, completion, colors, key handlers).
+rustyline = { version = "19.0.0", default-features = false, features = ["custom-bindings", "with-file-history"] }
+# G0.3: password hashes (Argon2id, pure Rust; salt from the OS, not from `rand`).
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash"] }
+getrandom = "0.3.4"
+# G0.3: TLS without OpenSSL; `ring` as the crypto provider (no cmake/NASM on Windows CI).
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rcgen = { version = "0.14.0", default-features = false, features = ["crypto", "ring", "pem"] }
+ring = "0.17.14"
+# G0.3: password prompt without echo (CLI).
+rpassword = "7.4.0"
+# G4.3b: RADIUS (RustCrypto, pure Rust): MD5/HMAC-MD5 for the authenticators,
+# MD4/SHA-1/DES for MS-CHAP (RFC 2759) and the MPPE keys (RFC 3079).
+md-5 = { version = "0.11.0", default-features = false }
+hmac = "0.13.0"
+md4 = { version = "0.11.0", default-features = false }
+sha1 = { version = "0.11.0", default-features = false }
+des = "0.9.0"
+# G4.3n: PPP secret passwords sealed at rest (AES-256-GCM, RustCrypto, pure Rust with AES-NI/
+# PCLMUL picked at run time, wasm too): 94 ns to open one against 1.3 µs for XChaCha20-Poly1305
+# (**medido**); nonces come from getrandom, so no `getrandom` feature here.
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc"] }
+# G0.3: "Remember password" in the OS store (Keychain, Credential Manager, Secret
+# Service over zbus: pure Rust, no libdbus headers on CI).
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+
+# Argon2 unoptimized takes ~1 s per hash: tests would crawl.
+# Pastas de build menores e builds mais rápidas: cada sessão em paralelo tem a sua
+# (`CARGO_TARGET_DIR`), e com debuginfo completo uma `cargo xtask ci` do zero ocupava 15 GB
+# (163 s); assim, 6,6 GB (135 s), **medido** (docs/perf.md). Backtraces e panics continuam com
+# arquivo e linha do nosso código; as dependências ficam sem debuginfo.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+# G4.3b: the RADIUS load simulation hashes every packet (100k requests).
+[profile.dev.package.md-5]
+opt-level = 3
+
+[profile.dev.package.egui]
+opt-level = 3
+
+[profile.dev.package.epaint]
+opt-level = 3
+
+[profile.dev.package.emath]
+opt-level = 3
+
+[profile.dev.package.ecolor]
+opt-level = 3
+
+[profile.dev.package.egui_plot]
+opt-level = 3
+
+[profile.dev.package.harfrust]
+opt-level = 3
+
+[profile.dev.package.skrifa]
+opt-level = 3
+
+[profile.dev.package.read-fonts]
+opt-level = 3
+
+[profile.dev.package.font-types]
+opt-level = 3
+
+[profile.dev.package.vello_cpu]
+opt-level = 3
+
+[profile.dev.package.vello_common]
+opt-level = 3
+
+[profile.dev.package.kurbo]
+opt-level = 3
+
+[profile.dev.package.peniko]
+opt-level = 3
+
+[profile.dev.package.guillotiere]
+opt-level = 3
+
+[profile.dev.package.fearless_simd]
+opt-level = 3
+
+[profile.dev.package.unicode-segmentation]
+opt-level = 3
+
+[profile.dev.package.ahash]
+opt-level = 3
+
+[profile.dev.package.hashbrown]
+opt-level = 3
+
+[profile.dev.package.foldhash]
+opt-level = 3
+
+[profile.dev.package.nohash-hasher]
+opt-level = 3
+
+[profile.dev.package.smallvec]
+opt-level = 3
+
+[profile.dev.package.serde_json]
+opt-level = 3
+
+[profile.dev.package.serde_core]
+opt-level = 3
+
+[profile.dev.package.regex]
+opt-level = 3
+
+[profile.dev.package.regex-automata]
+opt-level = 3
+
+[profile.dev.package.regex-syntax]
+opt-level = 3
+
+[profile.dev.package.aho-corasick]
+opt-level = 3
+
+[profile.dev.package.memchr]
+opt-level = 3
+
+[profile.dev.package.zmij]
+opt-level = 3
+
+[profile.dev.package.itoa]
+opt-level = 3
+
+[profile.dev.package.ipnet]
+opt-level = 3
+
+[profile.dev.package.sha1]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.release]
+# Must stay "unwind": engine::guard relies on catch_unwind to roll back a command.
+panic = "unwind"
+lto = "thin"
+codegen-units = 1
+
+# G0.28: the binaries of the installable packages (`cargo xtask package`):
+# release without symbols (the GUI goes from ~2x to 1x its code size).
+[profile.dist]
+inherits = "release"
+strip = "symbols"
+
+# processo: the `bench-check` step of `cargo xtask ci` (every benchmark run
+# once in criterion's test mode). Optimized, but with the debug assertions
+# and overflow checks of a test build: in debug, the setups of 1M routes or
+# 100k sessions made the step take 10 min in CI (docs/perf.md).
+[profile.bench-check]
+inherits = "test"
+opt-level = 1
+debug = false

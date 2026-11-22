@@ -1,0 +1,1107 @@
+//! An nftables table as data (G2.3b): what `hal-linux` encodes into
+//! nfnetlink messages and what "View generated rules" prints, from one
+//! description, so the text shown is what the kernel holds.
+//!
+//! Only what our tables need is modelled: base chains, sets and maps with
+//! IPv4 address (and address . port) keys, and the expressions of the
+//! nf_tables VM those rules use (payload, meta, cmp, bitwise, ct, lookup,
+//! nat, dynset, counter, verdicts). Register numbers follow the kernel:
+//! `REG_1` is the 16-byte register over the 32-bit `REG32_00..03` (8..11).
+
+use std::fmt::Write as _;
+use std::net::Ipv4Addr;
+
+/// The 16-byte register 1 (`NFT_REG_1`), over 32-bit registers 8..=11.
+pub const REG_1: u32 = 1;
+/// 32-bit registers (`NFT_REG32_00` = 8).
+pub const REG32_0: u32 = 8;
+pub const REG32_1: u32 = 9;
+pub const REG32_2: u32 = 10;
+pub const REG32_3: u32 = 11;
+
+/// `NFPROTO_IPV4`.
+pub const FAMILY_IPV4: u8 = 2;
+
+/// The family of a table: `ip` (CGNAT) or `inet` (both IP versions: the
+/// fast path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Family {
+    #[default]
+    Ip,
+    Inet,
+}
+
+impl Family {
+    /// `NFPROTO_*`.
+    pub fn number(self) -> u8 {
+        match self {
+            Family::Ip => FAMILY_IPV4,
+            Family::Inet => 1,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Family::Ip => "ip",
+            Family::Inet => "inet",
+        }
+    }
+}
+
+/// A flowtable (`nf_flowtable`): hook ingress, priority 0, on `devices`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Flowtable {
+    pub name: String,
+    pub devices: Vec<String>,
+    /// `flags offload`: the card forwards the flows (`NFT_FLOWTABLE_HW_OFFLOAD`).
+    pub hw_offload: bool,
+    /// `counter` (`NFT_FLOWTABLE_COUNTER`, kernel 5.7+).
+    pub counter: bool,
+}
+
+impl Flowtable {
+    /// `NFTA_FLOWTABLE_FLAGS`.
+    pub fn flags(&self) -> u32 {
+        u32::from(self.hw_offload) | (u32::from(self.counter) << 1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hook {
+    Prerouting,
+    Forward,
+    Postrouting,
+    /// Packets the router sends (the packet trace, G2.1c).
+    Output,
+    /// Packets to the router itself (the firewall's `input`, G2.8).
+    Input,
+    /// No hook: a regular chain, reached only by `jump` (G2.8).
+    Regular,
+}
+
+impl Hook {
+    /// `NF_INET_*`.
+    pub fn number(self) -> u32 {
+        match self {
+            Hook::Prerouting => 0,
+            Hook::Forward => 2,
+            Hook::Postrouting => 4,
+            Hook::Output => 3,
+            Hook::Input => 1,
+            Hook::Regular => u32::MAX,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Hook::Prerouting => "prerouting",
+            Hook::Forward => "forward",
+            Hook::Postrouting => "postrouting",
+            Hook::Output => "output",
+            Hook::Input => "input",
+            Hook::Regular => "",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainType {
+    Filter,
+    Nat,
+    /// `type route` (mangle `output`: a new mark re-routes, G2.8).
+    Route,
+}
+
+impl ChainType {
+    pub fn name(self) -> &'static str {
+        match self {
+            ChainType::Filter => "filter",
+            ChainType::Nat => "nat",
+            ChainType::Route => "route",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chain {
+    pub name: String,
+    pub kind: ChainType,
+    pub hook: Hook,
+    pub priority: i32,
+    /// How `nft` writes the priority (`srcnat + 10`).
+    pub priority_text: String,
+}
+
+/// Key or data type of a set: what one value is made of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Type {
+    Addr,
+    /// `ipv4_addr . inet_service` (each field padded to 4 bytes).
+    AddrPort,
+    /// Map data `interval ipv4_addr . inet_service`: min address . port,
+    /// then max address . port (16 bytes; nft's encoding of ranged data).
+    AddrPortRange,
+}
+
+impl Type {
+    /// Bytes in the kernel.
+    pub fn len(self) -> u32 {
+        match self {
+            Type::Addr => 4,
+            Type::AddrPort => 8,
+            Type::AddrPortRange => 16,
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        false
+    }
+
+    /// nft's datatype id (`ipv4_addr` 7, `inet_service` 13, a concat is
+    /// `(a << 6) | b`); the kernel stores it for `nft list`.
+    pub fn nft_id(self) -> u32 {
+        match self {
+            Type::Addr => 7,
+            Type::AddrPort | Type::AddrPortRange => (7 << 6) | 13,
+        }
+    }
+
+    fn text(self) -> &'static str {
+        match self {
+            Type::Addr => "ipv4_addr",
+            Type::AddrPort => "ipv4_addr . inet_service",
+            Type::AddrPortRange => "interval ipv4_addr . inet_service",
+        }
+    }
+}
+
+/// One value of a set key or map data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Value {
+    Addr(Ipv4Addr),
+    AddrPort(Ipv4Addr, u16),
+    AddrPortRange(Ipv4Addr, u16, u16),
+}
+
+impl Value {
+    /// Packet-order bytes, each field padded to 4 (`NFT_REG32` slots).
+    pub fn bytes(&self) -> Vec<u8> {
+        let port = |p: u16| {
+            let b = p.to_be_bytes();
+            [b[0], b[1], 0, 0]
+        };
+        match *self {
+            Value::Addr(a) => a.octets().to_vec(),
+            Value::AddrPort(a, p) => [a.octets(), port(p)].concat(),
+            Value::AddrPortRange(a, lo, hi) => {
+                [a.octets(), port(lo), a.octets(), port(hi)].concat()
+            }
+        }
+    }
+
+    fn text(&self) -> String {
+        match self {
+            Value::Addr(a) => a.to_string(),
+            Value::AddrPort(a, p) => format!("{a} . {p}"),
+            Value::AddrPortRange(a, lo, hi) => format!("{a} . {lo}-{hi}"),
+        }
+    }
+}
+
+/// One element: a key (or, in an interval set, a range of addresses) and,
+/// in a map, its data.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Element {
+    pub key: Value,
+    /// Interval sets: the last address of the range (inclusive).
+    pub key_last: Option<Ipv4Addr>,
+    pub data: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Set {
+    pub name: String,
+    pub key: Type,
+    pub data: Option<Type>,
+    /// Elements are address ranges (rbtree).
+    pub interval: bool,
+    /// Filled by the data path (`dynset`), with this timeout in seconds.
+    pub dynamic_timeout: Option<u32>,
+    pub size: Option<u32>,
+    pub elements: Vec<Element>,
+}
+
+impl Set {
+    /// `NFT_SET_*` flags.
+    pub fn flags(&self) -> u32 {
+        let mut f = 0;
+        if self.interval {
+            f |= 0x4;
+        }
+        if self.data.is_some() {
+            f |= 0x8;
+        }
+        if self.dynamic_timeout.is_some() {
+            f |= 0x10 | 0x20;
+        }
+        f
+    }
+
+    /// The rbtree encoding of an interval set: each range is a start
+    /// element and an end element at `last + 1` (flag `INTERVAL_END`); a
+    /// first range not starting at 0.0.0.0 is preceded by an end element
+    /// at 0.0.0.0, as `nft` sends it. The elements must be sorted,
+    /// disjoint and not adjacent ([`merge`] makes them so).
+    pub fn interval_elements(&self) -> Vec<(Vec<u8>, bool)> {
+        let mut out = Vec::new();
+        for (i, e) in self.elements.iter().enumerate() {
+            let Value::Addr(start) = e.key else { continue };
+            let last = e.key_last.unwrap_or(start);
+            if i == 0 && u32::from(start) != 0 {
+                out.push((vec![0; 4], true));
+            }
+            out.push((start.octets().to_vec(), false));
+            if let Some(end) = u32::from(last).checked_add(1) {
+                out.push((end.to_be_bytes().to_vec(), true));
+            }
+        }
+        out
+    }
+}
+
+/// Address ranges sorted, with overlapping and adjacent ones joined.
+pub fn merge(mut ranges: Vec<(Ipv4Addr, Ipv4Addr)>) -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    ranges.sort();
+    let mut out: Vec<(Ipv4Addr, Ipv4Addr)> = Vec::with_capacity(ranges.len());
+    for (a, b) in ranges {
+        if let Some(last) = out.last_mut()
+            && u64::from(u32::from(a)) <= u64::from(u32::from(last.1)) + 1
+        {
+            if b > last.1 {
+                last.1 = b;
+            }
+            continue;
+        }
+        out.push((a, b));
+    }
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MetaKey {
+    L4Proto,
+    OifName,
+    /// G2.1c (packet trace).
+    IifName,
+    NfProto,
+    NfTrace,
+    /// The packet mark (G2.8).
+    Mark,
+}
+
+impl MetaKey {
+    /// `NFT_META_*`.
+    pub fn number(self) -> u32 {
+        match self {
+            MetaKey::OifName => 7,
+            MetaKey::L4Proto => 16,
+            MetaKey::IifName => 6,
+            MetaKey::NfProto => 15,
+            MetaKey::NfTrace => 12,
+            MetaKey::Mark => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CtKey {
+    State,
+    Status,
+    SrcIp,
+    DstIp,
+    ProtoSrc,
+    ProtoDst,
+    /// The connection mark (G2.8).
+    Mark,
+}
+
+impl CtKey {
+    /// `NFT_CT_*`.
+    pub fn number(self) -> u32 {
+        match self {
+            CtKey::State => 0,
+            CtKey::Status => 2,
+            CtKey::ProtoSrc => 11,
+            CtKey::ProtoDst => 12,
+            CtKey::SrcIp => 19,
+            CtKey::DstIp => 20,
+            CtKey::Mark => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Dir {
+    Original,
+    Reply,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NatKind {
+    Snat,
+    Dnat,
+}
+
+/// `NFT_PAYLOAD_*` bases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Base {
+    Network,
+    Transport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Expr {
+    Payload {
+        base: Base,
+        offset: u32,
+        len: u32,
+        dreg: u32,
+    },
+    Meta {
+        key: MetaKey,
+        dreg: u32,
+    },
+    /// `NFT_CMP_EQ` / `NFT_CMP_NEQ` against `data`.
+    Cmp {
+        sreg: u32,
+        eq: bool,
+        data: Vec<u8>,
+    },
+    /// `dreg = (sreg & mask) ^ 0`.
+    And {
+        sreg: u32,
+        dreg: u32,
+        mask: Vec<u8>,
+    },
+    Ct {
+        key: CtKey,
+        dir: Option<Dir>,
+        dreg: u32,
+    },
+    /// Set (or map key) membership; `inv`: not a member.
+    Lookup {
+        set: String,
+        sreg: u32,
+        dreg: Option<u32>,
+        inv: bool,
+    },
+    /// `queue num <num>[-<num + total - 1>] [bypass]`. Without `bypass` and
+    /// without a listener the packet is dropped (the blocks queue: never
+    /// let through untranslated); with it, it goes on as if not queued.
+    /// More than one queue: the kernel picks one by flow hash.
+    Queue {
+        num: u16,
+        total: u16,
+        bypass: bool,
+    },
+    Nat {
+        kind: NatKind,
+        addr_min: u32,
+        addr_max: Option<u32>,
+        proto_min: Option<u32>,
+        proto_max: Option<u32>,
+    },
+    /// `update @set { key : data }` (`NFT_DYNSET_OP_UPDATE`).
+    Update {
+        set: String,
+        sreg_key: u32,
+        sreg_data: u32,
+    },
+    Counter,
+    Drop,
+    /// `flow add @<table>` (`flow_offload`): the connection enters the
+    /// flowtable.
+    FlowAdd {
+        table: String,
+    },
+    /// `dreg = data` (`immediate` with a value, G2.1c).
+    Immediate {
+        dreg: u32,
+        data: Vec<u8>,
+    },
+    /// `meta <key> set sreg` (`meta nftrace set 1`, G2.1c).
+    MetaSet {
+        key: MetaKey,
+        sreg: u32,
+    },
+    /// `limit rate <rate>/<unit_secs> burst <burst> packets` (G2.1c).
+    Limit {
+        rate: u64,
+        unit_secs: u64,
+        burst: u32,
+    },
+    // The firewall's table (G2.8) needs the rest of what it renders.
+    /// `dreg = (sreg & mask) ^ xor` (`meta mark set meta mark & m | v`).
+    Bitwise {
+        sreg: u32,
+        dreg: u32,
+        mask: Vec<u8>,
+        xor: Vec<u8>,
+    },
+    /// `NFT_CMP_LT`..`NFT_CMP_GTE`. nftables < 1.1.2 wrote a range `a-b`
+    /// as `gte a`, `lte b`; we write [`Expr::Range`] and read the pair as one.
+    Order {
+        sreg: u32,
+        op: Order,
+        data: Vec<u8>,
+    },
+    /// `range [n]eq reg from to`: a range `a-b` (`eq`) or its negation.
+    Range {
+        sreg: u32,
+        eq: bool,
+        from: Vec<u8>,
+        to: Vec<u8>,
+    },
+    /// Membership of an anonymous set that lives and dies with the rule
+    /// (`th dport { 22, 80 }`, `ct state { established, related }`).
+    LookupAnon {
+        set: AnonSet,
+        sreg: u32,
+        inv: bool,
+    },
+    Accept,
+    Return,
+    Jump {
+        chain: String,
+    },
+    /// `reject` (`type` 0 ICMP, 1 TCP reset, 2 ICMPX; `code`).
+    Reject {
+        kind: u32,
+        code: u8,
+    },
+    Log {
+        prefix: Option<String>,
+    },
+    Notrack,
+    /// `ct <key> set sreg`.
+    CtSet {
+        key: CtKey,
+        sreg: u32,
+    },
+    /// `masquerade [to :<proto_min>[-<proto_max>]]`: registers of the
+    /// ports, and `NF_NAT_RANGE_*` flags.
+    Masq {
+        proto_min: Option<u32>,
+        proto_max: Option<u32>,
+        flags: u32,
+    },
+    /// `redirect to :<port>`.
+    Redir {
+        proto_min: Option<u32>,
+        proto_max: Option<u32>,
+        flags: u32,
+    },
+    /// `snat|dnat <ip|ip6> to …` with the family and flags (`Nat` is the
+    /// IPv4-only form of the CGNAT).
+    NatRange {
+        kind: NatKind,
+        family: u8,
+        addr_min: Option<u32>,
+        addr_max: Option<u32>,
+        proto_min: Option<u32>,
+        proto_max: Option<u32>,
+        flags: u32,
+    },
+    /// `fib <flags> <result> => dreg` (`fib daddr type`).
+    Fib {
+        flags: u32,
+        result: u32,
+        dreg: u32,
+    },
+    /// `add @set { <key> [timeout <ms>ms] }` (`NFT_DYNSET_OP_ADD`).
+    DynsetAdd {
+        set: String,
+        sreg_key: u32,
+        timeout_ms: Option<u64>,
+    },
+    /// `rt <key> => dreg` (`NFT_RT_*`; G1.31d: `NFT_RT_TCPMSS`, the
+    /// route's MTU minus the IP and TCP headers, in host order).
+    Rt {
+        key: u32,
+        dreg: u32,
+    },
+    /// `byteorder dreg = hton|ntoh(sreg, len, size)`.
+    Byteorder {
+        sreg: u32,
+        dreg: u32,
+        hton: bool,
+        len: u32,
+        size: u32,
+    },
+    /// `exthdr write tcpopt sreg => len @ kind + offset` (`tcp option
+    /// maxseg size set …`, G1.31d). The kernel writes the MSS only when
+    /// it lowers it (`nft_exthdr_tcp_set_eval`).
+    TcpOptSet {
+        kind: u8,
+        offset: u32,
+        len: u32,
+        sreg: u32,
+    },
+}
+
+/// `NFT_RT_TCPMSS`.
+pub const RT_TCPMSS: u32 = 3;
+/// TCP option kind of the MSS (RFC 9293 §3.2).
+pub const TCPOPT_MAXSEG: u8 = 2;
+
+/// `NFT_CMP_*` orderings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Order {
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+}
+
+impl Order {
+    /// `enum nft_cmp_ops`.
+    pub fn number(self) -> u32 {
+        match self {
+            Order::Lt => 2,
+            Order::Lte => 3,
+            Order::Gt => 4,
+            Order::Gte => 5,
+        }
+    }
+
+    pub fn from_number(n: u32) -> Option<Order> {
+        Some(match n {
+            2 => Order::Lt,
+            3 => Order::Lte,
+            4 => Order::Gt,
+            5 => Order::Gte,
+            _ => return None,
+        })
+    }
+}
+
+/// What one key of a set is (G2.8): nft's datatype, its length in the
+/// kernel and its byte order (nft prints host-order keys as numbers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyKind {
+    Ipv4,
+    Ipv6,
+    IfName,
+    /// `inet_service` (a port).
+    Port,
+    /// `inet_proto` (`meta l4proto`).
+    L4Proto,
+    CtState,
+}
+
+impl KeyKind {
+    /// nft's datatype id (`enum datatypes`).
+    pub fn nft_id(self) -> u32 {
+        match self {
+            KeyKind::Ipv4 => 7,
+            KeyKind::Ipv6 => 8,
+            KeyKind::IfName => 41,
+            KeyKind::Port => 13,
+            KeyKind::L4Proto => 12,
+            KeyKind::CtState => 26,
+        }
+    }
+
+    pub fn from_nft_id(id: u32) -> Option<KeyKind> {
+        Some(match id {
+            7 => KeyKind::Ipv4,
+            8 => KeyKind::Ipv6,
+            41 => KeyKind::IfName,
+            13 => KeyKind::Port,
+            12 => KeyKind::L4Proto,
+            26 => KeyKind::CtState,
+            _ => return None,
+        })
+    }
+
+    pub fn len(self) -> u32 {
+        match self {
+            KeyKind::Ipv4 | KeyKind::CtState => 4,
+            KeyKind::Ipv6 | KeyKind::IfName => 16,
+            KeyKind::Port => 2,
+            KeyKind::L4Proto => 1,
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        false
+    }
+
+    /// Network byte order (addresses, ports); the others are host order.
+    pub fn big_endian(self) -> bool {
+        matches!(self, KeyKind::Ipv4 | KeyKind::Ipv6 | KeyKind::Port)
+    }
+}
+
+/// An anonymous set: elements already in kernel encoding (key bytes and
+/// whether it is an interval's end), and nft's user data, which tells
+/// `nft list` how to print it (`typeof`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AnonSet {
+    pub key: KeyKind,
+    pub interval: bool,
+    pub elements: Vec<(Vec<u8>, bool)>,
+    pub udata: Vec<u8>,
+}
+
+/// One element of a [`FwSet`]: a key, or (interval sets) the first and
+/// last key of a range, with an optional timeout.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FwElement {
+    pub key: Vec<u8>,
+    /// Interval sets: the last key of the range (inclusive), when it is
+    /// not `key` itself.
+    pub last: Option<Vec<u8>>,
+    pub timeout_ms: Option<u64>,
+}
+
+/// A named set of the firewall's table (G2.8): any [`KeyKind`], IPv6
+/// intervals and per-element timeouts, which the CGNAT's [`Set`] lacks.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FwSet {
+    pub name: String,
+    pub key: KeyKind,
+    pub interval: bool,
+    /// `flags timeout`: elements may carry one.
+    pub timeout: bool,
+    /// `flags dynamic`: rules add to it (`dynset`).
+    pub dynamic: bool,
+    pub size: Option<u32>,
+    /// nft merges overlapping ranges on add (user space only: we merge
+    /// before sending, see `corerouter_firewall::nft`).
+    pub auto_merge: bool,
+    /// Sorted, and for interval sets disjoint.
+    pub elements: Vec<FwElement>,
+}
+
+/// `NFT_SET_*` flags.
+pub const SET_ANONYMOUS: u32 = 0x1;
+pub const SET_CONSTANT: u32 = 0x2;
+pub const SET_INTERVAL: u32 = 0x4;
+pub const SET_MAP: u32 = 0x8;
+pub const SET_TIMEOUT: u32 = 0x10;
+pub const SET_EVAL: u32 = 0x20;
+
+impl FwSet {
+    pub fn flags(&self) -> u32 {
+        let mut f = 0;
+        if self.interval {
+            f |= SET_INTERVAL;
+        }
+        if self.timeout {
+            f |= SET_TIMEOUT;
+        }
+        if self.dynamic {
+            f |= SET_EVAL;
+        }
+        f
+    }
+
+    /// The set without its elements (what a table diff compares).
+    pub fn same_definition(&self, o: &FwSet) -> bool {
+        self.name == o.name
+            && self.key == o.key
+            && self.interval == o.interval
+            && self.timeout == o.timeout
+            && self.dynamic == o.dynamic
+            && self.size == o.size
+            && self.auto_merge == o.auto_merge
+    }
+
+    /// The elements as the kernel holds them (see [`interval_encoding`]).
+    pub fn encoded(&self) -> Vec<KernelElement> {
+        if self.interval {
+            interval_encoding(&self.elements)
+        } else {
+            self.elements
+                .iter()
+                .map(|e| KernelElement {
+                    key: e.key.clone(),
+                    end: false,
+                    timeout_ms: e.timeout_ms,
+                })
+                .collect()
+        }
+    }
+}
+
+/// One element as the kernel stores it: interval sets hold each range as
+/// a start and an end element.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct KernelElement {
+    pub key: Vec<u8>,
+    /// `NFT_SET_ELEM_INTERVAL_END`.
+    pub end: bool,
+    pub timeout_ms: Option<u64>,
+}
+
+/// `bytes + 1` as a big-endian number; `None` past the last value.
+pub fn successor(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut out = bytes.to_vec();
+    for b in out.iter_mut().rev() {
+        if *b == 0xff {
+            *b = 0;
+        } else {
+            *b += 1;
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// The rbtree encoding of interval elements, as `nft` sends it: each range
+/// is a start element (with the timeout) and an end element at `last + 1`
+/// (none after the last address); a first range not starting at zero is
+/// preceded by an end element at zero. `elements` must be sorted and
+/// disjoint (they may touch: an end and the next start then share a key,
+/// which the kernel keeps apart by the end flag).
+pub fn interval_encoding(elements: &[FwElement]) -> Vec<KernelElement> {
+    let mut out = Vec::with_capacity(elements.len() * 2 + 1);
+    for (i, e) in elements.iter().enumerate() {
+        if i == 0 && e.key.iter().any(|b| *b != 0) {
+            out.push(KernelElement {
+                key: vec![0; e.key.len()],
+                end: true,
+                timeout_ms: None,
+            });
+        }
+        out.push(KernelElement {
+            key: e.key.clone(),
+            end: false,
+            timeout_ms: e.timeout_ms,
+        });
+        if let Some(end) = successor(e.last.as_ref().unwrap_or(&e.key)) {
+            out.push(KernelElement {
+                key: end,
+                end: true,
+                timeout_ms: None,
+            });
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Rule {
+    pub chain: String,
+    pub exprs: Vec<Expr>,
+    /// The rule as `nft list` writes it.
+    pub text: String,
+    /// How `nft -f` must spell it, when that differs (`nft` refuses some
+    /// rules the kernel accepts).
+    pub nft: Option<String>,
+    /// `comment "…"` (nft's rule user data): `cr:*N` ties the kernel rule
+    /// to rule `*N` (G2.8).
+    pub comment: Option<String>,
+}
+
+/// A whole table.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Table {
+    pub family: Family,
+    pub name: String,
+    pub flowtables: Vec<Flowtable>,
+    pub sets: Vec<Set>,
+    pub chains: Vec<Chain>,
+    pub rules: Vec<Rule>,
+    /// The firewall's sets (G2.8), created after [`Self::sets`].
+    pub fw_sets: Vec<FwSet>,
+}
+
+impl Table {
+    /// Static elements of every set.
+    pub fn elements(&self) -> u64 {
+        self.sets.iter().map(|s| s.elements.len() as u64).sum()
+    }
+
+    /// The table with no set elements: two tables with the same skeleton
+    /// differ only in elements, which can then change one by one.
+    pub fn skeleton(&self) -> Table {
+        let mut t = self.clone();
+        for s in &mut t.sets {
+            s.elements.clear();
+        }
+        t
+    }
+
+    /// Whether `other` is this table but for set elements (what
+    /// [`Self::skeleton`] compares, without copying the elements).
+    pub fn same_skeleton(&self, other: &Table) -> bool {
+        self.name == other.name
+            && self.family == other.family
+            && self.flowtables == other.flowtables
+            && self.chains == other.chains
+            && self.rules == other.rules
+            && self.fw_sets == other.fw_sets
+            && self.sets.len() == other.sets.len()
+            && self.sets.iter().zip(&other.sets).all(|(a, b)| {
+                a.name == b.name
+                    && a.key == b.key
+                    && a.data == b.data
+                    && a.interval == b.interval
+                    && a.dynamic_timeout == b.dynamic_timeout
+                    && a.size == b.size
+            })
+    }
+
+    /// The table as `nft list table` writes it (and `nft -f` reads it).
+    pub fn text(&self) -> String {
+        let mut s = String::new();
+        let _ = writeln!(s, "table {} {} {{", self.family.name(), self.name);
+        for f in &self.flowtables {
+            let devices: Vec<&str> = f.devices.iter().map(String::as_str).collect();
+            let _ = writeln!(
+                s,
+                "\tflowtable {} {{\n\t\thook ingress priority filter;\n\t\tdevices = {{ {} }}",
+                f.name,
+                devices.join(", ")
+            );
+            if f.hw_offload {
+                let _ = writeln!(s, "\t\tflags offload");
+            }
+            if f.counter {
+                let _ = writeln!(s, "\t\tcounter");
+            }
+            let _ = writeln!(s, "\t}}");
+        }
+        for set in &self.sets {
+            let what = if set.data.is_some() { "map" } else { "set" };
+            let _ = writeln!(s, "\t{what} {} {{", set.name);
+            match set.data {
+                Some(d) => {
+                    let _ = writeln!(s, "\t\ttype {} : {}", set.key.text(), d.text());
+                }
+                None => {
+                    let _ = writeln!(s, "\t\ttype {}", set.key.text());
+                }
+            }
+            let mut flags = Vec::new();
+            if set.interval {
+                flags.push("interval");
+            }
+            if set.dynamic_timeout.is_some() {
+                flags.push("dynamic");
+                flags.push("timeout");
+            }
+            if !flags.is_empty() {
+                let _ = writeln!(s, "\t\tflags {}", flags.join(", "));
+            }
+            if let Some(t) = set.dynamic_timeout {
+                let _ = writeln!(s, "\t\ttimeout {t}s");
+            }
+            if let Some(n) = set.size {
+                let _ = writeln!(s, "\t\tsize {n}");
+            }
+            if !set.elements.is_empty() {
+                let items: Vec<String> = set
+                    .elements
+                    .iter()
+                    .map(|e| {
+                        let key = match (e.key, e.key_last) {
+                            (Value::Addr(a), Some(b)) if b != a => format!("{a}-{b}"),
+                            (k, _) => k.text(),
+                        };
+                        match &e.data {
+                            Some(d) => format!("{key} : {}", d.text()),
+                            None => key,
+                        }
+                    })
+                    .collect();
+                let _ = writeln!(s, "\t\telements = {{ {} }}", items.join(",\n\t\t\t     "));
+            }
+            let _ = writeln!(s, "\t}}");
+        }
+        for c in &self.chains {
+            let _ = writeln!(
+                s,
+                "\tchain {} {{\n\t\ttype {} hook {} priority {}; policy accept;",
+                c.name,
+                c.kind.name(),
+                c.hook.name(),
+                c.priority_text
+            );
+            for r in self.rules.iter().filter(|r| r.chain == c.name) {
+                let _ = writeln!(s, "\t\t{}", r.text);
+            }
+            let _ = writeln!(s, "\t}}");
+        }
+        let _ = writeln!(s, "}}");
+        s
+    }
+}
+
+/// Expressions that load `ip saddr` (or daddr) into `dreg`.
+pub fn ip_addr(src: bool, dreg: u32) -> Expr {
+    Expr::Payload {
+        base: Base::Network,
+        offset: if src { 12 } else { 16 },
+        len: 4,
+        dreg,
+    }
+}
+
+/// `udp sport` / `udp dport` (any transport with ports at 0/2).
+pub fn l4_port(src: bool, dreg: u32) -> Expr {
+    Expr::Payload {
+        base: Base::Transport,
+        offset: if src { 0 } else { 2 },
+        len: 2,
+        dreg,
+    }
+}
+
+/// `meta l4proto <proto>`.
+pub fn l4proto_is(proto: u8) -> [Expr; 2] {
+    [
+        Expr::Meta {
+            key: MetaKey::L4Proto,
+            dreg: REG_1,
+        },
+        Expr::Cmp {
+            sreg: REG_1,
+            eq: true,
+            data: vec![proto],
+        },
+    ]
+}
+
+/// `oifname "<name>"`: interface names are compared as 16 NUL-padded bytes.
+pub fn oifname_is(name: &str) -> [Expr; 2] {
+    let mut data = name.as_bytes().to_vec();
+    data.resize(16, 0);
+    data.truncate(16);
+    [
+        Expr::Meta {
+            key: MetaKey::OifName,
+            dreg: REG_1,
+        },
+        Expr::Cmp {
+            sreg: REG_1,
+            eq: true,
+            data,
+        },
+    ]
+}
+
+/// `ct <key> & mask != 0` on a 4-byte ct value (state bits, status bits).
+pub fn ct_bits(key: CtKey, mask: u32) -> [Expr; 3] {
+    // ct state/status are host-order u32 in the register.
+    [
+        Expr::Ct {
+            key,
+            dir: None,
+            dreg: REG_1,
+        },
+        Expr::And {
+            sreg: REG_1,
+            dreg: REG_1,
+            mask: mask.to_ne_bytes().to_vec(),
+        },
+        Expr::Cmp {
+            sreg: REG_1,
+            eq: false,
+            data: vec![0; 4],
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(ranges: &[(&str, &str)]) -> Set {
+        Set {
+            name: "s".into(),
+            key: Type::Addr,
+            data: None,
+            interval: true,
+            dynamic_timeout: None,
+            size: None,
+            elements: ranges
+                .iter()
+                .map(|(a, b)| Element {
+                    key: Value::Addr(a.parse().unwrap()),
+                    key_last: Some(b.parse().unwrap()),
+                    data: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn hex(v: &[(Vec<u8>, bool)]) -> Vec<String> {
+        v.iter()
+            .map(|(k, end)| {
+                format!(
+                    "{}{}",
+                    Ipv4Addr::from(<[u8; 4]>::try_from(k.as_slice()).unwrap()),
+                    if *end { " end" } else { "" }
+                )
+            })
+            .collect()
+    }
+
+    /// What `nft --debug=netlink` sends for the same sets.
+    #[test]
+    fn interval_elements_match_nft() {
+        let s = set(&[("203.0.113.0", "203.0.113.3")]);
+        assert_eq!(
+            hex(&s.interval_elements()),
+            ["0.0.0.0 end", "203.0.113.0", "203.0.113.4 end"]
+        );
+        let s = set(&[("10.0.0.0", "10.0.0.255"), ("10.0.2.0", "10.0.2.9")]);
+        assert_eq!(
+            hex(&s.interval_elements()),
+            [
+                "0.0.0.0 end",
+                "10.0.0.0",
+                "10.0.1.0 end",
+                "10.0.2.0",
+                "10.0.2.10 end"
+            ]
+        );
+        let s = set(&[("0.0.0.0", "0.0.0.9"), ("1.0.0.0", "255.255.255.255")]);
+        assert_eq!(
+            hex(&s.interval_elements()),
+            ["0.0.0.0", "0.0.0.10 end", "1.0.0.0"]
+        );
+    }
+
+    #[test]
+    fn ranges_merge() {
+        let r = |a: &str, b: &str| {
+            (
+                a.parse::<Ipv4Addr>().unwrap(),
+                b.parse::<Ipv4Addr>().unwrap(),
+            )
+        };
+        assert_eq!(
+            merge(vec![
+                r("10.0.1.0", "10.0.1.9"),
+                r("10.0.0.0", "10.0.0.255"),
+                r("10.0.5.0", "10.0.5.0"),
+                r("10.0.0.5", "10.0.0.6")
+            ]),
+            [r("10.0.0.0", "10.0.1.9"), r("10.0.5.0", "10.0.5.0")]
+        );
+    }
+
+    #[test]
+    fn values_are_padded_like_registers() {
+        let v = Value::AddrPortRange("203.0.113.1".parse().unwrap(), 1024, 1523);
+        assert_eq!(
+            v.bytes(),
+            [203, 0, 113, 1, 4, 0, 0, 0, 203, 0, 113, 1, 5, 0xf3, 0, 0]
+        );
+        assert_eq!(Type::AddrPortRange.nft_id(), 461);
+    }
+}

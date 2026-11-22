@@ -1,0 +1,519 @@
+//! `/ppp profile` (G4.3d, RouterOS v7): what a PPP session gets when the
+//! secret (or RADIUS) does not say. The built-in `default` and
+//! `default-encryption` always exist; changing one stores a copy, and they
+//! cannot be removed. Changes apply to new sessions.
+
+use corerouter_model::ItemId;
+use corerouter_model::ppp::{AddrOrPool, MAX_PROFILES, PppProfile, Tri, UseIpv6};
+use corerouter_model::queue::DownloadMode;
+use serde_json::{Value, json};
+
+use super::args::{opt_str, opt_text};
+use super::dhcp_server::{opt_ips, opt_secs};
+use super::ppp_common::{opt_address_list, opt_hooks, opt_name, opt_rate_limit};
+use super::{CommandSpec, always};
+use crate::{EngineError, Result, Session};
+
+pub(super) const COMMANDS: &[CommandSpec] = &[
+    cmd!("ppp.profile.add", "Add PPP Profile", [], None,
+        "{name: string, local_address?: ipv4 | pool (our side; empty: unnumbered), remote_address?: ipv4 | pool (the subscriber's), dns_server?: [ipv4] | string (at most 2), rate_limit?: string (RouterOS rate-limit, rx/tx from the router: 10M/50M [burst [threshold [time [priority [min]]]]]; empty clears), address_list?: string (firewall list the subscriber's address joins while up), only_one?: default|yes|no, change_tcp_mss?: default|yes|no, idle_timeout?: duration (empty: none), session_timeout?: duration (empty: none), on_up?: [{command, params?}] | string (the same list as JSON text; $user, $remote-address, $local-address, $caller-id, $interface, $service in string values), on_down?: [{command, params?}], comment?: string, use_ipv6?: default|yes|no|require (IPv6CP; require: no IPv6 = no session), remote_ipv6_prefix_pool?: string (/ipv6 pool of prefix-length 64: the link's /64 in the RA; empty clears), dhcpv6_pd_pool?: string (/ipv6 pool of prefix-length 48..64: the delegated prefix; empty clears), dhcpv6_lease_time?: duration (valid lifetime of both, default 1d; empty: default), dns_server_ipv6?: [ipv6] | string (RA RDNSS and DHCPv6, at most 4), queue_type?: string (/queue type of the download queue; empty: fq-codel-default), download_mode?: shaper|policer (download held in a queue, the default and recommended, or dropped in XDP)} → {id, name, warnings}",
+        always, add),
+    cmd!("ppp.profile.set", "Set PPP Profile", [], None,
+        "{id: *hex | name, name?: string, local_address?: ipv4 | pool (our side; empty: unnumbered), remote_address?: ipv4 | pool (the subscriber's), dns_server?: [ipv4] | string (at most 2), rate_limit?: string (RouterOS rate-limit, rx/tx from the router: 10M/50M [burst [threshold [time [priority [min]]]]]; empty clears), address_list?: string (firewall list the subscriber's address joins while up), only_one?: default|yes|no, change_tcp_mss?: default|yes|no, idle_timeout?: duration (empty: none), session_timeout?: duration (empty: none), on_up?: [{command, params?}] | string (the same list as JSON text; $user, $remote-address, $local-address, $caller-id, $interface, $service in string values), on_down?: [{command, params?}], comment?: string, use_ipv6?: default|yes|no|require (IPv6CP; require: no IPv6 = no session), remote_ipv6_prefix_pool?: string (/ipv6 pool of prefix-length 64: the link's /64 in the RA; empty clears), dhcpv6_pd_pool?: string (/ipv6 pool of prefix-length 48..64: the delegated prefix; empty clears), dhcpv6_lease_time?: duration (valid lifetime of both, default 1d; empty: default), dns_server_ipv6?: [ipv6] | string (RA RDNSS and DHCPv6, at most 4), queue_type?: string (/queue type of the download queue; empty: fq-codel-default), download_mode?: shaper|policer (download held in a queue, the default and recommended, or dropped in XDP)} → {id, name, warnings}",
+        always, set),
+    cmd!("ppp.profile.remove", "Remove PPP Profile", [], None,
+        "{id: *hex | name} → {id, name}", always, remove),
+    cmd!(query "ppp.profile.preview", "PPP Profile Preview", [], None,
+        "{id?: *hex | name, name?: string, local_address?: string, remote_address?: string, dns_server?: string, rate_limit?: string, address_list?: string, only_one?: string, change_tcp_mss?: string, idle_timeout?: string, session_timeout?: string, on_up?: string, on_down?: string, comment?: string, use_ipv6?: string, remote_ipv6_prefix_pool?: string, dhcpv6_pd_pool?: string, dhcpv6_lease_time?: string, dns_server_ipv6?: string, queue_type?: string, download_mode?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
+        always, preview),
+    cmd!(query "ppp.profile.list", "PPP Profiles", [], None,
+        "{} → [{id, name, builtin, default (built in), local_address?, remote_address?, dns_server, rate_limit?, address_list?, only_one, change_tcp_mss, idle_timeout?, session_timeout?, on_up (JSON text), on_down, comment?, use_ipv6, remote_ipv6_prefix_pool?, dhcpv6_pd_pool?, dhcpv6_lease_time?, dns_server_ipv6, queue_type?, download_mode?, secrets (that use it), active (sessions up with it)}]",
+        always, list),
+];
+
+fn tri(p: &Value, key: &str) -> Result<Option<Tri>> {
+    opt_str(p, key)?
+        .map(|t| Tri::parse(t).ok_or_else(|| EngineError::bad(key, "default, yes or no")))
+        .transpose()
+}
+
+fn addr(s: &Session, p: &Value, key: &str) -> Result<Option<Option<AddrOrPool>>> {
+    let Some(t) = opt_str(p, key)? else {
+        return Ok(None);
+    };
+    if t.trim().is_empty() {
+        return Ok(Some(None));
+    }
+    let a: AddrOrPool = t.parse().map_err(|e| EngineError::bad(key, format!("{e}")))?;
+    if let AddrOrPool::Pool(name) = &a
+        && s.store().candidate().ip.pools.get(name).is_none()
+    {
+        let shown: String = name.chars().take(64).collect();
+        return Err(EngineError::bad(key, format!("no /ip pool '{shown}' (ip.pool.add)")));
+    }
+    Ok(Some(Some(a)))
+}
+
+/// A `/ipv6 pool` name whose pieces are `lens` long (empty clears).
+fn pool6(s: &Session, p: &Value, key: &str, lens: std::ops::RangeInclusive<u8>) -> Result<Option<Option<String>>> {
+    let Some(t) = opt_str(p, key)? else {
+        return Ok(None);
+    };
+    let t = t.trim();
+    if t.is_empty() || t == "none" {
+        return Ok(Some(None));
+    }
+    let shown: String = t.chars().take(64).collect();
+    let pool = s
+        .store()
+        .candidate()
+        .ipv6
+        .dhcp_server
+        .pool(t)
+        .ok_or_else(|| EngineError::bad(key, format!("no /ipv6 pool '{shown}' (ipv6.pool.add)")))?;
+    if !lens.contains(&pool.prefix_length) {
+        return Err(EngineError::bad(
+            key,
+            format!(
+                "/ipv6 pool '{shown}' hands out /{}; this needs {}..={}",
+                pool.prefix_length,
+                lens.start(),
+                lens.end()
+            ),
+        ));
+    }
+    Ok(Some(Some(t.to_owned())))
+}
+
+fn ips6(p: &Value, key: &str) -> Result<Option<Vec<std::net::Ipv6Addr>>> {
+    let items: Vec<String> = match p.get(key) {
+        None => return Ok(None),
+        Some(Value::String(t)) => t.split(',').map(str::trim).filter(|x| !x.is_empty()).map(String::from).collect(),
+        Some(Value::Array(a)) => a.iter().map(|v| v.as_str().map(String::from).ok_or_else(|| EngineError::bad(key, "a list of IPv6 addresses"))).collect::<Result<_>>()?,
+        Some(_) => return Err(EngineError::bad(key, "a list of IPv6 addresses")),
+    };
+    if items.len() > corerouter_model::ppp::MAX_DNS6 {
+        return Err(EngineError::bad(key, format!("at most {}", corerouter_model::ppp::MAX_DNS6)));
+    }
+    items
+        .iter()
+        .map(|t| {
+            let a: std::net::Ipv6Addr = t.parse().map_err(|_| {
+                let shown: String = t.chars().take(48).collect();
+                EngineError::bad(key, format!("'{shown}' is not an IPv6 address"))
+            })?;
+            if a.is_unspecified() || a.is_multicast() {
+                return Err(EngineError::bad(key, format!("{a} cannot be a DNS server")));
+            }
+            Ok(a)
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn timeout(p: &Value, key: &str) -> Result<Option<Option<u32>>> {
+    if matches!(p.get(key), Some(Value::String(t)) if t.trim().is_empty() || t.trim() == "none") {
+        return Ok(Some(None));
+    }
+    Ok(opt_secs(p, key)?.map(|v| (v != 0).then_some(v)))
+}
+
+fn apply(s: &Session, pr: &mut PppProfile, p: &Value) -> Result<()> {
+    if let Some(n) = opt_name(p, "name")? {
+        pr.name = n;
+    }
+    if let Some(a) = addr(s, p, "local_address")? {
+        pr.local_address = a;
+    }
+    if let Some(a) = addr(s, p, "remote_address")? {
+        pr.remote_address = a;
+    }
+    if let Some(d) = opt_ips(p, "dns_server")? {
+        if d.len() > 2 {
+            return Err(EngineError::bad("dns_server", "at most 2 (RFC 1877: primary and secondary)"));
+        }
+        pr.dns_server = d;
+    }
+    if let Some(r) = opt_rate_limit(p)? {
+        pr.rate_limit = r;
+    }
+    if let Some(l) = opt_address_list(p)? {
+        pr.address_list = l;
+    }
+    if let Some(t) = tri(p, "only_one")? {
+        pr.only_one = t;
+    }
+    if let Some(t) = tri(p, "change_tcp_mss")? {
+        pr.change_tcp_mss = t;
+    }
+    if let Some(t) = timeout(p, "idle_timeout")? {
+        pr.idle_timeout = t;
+    }
+    if let Some(t) = timeout(p, "session_timeout")? {
+        pr.session_timeout = t;
+    }
+    if let Some(h) = opt_hooks(p, "on_up")? {
+        pr.on_up = h;
+    }
+    if let Some(h) = opt_hooks(p, "on_down")? {
+        pr.on_down = h;
+    }
+    if let Some(c) = opt_text(p, "comment", 256)? {
+        pr.comment = c;
+    }
+    if let Some(t) = opt_str(p, "use_ipv6")? {
+        pr.use_ipv6 = UseIpv6::parse(t).ok_or_else(|| EngineError::bad("use_ipv6", "default, yes, no or require"))?;
+    }
+    if let Some(v) = pool6(s, p, "remote_ipv6_prefix_pool", 64..=64)? {
+        pr.remote_ipv6_prefix_pool = v;
+    }
+    if let Some(v) = pool6(s, p, "dhcpv6_pd_pool", 48..=64)? {
+        pr.dhcpv6_pd_pool = v;
+    }
+    if let Some(t) = timeout(p, "dhcpv6_lease_time")? {
+        // RFC 4861 §6.2.1 / RFC 9915 §21.4: below a few minutes the CPE
+        // renews all the time.
+        if t.is_some_and(|v| v < 300) {
+            return Err(EngineError::bad("dhcpv6_lease_time", "at least 5m"));
+        }
+        pr.dhcpv6_lease_time = t;
+    }
+    if let Some(d) = ips6(p, "dns_server_ipv6")? {
+        pr.dns_server_ipv6 = d;
+    }
+    if let Some(t) = opt_str(p, "queue_type")? {
+        let t = t.trim();
+        pr.queue_type = if t.is_empty() || t == "none" {
+            None
+        } else if s.store().candidate().queue.queue_type(t).is_some() {
+            Some(t.to_owned())
+        } else {
+            let shown: String = t.chars().take(64).collect();
+            return Err(EngineError::bad("queue_type", format!("no /queue type '{shown}' (queue.type.add)")));
+        };
+    }
+    if let Some(t) = opt_str(p, "download_mode")? {
+        pr.download_mode = match t.trim() {
+            "" | "default" => None,
+            t => Some(DownloadMode::parse(t).ok_or_else(|| EngineError::bad("download_mode", "shaper or policer"))?),
+        };
+    }
+    Ok(())
+}
+
+fn warnings(pr: &PppProfile) -> Vec<String> {
+    let mut w = Vec::new();
+    if pr.remote_address.is_none() && pr.name != corerouter_model::ppp::DEFAULT_ENCRYPTION {
+        w.push("no remote_address: subscribers get an address only from their secret or RADIUS (Framed-IP-Address / Framed-Pool)".into());
+    }
+    if pr.use_ipv6 == UseIpv6::No && (pr.remote_ipv6_prefix_pool.is_some() || pr.dhcpv6_pd_pool.is_some()) {
+        w.push("use_ipv6=no: the IPv6 pools of this profile are not used".into());
+    }
+    if pr.use_ipv6 == UseIpv6::Require && pr.remote_ipv6_prefix_pool.is_none() && pr.dhcpv6_pd_pool.is_none() {
+        w.push("use_ipv6=require without IPv6 pools: the session needs IPv6CP but gets only a link-local address unless RADIUS sends a prefix".into());
+    }
+    if pr.download_mode == Some(DownloadMode::Policer) {
+        w.push("download_mode=policer drops what exceeds the rate: TCP loses packets instead of waiting (about 6× the loss of a shaper, Google 2016); shaper is recommended".into());
+    }
+    if pr.change_tcp_mss == Tri::Yes {
+        w.push("change_tcp_mss=yes clamps the MSS per session; with many subscribers one mangle rule (change-mss) is lighter".into());
+    }
+    w
+}
+
+pub(super) fn add(s: &mut Session, p: &Value) -> Result<Value> {
+    let name = opt_name(p, "name")?.ok_or_else(|| EngineError::bad("name", "is required"))?;
+    let ppp = &s.store().candidate().ppp;
+    if ppp.profile(&name).is_some() {
+        return Err(EngineError::bad("name", format!("profile '{name}' exists")));
+    }
+    if ppp.profiles.len() >= MAX_PROFILES {
+        return Err(EngineError::bad("name", "too many profiles"));
+    }
+    let mut pr = PppProfile { name, ..PppProfile::default() };
+    apply(s, &mut pr, p)?;
+    let ppp = &mut s.store_mut().candidate_mut().ppp;
+    pr.id = ppp.next_id();
+    let out = json!({"id": pr.id, "name": pr.name, "warnings": warnings(&pr)});
+    ppp.profiles.push(pr);
+    Ok(out)
+}
+
+/// The profile `p["id"]` names (stored or built-in).
+fn named(s: &Session, p: &Value) -> Result<PppProfile> {
+    let raw = opt_str(p, "id")?.ok_or_else(|| EngineError::bad("id", "is required"))?.trim();
+    let ppp = &s.store().candidate().ppp;
+    let found = if raw.starts_with('*') {
+        let id: ItemId = raw.parse().map_err(|e| EngineError::bad("id", format!("{e}")))?;
+        ppp.all_profiles().into_iter().find(|x| x.id == id)
+    } else {
+        ppp.profile(raw)
+    };
+    found.ok_or_else(|| {
+        let shown: String = raw.chars().take(64).collect();
+        EngineError::bad("id", format!("no profile '{shown}'"))
+    })
+}
+
+fn set(s: &mut Session, p: &Value) -> Result<Value> {
+    let mut pr = named(s, p)?;
+    let old = pr.name.clone();
+    apply(s, &mut pr, p)?;
+    if pr.name != old {
+        if PppProfile::is_builtin_name(&old) {
+            return Err(EngineError::bad("name", format!("'{old}' is built in and keeps its name")));
+        }
+        let ppp = &s.store().candidate().ppp;
+        if ppp.profile(&pr.name).is_some() {
+            return Err(EngineError::bad("name", format!("profile '{}' exists", pr.name)));
+        }
+        let used = ppp.profile_users(&old);
+        if !used.is_empty() {
+            return Err(EngineError::bad(
+                "name",
+                format!("{} use it by name: change them first", used.iter().take(5).cloned().collect::<Vec<_>>().join(", ")),
+            ));
+        }
+    }
+    let out = json!({"id": pr.id, "name": pr.name, "warnings": warnings(&pr)});
+    let ppp = &mut s.store_mut().candidate_mut().ppp;
+    // A built-in set back to what it ships with needs no stored copy.
+    if PppProfile::builtin(&pr.name).as_ref() == Some(&pr) {
+        ppp.profiles.retain(|x| x.name != pr.name);
+        return Ok(out);
+    }
+    match ppp.profiles.iter_mut().find(|x| x.name == old) {
+        Some(slot) => *slot = pr,
+        None => ppp.profiles.push(pr),
+    }
+    Ok(out)
+}
+
+fn remove(s: &mut Session, p: &Value) -> Result<Value> {
+    let pr = named(s, p)?;
+    if PppProfile::is_builtin_name(&pr.name) {
+        return Err(EngineError::bad("id", format!("'{}' is built in and cannot be removed", pr.name)));
+    }
+    let used = s.store().candidate().ppp.profile_users(&pr.name);
+    if !used.is_empty() {
+        let n = used.len();
+        let first: Vec<String> = used.into_iter().take(5).collect();
+        return Err(EngineError::bad("id", format!("in use by {n}: {}", first.join(", "))));
+    }
+    s.store_mut().candidate_mut().ppp.profiles.retain(|x| x.name != pr.name);
+    Ok(json!({"id": pr.id, "name": pr.name}))
+}
+
+/// The modal's preview: the checks of `add`/`set`, and what a session
+/// with this profile gets once the built-in `default` fills the gaps.
+fn preview(s: &mut Session, p: &Value) -> Result<Value> {
+    super::ppp_common::preview(s, p, ("ppp.profile.add", "ppp.profile.set"), (add, set), |s, v| {
+        let name = v.get("name").and_then(Value::as_str).unwrap_or_default();
+        let e = s.store().candidate().ppp.effective(None, name, corerouter_model::ppp::DEFAULT_PROFILE);
+        let opt = |o: Option<String>| o.unwrap_or_else(|| "none".into());
+        vec![
+            json!({"label": "Remote address", "value": opt(e.remote_address.map(|a| a.to_string()))}),
+            json!({"label": "Rate limit", "value": opt(e.rate_limit)}),
+            json!({"label": "Only one", "value": if e.only_one { "yes" } else { "no" }}),
+            json!({"label": "Change TCP MSS", "value": if e.change_tcp_mss { "yes" } else { "no" }}),
+            json!({"label": "Use IPv6", "value": e.use_ipv6.as_str()}),
+            json!({"label": "IPv6 prefix pool", "value": opt(e.remote_ipv6_prefix_pool)}),
+            json!({"label": "DHCPv6 PD pool", "value": opt(e.dhcpv6_pd_pool)}),
+            json!({"label": "DHCPv6 lease time", "value": super::dhcp_server::secs_text(e.dhcpv6_lease_time)}),
+            json!({"label": "Queue type", "value": e.queue_type}),
+            json!({"label": "Download mode", "value": e.download_mode.as_str()}),
+        ]
+    })
+}
+
+/// Hooks as one JSON text (what `add` takes back, so `/export` round-trips).
+fn hooks_text(h: &[corerouter_model::ppp::PppHook]) -> String {
+    if h.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(h).unwrap_or_default()
+    }
+}
+
+fn list(s: &mut Session, _: &Value) -> Result<Value> {
+    let active = s.ppp_active();
+    let ppp = &s.store().candidate().ppp;
+    let rows: Vec<Value> = ppp
+        .all_profiles()
+        .into_iter()
+        .map(|pr| {
+            let secrets = ppp.secrets.iter().filter(|x| x.profile == pr.name).count();
+            let up = active.iter().filter(|a| a.profile == pr.name).count();
+            let mut v = json!({
+                "id": pr.id,
+                "name": pr.name,
+                "builtin": PppProfile::is_builtin_name(&pr.name),
+                // Built in: every config has it (`/export` writes a `set`).
+                "default": PppProfile::is_builtin_name(&pr.name),
+                "dns_server": pr.dns_server,
+                "only_one": pr.only_one.as_str(),
+                "change_tcp_mss": pr.change_tcp_mss.as_str(),
+                "on_up": hooks_text(&pr.on_up),
+                "on_down": hooks_text(&pr.on_down),
+                "use_ipv6": pr.use_ipv6.as_str(),
+                "dns_server_ipv6": pr.dns_server_ipv6,
+                "secrets": secrets,
+                "active": up,
+            });
+            if let Some(o) = v.as_object_mut() {
+                for (k, val) in [
+                    ("local_address", pr.local_address.as_ref().map(ToString::to_string)),
+                    ("remote_address", pr.remote_address.as_ref().map(ToString::to_string)),
+                    ("rate_limit", pr.rate_limit.clone()),
+                    ("address_list", pr.address_list.clone()),
+                    ("idle_timeout", pr.idle_timeout.map(super::dhcp_server::secs_text)),
+                    ("session_timeout", pr.session_timeout.map(super::dhcp_server::secs_text)),
+                    ("comment", Some(pr.comment.clone()).filter(|c| !c.is_empty())),
+                    ("remote_ipv6_prefix_pool", pr.remote_ipv6_prefix_pool.clone()),
+                    ("dhcpv6_pd_pool", pr.dhcpv6_pd_pool.clone()),
+                    ("dhcpv6_lease_time", pr.dhcpv6_lease_time.map(super::dhcp_server::secs_text)),
+                    ("queue_type", pr.queue_type.clone()),
+                    ("download_mode", pr.download_mode.map(|m| m.as_str().to_owned())),
+                ] {
+                    if let Some(val) = val {
+                        o.insert(k.into(), json!(val));
+                    }
+                }
+            }
+            v
+        })
+        .collect();
+    Ok(Value::Array(rows))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lab() -> Session {
+        let mut s = Session::virtual_lab();
+        s.execute("ip.pool.add", &json!({"name": "clientes", "ranges": "100.64.0.1-100.64.3.254"})).unwrap();
+        s
+    }
+
+    #[test]
+    fn builtins_exist_and_add_set_remove_work() {
+        let mut s = lab();
+        let l = s.execute("ppp.profile.list", &json!({})).unwrap();
+        assert_eq!(l.as_array().unwrap().len(), 2);
+        assert_eq!(l[0]["name"], "default");
+        assert_eq!(l[0]["change_tcp_mss"], "yes");
+        let r = s
+            .execute("ppp.profile.add", &json!({
+                "name": "plano-100M", "remote_address": "clientes", "local_address": "100.64.255.254",
+                "dns_server": "1.1.1.1,8.8.8.8", "rate_limit": "50M/100M", "address_list": "assinantes",
+                "only_one": "yes", "session_timeout": "1d",
+                "on_up": [{"command": "ip.firewall.address-list.add", "params": {"list": "online", "address": "$remote-address", "comment": "$user", "timeout": "1d"}}]
+            }))
+            .unwrap();
+        assert_eq!(r["name"], "plano-100M");
+        let l = s.execute("ppp.profile.list", &json!({})).unwrap();
+        let row = &l[2];
+        assert_eq!(row["remote_address"], "clientes");
+        assert_eq!(row["rate_limit"], "50M/100M");
+        assert_eq!(row["session_timeout"], "1d");
+        s.execute("ppp.profile.set", &json!({"id": "plano-100M", "rate_limit": ""})).unwrap();
+        assert!(s.store().running().ppp.profile("plano-100M").unwrap().rate_limit.is_none());
+        // Editing a built-in stores a copy; removing it is refused.
+        s.execute("ppp.profile.set", &json!({"id": "default", "dns_server": "9.9.9.9"})).unwrap();
+        assert_eq!(s.store().running().ppp.profiles.len(), 2);
+        assert!(s.execute("ppp.profile.remove", &json!({"id": "default"})).is_err());
+        assert!(s.execute("ppp.profile.set", &json!({"id": "default", "name": "x"})).is_err());
+        s.execute("ppp.profile.set", &json!({"id": "default", "dns_server": ""})).unwrap();
+        assert_eq!(s.store().running().ppp.profiles.len(), 1, "back to the built-in: no copy");
+        let err = s.execute("ip.pool.remove", &json!({"id": "clientes"})).unwrap_err();
+        assert!(err.to_string().contains("ppp profile plano-100M"), "{err}");
+        s.execute("ppp.profile.remove", &json!({"id": "plano-100M"})).unwrap();
+        assert!(s.store().running().ppp.profile("plano-100M").is_none());
+    }
+
+    #[test]
+    fn bad_values_are_refused() {
+        let mut s = lab();
+        for p in [
+            json!({"name": ""}),
+            json!({"name": "a", "remote_address": "nopool"}),
+            json!({"name": "a", "rate_limit": "fast"}),
+            json!({"name": "a", "dns_server": "1.1.1.1,1.0.0.1,8.8.8.8"}),
+            json!({"name": "a", "only_one": "maybe"}),
+            json!({"name": "a", "address_list": "with space"}),
+            json!({"name": "a", "on_up": [{"command": "no.such.command"}]}),
+            json!({"name": "a", "on_up": [{"command": "ppp.secret.remove", "params": {"id": "$user"}}]}),
+            json!({"name": "a", "on_up": [{"command": "ip.firewall.address-list.add", "params": {"nope": 1}}]}),
+            json!({"name": "default"}),
+        ] {
+            let err = s.execute("ppp.profile.add", &p).unwrap_err();
+            assert!(matches!(err, EngineError::BadParam { .. }), "{p}: {err}");
+        }
+        assert!(s.store().candidate().ppp.profiles.is_empty());
+    }
+
+    #[test]
+    fn ipv6_fields_and_their_pools() {
+        let mut s = lab();
+        s.execute("ipv6.pool.add", &json!({"name": "wan6", "prefix": "2001:db8:100::/44", "prefix_length": 64})).unwrap();
+        s.execute("ipv6.pool.add", &json!({"name": "pd6", "prefix": "2001:db8:8000::/36", "prefix_length": 56})).unwrap();
+        s.execute("ppp.profile.add", &json!({
+            "name": "dual", "use_ipv6": "require", "remote_ipv6_prefix_pool": "wan6", "dhcpv6_pd_pool": "pd6",
+            "dhcpv6_lease_time": "12h", "dns_server_ipv6": "2001:db8::53, 2001:db8::54"
+        }))
+        .unwrap();
+        let pr = s.store().running().ppp.profile("dual").unwrap();
+        assert_eq!(pr.use_ipv6, UseIpv6::Require);
+        assert_eq!(pr.dhcpv6_lease_time, Some(43_200));
+        assert_eq!(pr.dns_server_ipv6.len(), 2);
+        let row = s.execute("ppp.profile.list", &json!({})).unwrap()[2].clone();
+        assert_eq!(row["dhcpv6_pd_pool"], "pd6");
+        assert_eq!(row["dhcpv6_lease_time"], "12h");
+        let e = s.store().running().ppp.effective(None, "dual", "default");
+        assert_eq!(e.remote_ipv6_prefix_pool.as_deref(), Some("wan6"));
+        // The built-in resolves to yes and one day.
+        let d = s.store().running().ppp.effective(None, "default", "default");
+        assert_eq!((d.use_ipv6, d.dhcpv6_lease_time), (UseIpv6::Yes, 86_400));
+        // Wrong piece sizes, unknown pools, bad DNS, short lease.
+        for p in [
+            json!({"id": "dual", "remote_ipv6_prefix_pool": "pd6"}),
+            json!({"id": "dual", "dhcpv6_pd_pool": "nope"}),
+            json!({"id": "dual", "dns_server_ipv6": "ff02::1"}),
+            json!({"id": "dual", "dns_server_ipv6": "1.1.1.1"}),
+            json!({"id": "dual", "dhcpv6_lease_time": "1m"}),
+            json!({"id": "dual", "use_ipv6": "maybe"}),
+        ] {
+            assert!(matches!(s.execute("ppp.profile.set", &p), Err(EngineError::BadParam { .. })), "{p}");
+        }
+        // A pool a profile uses cannot be removed.
+        // G4.9: the download queue.
+        s.execute("ppp.profile.set", &json!({"id": "dual", "queue_type": "cake-default", "download_mode": "policer"})).unwrap();
+        let row = s.execute("ppp.profile.list", &json!({})).unwrap()[2].clone();
+        assert_eq!((row["queue_type"].as_str(), row["download_mode"].as_str()), (Some("cake-default"), Some("policer")));
+        let e = s.store().running().ppp.effective(None, "dual", "default");
+        assert_eq!((e.queue_type.as_str(), e.download_mode), ("cake-default", DownloadMode::Policer));
+        let d = s.store().running().ppp.effective(None, "default", "default");
+        assert_eq!((d.queue_type.as_str(), d.download_mode), ("fq-codel-default", DownloadMode::Shaper));
+        assert!(s.execute("ppp.profile.set", &json!({"id": "dual", "queue_type": "nope"})).is_err());
+        assert!(s.execute("ppp.profile.set", &json!({"id": "dual", "download_mode": "drop"})).is_err());
+        let err = s.execute("ipv6.pool.remove", &json!({"id": "pd6"})).unwrap_err();
+        assert!(err.to_string().contains("ppp profile dual"), "{err}");
+        s.execute("ppp.profile.set", &json!({"id": "dual", "dhcpv6_pd_pool": ""})).unwrap();
+        s.execute("ipv6.pool.remove", &json!({"id": "pd6"})).unwrap();
+    }
+
+    #[test]
+    fn in_use_profiles_and_rollback() {
+        let mut s = lab();
+        s.execute("ppp.profile.add", &json!({"name": "p1"})).unwrap();
+        s.execute("ppp.secret.add", &json!({"name": "joao", "password": "x", "profile": "p1"})).unwrap();
+        let err = s.execute("ppp.profile.remove", &json!({"id": "p1"})).unwrap_err();
+        assert!(err.to_string().contains("secret joao"), "{err}");
+        assert!(s.execute("ppp.profile.set", &json!({"id": "p1", "name": "p2"})).is_err());
+        s.execute("config.mode.set", &json!({"mode": "transactional"})).unwrap();
+        s.execute("ppp.profile.add", &json!({"name": "p3"})).unwrap();
+        s.execute("config.discard", &json!({})).unwrap();
+        assert!(s.store().candidate().ppp.profile("p3").is_none());
+    }
+}

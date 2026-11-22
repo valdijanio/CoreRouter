@@ -1,0 +1,3 @@
+# Linux LTS kernel of the image. From the PGP-signed
+# https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc
+sha256  53a55ac9863a5547e292b8e381d4e4c2240dd1127d5428a7c44dbc550be23963  linux-6.18.59.tar.xz

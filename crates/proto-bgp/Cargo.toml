@@ -1,0 +1,35 @@
+[package]
+name = "corerouter-proto-bgp"
+description = "L2: BGP config validation and FRR bgpd rendering"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+corerouter-model.workspace = true
+ipnet.workspace = true
+serde.workspace = true
+# AS-path expressions of `/routing filter` (G3.2b): linear time, no
+# backtracking (a hostile pattern cannot stall a commit or a preview).
+regex = { version = "1.13.1", default-features = false, features = ["std", "perf"] }
+# Syntax check of a rule's regex without compiling it (the policy compiles
+# each once: 10 000 rules validate in a third of the time, **medido**).
+regex-syntax = { version = "0.8.11", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "filter"
+harness = false
+
+[[bench]]
+name = "rpki"
+harness = false
+
+[lints]
+workspace = true

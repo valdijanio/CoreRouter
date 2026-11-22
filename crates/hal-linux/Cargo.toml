@@ -1,0 +1,121 @@
+[package]
+name = "corerouter-hal-linux"
+description = "L1 platform crate: Linux backend (rtnetlink apply, discovery and counters). Only apps may depend on it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+corerouter-model.workspace = true
+corerouter-hal.workspace = true
+corerouter-firewall.workspace = true
+ipnet.workspace = true
+log.workspace = true
+
+# Netlink only exists on Linux; elsewhere only the pure planner compiles.
+# netlink-packet-route comes re-exported as `rtnetlink::packet_route`, so the
+# two can never drift apart.
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = { version = "0.23.0", default-features = false, features = ["tokio_socket"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Only a current-thread runtime, private to hal-linux: the Hal trait stays sync.
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net"] }
+# G5.2 (l2.rs): AF_PACKET and UDP sockets through safe APIs only (no `unsafe`).
+socket2 = { version = "0.6.5", features = ["all"] }
+serde_json.workspace = true
+nix = { version = "0.30.1", default-features = false, features = ["socket", "net", "uio", "poll", "signal"] }
+# clock.rs (G4.6b): clock_adjtime (ADJ_FREQUENCY, ADJ_SETOFFSET), which std,
+# nix and rustix lack; `unsafe` stays in that crate (ntpd-rs and statime use it).
+clock-steering = "0.2.1"
+# Tools (icmp.rs): IP_MTU_DISCOVER / IPV6_MTU_DISCOVER, which socket2 and nix lack.
+rustix = { version = "1.1.5", default-features = false, features = ["std", "net", "time", "fs", "param", "process"] }
+# G1.19 (genl.rs): sync generic netlink socket for ethtool/devlink queries
+# (the same crate rtnetlink uses underneath; its API is safe).
+netlink-sys = { version = "0.9.0", default-features = false }
+# G2.5a (xdp.rs): loads the XDP object and drives its maps (userspace aya;
+# the `unsafe` stays inside aya and crates/dataplane-ebpf).
+aya = { version = "=0.14.0", default-features = false }
+# G3.9db (lsp/ebpf.rs): the object's map names, to load the LSP tap with
+# every other map at its smallest (aya itself depends on it).
+aya-obj = { version = "0.3", default-features = false }
+corerouter-dataplane-ebpf-common.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Tests open sockets inside nested namespaces (netns_cgnat.rs).
+nix = { version = "0.30.1", default-features = false, features = ["sched"] }
+# Frames and the reference model of the kernel differential test (tests/xdp_root.rs).
+corerouter-dataplane-ebpf-common = { workspace = true, features = ["testing"] }
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "netns_apply"
+harness = false
+
+[[bench]]
+name = "route_plan"
+harness = false
+
+[[bench]]
+name = "netns_forward"
+harness = false
+
+[[bench]]
+name = "netns_rules"
+harness = false
+
+[[bench]]
+name = "netns_raw"
+harness = false
+
+[[bench]]
+name = "netns_fw_counters"
+harness = false
+
+[[bench]]
+name = "netns_firewall"
+harness = false
+
+[[bench]]
+name = "netns_cgnat"
+harness = false
+
+[[bench]]
+name = "netns_cgnat_pps"
+harness = false
+
+[[bench]]
+name = "netns_notice"
+harness = false
+
+[[bench]]
+name = "netns_capture"
+harness = false
+
+[[bench]]
+name = "netns_neigh"
+harness = false
+
+[[bench]]
+name = "netns_routes_batch"
+harness = false
+
+[[bench]]
+name = "netns_pppoe_slow"
+harness = false
+
+[[bench]]
+name = "netns_mpls_ttl"
+harness = false
+
+[[bench]]
+name = "resource"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,730 @@
+//! /tool: diagnostic tools (ping, MTU discovery) and the tasks they run in.
+//!
+//! Every tool command starts a task and returns its id at once; results
+//! come from `tool.task.poll`. All of them are operational (`query`): no
+//! journal entry, no revision. See `docs/tools.md`.
+
+use std::net::IpAddr;
+use std::time::Duration;
+
+use corerouter_hal::probe::{MAX_PACKET, ProbeProto, SocketOptions, V4_OVERHEAD};
+use corerouter_model::{IfName, InterfaceKind, RoutingTable};
+use serde_json::{Value, json};
+
+use super::args::{opt_bool, opt_parse, opt_u32, req_u32};
+use super::{CommandSpec, always};
+use crate::tasks::{MAX_POLL, can_start};
+use crate::tools::{Target, mtr, mtu, ping, text};
+use crate::{EngineError, Result, Session};
+
+/// Targets one ping task may have.
+pub const MAX_TARGETS: usize = 16;
+const MAX_NAME: usize = 253;
+
+pub(super) const COMMANDS: &[CommandSpec] = &[
+    cmd!(query "tool.ping.start", "Ping", ["Tools", "Ping"], None,
+        "{address: string|[string] (1..16 IPs or DNS names), count?: int 0..1000000 (0 = until stopped), interval_ms?: int 10..60000, timeout_ms?: int 10..10000, size?: int 28..65535 (whole IP packet), ttl?: int 1..255, dscp?: int 0..63, do_not_fragment?: bool, src_address?: ip, interface?: string, routing_table?: string} → {id, task_id, targets, columns}",
+        can_start, ping_start)
+    .alias("ping")
+    .positional("address")
+    .task(),
+    cmd!(query "tool.ping.mtu", "Discover MTU", ["Tools", "Ping"], None,
+        "{address: string, max_size?: int 28..65535 (default 1500), timeout_ms?: int 10..10000, retries?: int 1..5, dscp?: int 0..63, src_address?: ip, interface?: string, routing_table?: string} → {id, task_id, columns}",
+        can_start, ping_mtu)
+    .positional("address")
+    .task(),
+    cmd!(query "tool.mtr.start", "MTR", ["Tools", "MTR"], None,
+        "{address: string, count?: int 0..1000000 (rounds, 0 = until stopped), interval_ms?: int 100..60000, timeout_ms?: int 10..10000, max_hops?: int 1..64, size?: int 28..65535, dscp?: int 0..63, src_address?: ip, interface?: string, routing_table?: string, use_dns?: bool (default true: hop names by PTR), as_lookup?: bool (default false: origin AS via Team Cymru DNS), protocol?: icmp|udp|tcp (default icmp), port?: int 1..65535 (udp default 33434, tcp default 80), paris?: bool (default true: one flow, one ECMP path)} → {id, task_id, columns}",
+        can_start, mtr_start)
+    .alias("mtr")
+    .positional("address")
+    .task(),
+    cmd!(query "tool.traceroute.start", "Traceroute", ["Tools", "MTR"], None,
+        "{address: string, probes?: int 1..10 (per hop, default 3), timeout_ms?: int 10..10000, max_hops?: int 1..64, size?: int 28..65535, dscp?: int 0..63, src_address?: ip, interface?: string, routing_table?: string, use_dns?: bool (default true), as_lookup?: bool (default false), protocol?: icmp|udp|tcp (default icmp), port?: int 1..65535 (udp default 33434, tcp default 80), paris?: bool (default true: one flow, one ECMP path)} → {id, task_id, columns}",
+        can_start, traceroute_start)
+    .alias("traceroute")
+    .positional("address")
+    .task(),
+    cmd!(query "tool.task.list", "Tasks", [], None,
+        "{} → [{id, kind, title, state: running|done|stopped|failed, reason, owner, events, age_secs}]",
+        always, task_list),
+    cmd!(query "tool.task.poll", "Poll Task", [], None,
+        "{id: int, after_seq?: int, max?: int 1..256, text?: bool (add RouterOS-style header, lines, summary_lines)} → {id, kind, title, state, done, reason, summary, events: [{seq, …}], next_seq, more, lost, header?, lines?, summary_lines?}",
+        always, task_poll),
+    cmd!(query "tool.task.stop", "Stop Task", [], None,
+        "{id: int} → {id, state, stopping}",
+        always, task_stop),
+];
+
+fn ranged(p: &Value, key: &str, lo: u32, hi: u32, default: u32) -> Result<u32> {
+    let v = opt_u32(p, key)?.unwrap_or(default);
+    if !(lo..=hi).contains(&v) {
+        return Err(EngineError::bad(key, format!("must be {lo}..={hi}")));
+    }
+    Ok(v)
+}
+
+fn narrow<T: TryFrom<u32>>(key: &str, v: u32) -> Result<T> {
+    T::try_from(v).map_err(|_| EngineError::bad(key, "out of range"))
+}
+
+/// A DNS name: 1..=253 characters, labels of 1..=63 letters, digits, `-`
+/// and `_`, not starting or ending with `-`, and a last label that is not
+/// all digits (RFC 3696 §2: so a mistyped `192.168.0.` is not a name).
+pub(super) fn valid_name(s: &str) -> bool {
+    let s = s.strip_suffix('.').unwrap_or(s);
+    let numeric_tld = s
+        .rsplit('.')
+        .next()
+        .is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()));
+    !s.is_empty()
+        && !numeric_tld
+        && s.len() <= MAX_NAME
+        && s.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+}
+
+fn target(key: &str, raw: &str) -> Result<Target> {
+    let t = raw.trim();
+    if let Ok(addr) = t.parse::<IpAddr>() {
+        return Ok(Target {
+            input: t.to_owned(),
+            addr: Some(addr),
+        });
+    }
+    if !valid_name(t) {
+        let shown: String = t.chars().take(64).collect();
+        return Err(EngineError::bad(
+            key,
+            format!("'{shown}' is neither an IP address nor a DNS name"),
+        ));
+    }
+    Ok(Target {
+        input: t.to_owned(),
+        addr: None,
+    })
+}
+
+/// `address`: one string (comma-separated for several, as the CLI types
+/// it) or a list of strings. Duplicates are dropped.
+fn targets(p: &Value) -> Result<Vec<Target>> {
+    let raw: Vec<&str> = match p.get("address") {
+        Some(Value::String(s)) => s.split(',').filter(|x| !x.trim().is_empty()).collect(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .ok_or_else(|| EngineError::bad("address", "must be a list of strings"))
+            })
+            .collect::<Result<_>>()?,
+        _ => {
+            return Err(EngineError::bad(
+                "address",
+                "must be an IP address or name, or a list of them",
+            ));
+        }
+    };
+    if raw.is_empty() {
+        return Err(EngineError::bad("address", "is required"));
+    }
+    if raw.len() > MAX_TARGETS {
+        return Err(EngineError::bad(
+            "address",
+            format!("at most {MAX_TARGETS} targets"),
+        ));
+    }
+    let mut out: Vec<Target> = Vec::with_capacity(raw.len());
+    for r in raw {
+        let t = target("address", r)?;
+        if !out.iter().any(|o| o.input.eq_ignore_ascii_case(&t.input)) {
+            out.push(t);
+        }
+    }
+    Ok(out)
+}
+
+/// Socket options shared by ping and MTU: DSCP, source, and the device
+/// for `interface` / `routing_table` (a VRF is reached by binding to its
+/// device, or to one of its members).
+fn options(s: &Session, p: &Value, targets: &[Target]) -> Result<SocketOptions> {
+    let dscp = ranged(p, "dscp", 0, 63, 0)?;
+    let src: Option<IpAddr> = opt_parse(p, "src_address")?;
+    if let Some(src) = src {
+        if let Some(t) = targets
+            .iter()
+            .find(|t| t.addr.is_some_and(|a| a.is_ipv6() != src.is_ipv6()))
+        {
+            return Err(EngineError::bad(
+                "src_address",
+                format!("{src} and {} are of different IP versions", t.input),
+            ));
+        }
+        if src.is_unspecified() || src.is_multicast() {
+            return Err(EngineError::bad("src_address", "must be a unicast address"));
+        }
+    }
+    let cfg = s.store().running();
+    let table: Option<RoutingTable> = opt_parse(p, "routing_table")?;
+    let vrf = match table {
+        None | Some(RoutingTable::Main) => None,
+        Some(RoutingTable::Vrf(name)) => match cfg.interfaces.get(&name).map(|i| &i.kind) {
+            Some(InterfaceKind::Vrf { .. }) => Some(name),
+            _ => {
+                return Err(EngineError::bad(
+                    "routing_table",
+                    format!("no VRF '{name}' (see ip.vrf.list)"),
+                ));
+            }
+        },
+    };
+    let interface: Option<IfName> = opt_parse(p, "interface")?;
+    let device = match (interface, vrf) {
+        (None, vrf) => vrf,
+        (Some(i), vrf) => {
+            let Some(iface) = cfg.interfaces.get(&i) else {
+                return Err(EngineError::bad(
+                    "interface",
+                    format!("no interface '{i}' (see interface.list)"),
+                ));
+            };
+            if let Some(v) = &vrf
+                && iface.vrf.as_ref() != Some(v)
+                && &i != v
+            {
+                return Err(EngineError::bad(
+                    "interface",
+                    format!("{i} is not in VRF {v}"),
+                ));
+            }
+            Some(i)
+        }
+    };
+    Ok(SocketOptions {
+        tos: narrow::<u8>("dscp", dscp)? << 2,
+        dont_fragment: opt_bool(p, "do_not_fragment")?.unwrap_or(false),
+        src,
+        device: device.map(|d| d.to_string()),
+        ..SocketOptions::default()
+    })
+}
+
+fn title(verb: &str, targets: &[Target]) -> String {
+    let names: Vec<&str> = targets.iter().map(|t| t.input.as_str()).collect();
+    let mut t = format!("{verb} {}", names.join(", "));
+    if t.chars().count() > 120 {
+        t = t.chars().take(117).collect::<String>() + "...";
+    }
+    t
+}
+
+fn ping_start(s: &mut Session, p: &Value) -> Result<Value> {
+    let targets = targets(p)?;
+    let count = ranged(p, "count", 0, 1_000_000, 0)?;
+    let interval = ranged(p, "interval_ms", 10, 60_000, 1000)?;
+    let timeout = ranged(p, "timeout_ms", 10, 10_000, 1000)?;
+    let size = ranged(p, "size", u32::from(V4_OVERHEAD), u32::from(MAX_PACKET), 56)?;
+    let ttl = match opt_u32(p, "ttl")? {
+        None => None,
+        Some(t) if (1..=255).contains(&t) => Some(narrow::<u8>("ttl", t)?),
+        Some(_) => return Err(EngineError::bad("ttl", "must be 1..=255")),
+    };
+    let options = options(s, p, &targets)?;
+    let prober = s.tool_prober().map_err(EngineError::Hal)?;
+    let job = ping::PingJob {
+        targets: targets.clone(),
+        count,
+        interval: Duration::from_millis(u64::from(interval)),
+        timeout: Duration::from_millis(u64::from(timeout)),
+        size: narrow("size", size)?,
+        ttl,
+        options,
+    };
+    let id = s.start_task("ping", title("ping", &targets), move |ctx| {
+        ping::run(job, prober.as_ref(), ctx)
+    })?;
+    let names: Vec<&str> = targets.iter().map(|t| t.input.as_str()).collect();
+    Ok(json!({
+        "id": id,
+        "task_id": id,
+        "targets": names,
+        // Event fields in RouterOS column order, for terminals.
+        "columns": ["icmp_seq", "host", "size", "ttl", "rtt_ms", "status", "detail"],
+    }))
+}
+
+fn ping_mtu(s: &mut Session, p: &Value) -> Result<Value> {
+    let raw = super::args::req_str(p, "address")?;
+    let target = target("address", raw)?;
+    let max = ranged(
+        p,
+        "max_size",
+        u32::from(V4_OVERHEAD),
+        u32::from(MAX_PACKET),
+        1500,
+    )?;
+    let timeout = ranged(p, "timeout_ms", 10, 10_000, 1000)?;
+    let retries = ranged(p, "retries", 1, 5, 2)?;
+    let targets = [target.clone()];
+    let options = options(s, p, &targets)?;
+    let prober = s.tool_prober().map_err(EngineError::Hal)?;
+    let job = mtu::MtuJob {
+        target,
+        max: narrow("max_size", max)?,
+        timeout: Duration::from_millis(u64::from(timeout)),
+        retries: narrow("retries", retries)?,
+        options,
+    };
+    let id = s.start_task("mtu", title("mtu", &targets), move |ctx| {
+        mtu::run(job, prober.as_ref(), ctx)
+    })?;
+    Ok(json!({
+        "id": id,
+        "task_id": id,
+        "columns": ["size", "payload", "rtt_ms", "status", "mtu"],
+    }))
+}
+
+/// `protocol`, `port` and `paris` of MTR and traceroute (G6.4c).
+fn probe_kind(p: &Value, options: &mut SocketOptions) -> Result<()> {
+    let port = opt_u32(p, "port")?;
+    if let Some(v) = port
+        && !(1..=65_535).contains(&v)
+    {
+        return Err(EngineError::bad("port", "must be 1..=65535"));
+    }
+    let port = |default: u16| port.map_or(default, |v| u16::try_from(v).unwrap_or(default));
+    options.proto = match super::args::opt_str(p, "protocol")?.map(str::trim) {
+        None | Some("" | "icmp") => {
+            if p.get("port").is_some_and(|v| !v.is_null()) {
+                return Err(EngineError::bad("port", "only for protocol udp or tcp"));
+            }
+            ProbeProto::Icmp
+        }
+        Some("udp") => ProbeProto::Udp { port: port(33_434) },
+        Some("tcp") => ProbeProto::Tcp { port: port(80) },
+        Some(_) => return Err(EngineError::bad("protocol", "must be icmp, udp or tcp")),
+    };
+    options.paris = opt_bool(p, "paris")?.unwrap_or(true);
+    Ok(())
+}
+
+fn traceroute_start(s: &mut Session, p: &Value) -> Result<Value> {
+    let raw = super::args::req_str(p, "address")?;
+    let target = target("address", raw)?;
+    let probes = ranged(p, "probes", 1, mtr::MAX_PROBES, 3)?;
+    let timeout = ranged(p, "timeout_ms", 10, 10_000, 1000)?;
+    let max_hops = ranged(p, "max_hops", 1, 64, 30)?;
+    let size = ranged(p, "size", u32::from(V4_OVERHEAD), u32::from(MAX_PACKET), 60)?;
+    let targets = [target.clone()];
+    let mut options = options(s, p, &targets)?;
+    probe_kind(p, &mut options)?;
+    let prober = s.tool_prober().map_err(EngineError::Hal)?;
+    let job = mtr::MtrJob {
+        target,
+        count: probes,
+        // The probes of one hop leave 50 ms apart: routers rate-limit
+        // their ICMP errors.
+        interval: Duration::from_millis(50),
+        timeout: Duration::from_millis(u64::from(timeout)),
+        max_hops: narrow("max_hops", max_hops)?,
+        size: narrow("size", size)?,
+        options,
+        use_dns: opt_bool(p, "use_dns")?.unwrap_or(true),
+        as_lookup: opt_bool(p, "as_lookup")?.unwrap_or(false),
+        traceroute: true,
+    };
+    let id = s.start_task("traceroute", title("traceroute", &targets), move |ctx| {
+        mtr::run(job, prober.as_ref(), ctx)
+    })?;
+    Ok(json!({
+        "id": id,
+        "task_id": id,
+        "columns": ["round", "hop", "address", "rtt_ms", "status", "mpls"],
+    }))
+}
+
+fn mtr_start(s: &mut Session, p: &Value) -> Result<Value> {
+    let raw = super::args::req_str(p, "address")?;
+    let target = target("address", raw)?;
+    let count = ranged(p, "count", 0, 1_000_000, 0)?;
+    let interval = ranged(p, "interval_ms", 100, 60_000, 1000)?;
+    let timeout = ranged(p, "timeout_ms", 10, 10_000, 1000)?;
+    let max_hops = ranged(p, "max_hops", 1, 64, 30)?;
+    let size = ranged(p, "size", u32::from(V4_OVERHEAD), u32::from(MAX_PACKET), 56)?;
+    let targets = [target.clone()];
+    let mut options = options(s, p, &targets)?;
+    probe_kind(p, &mut options)?;
+    let prober = s.tool_prober().map_err(EngineError::Hal)?;
+    let job = mtr::MtrJob {
+        target,
+        count,
+        interval: Duration::from_millis(u64::from(interval)),
+        timeout: Duration::from_millis(u64::from(timeout)),
+        max_hops: narrow("max_hops", max_hops)?,
+        size: narrow("size", size)?,
+        options,
+        use_dns: opt_bool(p, "use_dns")?.unwrap_or(true),
+        as_lookup: opt_bool(p, "as_lookup")?.unwrap_or(false),
+        traceroute: false,
+    };
+    let id = s.start_task("mtr", title("mtr", &targets), move |ctx| {
+        mtr::run(job, prober.as_ref(), ctx)
+    })?;
+    Ok(json!({
+        "id": id,
+        "task_id": id,
+        "columns": ["round", "hop", "address", "rtt_ms", "status", "mpls"],
+    }))
+}
+
+fn task_list(s: &mut Session, _: &Value) -> Result<Value> {
+    Ok(s.task_list())
+}
+
+fn task_poll(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = req_u32(p, "id")?;
+    let after = match p.get("after_seq") {
+        None | Some(Value::Null) => 0,
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| EngineError::bad("after_seq", "must be a non-negative integer"))?,
+    };
+    let max = ranged(p, "max", 1, MAX_POLL as u32, MAX_POLL as u32)?;
+    let mut reply = s.task_poll(u64::from(id), after, max as usize)?;
+    if opt_bool(p, "text")? == Some(true) {
+        add_text(&mut reply);
+    }
+    Ok(reply)
+}
+
+/// Terminal rendering of a poll reply (`tools::text`): the column header,
+/// one line per event and, once done, the closing statistics. Front ends
+/// print these and need not know the tool.
+fn add_text(reply: &mut Value) {
+    let kind = reply
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let lines: Vec<String> = reply
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        // A `dig` answer is many lines: each its own.
+        .flat_map(|ev| {
+            text::line(&kind, ev)
+                .split('\n')
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        // A traceroute prints its table at the end, nothing per probe.
+        .filter(|l| kind != "traceroute" || !l.is_empty())
+        .collect();
+    let done = reply.get("done").and_then(Value::as_bool) == Some(true);
+    let summary = done.then(|| text::summary(&kind, reply.get("summary").unwrap_or(&Value::Null)));
+    if let Value::Object(o) = reply {
+        o.insert("header".into(), json!(text::header(&kind)));
+        o.insert("lines".into(), json!(lines));
+        o.insert("summary_lines".into(), json!(summary));
+    }
+}
+
+fn task_stop(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = req_u32(p, "id")?;
+    s.task_stop(u64::from(id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tasks::test_runner;
+    use std::thread;
+
+    fn lab() -> Session {
+        let mut s = Session::virtual_lab();
+        s.set_runner(test_runner::sim());
+        s
+    }
+
+    fn until_done(s: &mut Session, id: u64) -> Value {
+        for _ in 0..500 {
+            let p = s
+                .execute("tool.task.poll", &json!({"id": id, "max": 256}))
+                .unwrap();
+            if p["done"] == true {
+                return p;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("task {id} did not finish");
+    }
+
+    #[test]
+    fn ping_two_targets_in_the_lab() {
+        let mut s = lab();
+        let r = s
+            .execute(
+                "tool.ping.start",
+                &json!({"address": "127.0.0.1, ::1", "count": 3, "interval_ms": 10}),
+            )
+            .unwrap();
+        assert_eq!(r["targets"], json!(["127.0.0.1", "::1"]));
+        let p = until_done(&mut s, r["task_id"].as_u64().unwrap());
+        assert_eq!(p["state"], "done");
+        assert_eq!(p["summary"]["targets"][0]["received"], 3);
+        assert_eq!(p["summary"]["targets"][1]["received"], 3);
+        assert_eq!(p["events"].as_array().unwrap().len(), 6);
+        // Operational: nothing in the journal, no revision.
+        assert!(s.journal().is_empty());
+        assert_eq!(s.store().current_revision(), 0);
+    }
+
+    #[test]
+    fn mtu_task_reports_the_path_mtu() {
+        let mut s = lab();
+        let r = s
+            .execute(
+                "tool.ping.mtu",
+                &json!({"address": "8.8.8.8", "max_size": 9000}),
+            )
+            .unwrap();
+        let p = until_done(&mut s, r["task_id"].as_u64().unwrap());
+        assert_eq!(p["summary"]["mtu"], 1500);
+        assert_eq!(p["summary"]["payload"], 1472);
+    }
+
+    #[test]
+    fn poll_can_render_routeros_text() {
+        let mut s = lab();
+        let r = s
+            .execute(
+                "tool.ping.start",
+                &json!({"address": "127.0.0.1", "count": 2, "interval_ms": 10}),
+            )
+            .unwrap();
+        let id = r["task_id"].as_u64().unwrap();
+        let p = until_done(&mut s, id);
+        assert!(p.get("lines").is_none(), "only on request");
+        let t = s
+            .execute("tool.task.poll", &json!({"id": id, "text": true}))
+            .unwrap();
+        assert!(t["header"].as_str().unwrap().contains("SEQ"));
+        assert_eq!(t["lines"].as_array().unwrap().len(), 2);
+        assert!(t["lines"][0].as_str().unwrap().contains("127.0.0.1"));
+        assert!(
+            t["summary_lines"][0]
+                .as_str()
+                .unwrap()
+                .contains("sent=2 received=2 packet-loss=0")
+        );
+    }
+
+    #[test]
+    fn mtr_task_lists_the_hops() {
+        let mut s = lab();
+        let r = s
+            .execute(
+                "tool.mtr.start",
+                &json!({"address": "8.8.8.8", "count": 2, "interval_ms": 100, "timeout_ms": 50}),
+            )
+            .unwrap();
+        let p = until_done(&mut s, r["task_id"].as_u64().unwrap());
+        assert_eq!(p["kind"], "mtr");
+        assert_eq!(p["summary"]["reached"], true);
+        assert!(p["summary"]["hops"].as_array().unwrap().len() >= 2);
+        // G6.3b: names by default, AS numbers when asked, in the text too.
+        let last = p["summary"]["hops"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["name"], "host-8-8-8-8.sim-dest.example");
+        assert!(last["asn"].is_null(), "as_lookup is off by default");
+        let r = s
+            .execute(
+                "tool.mtr.start",
+                &json!({"address": "8.8.8.8", "count": 1, "interval_ms": 100, "timeout_ms": 50,
+                        "use_dns": false, "as_lookup": true}),
+            )
+            .unwrap();
+        let id = r["task_id"].as_u64().unwrap();
+        let p = until_done(&mut s, id);
+        let last = p["summary"]["hops"].as_array().unwrap().last().unwrap().clone();
+        assert!(last["name"].is_null());
+        assert_eq!((last["asn"].as_u64(), last["as_name"].as_str()), (Some(64_999), Some("SIM-DEST")));
+        let t = s
+            .execute("tool.task.poll", &json!({"id": id, "text": true}))
+            .unwrap();
+        let table = t["summary_lines"].as_array().unwrap();
+        assert!(table.iter().any(|l| l.as_str().unwrap().ends_with("AS64999 SIM-DEST")), "{table:?}");
+        assert!(
+            s.execute("tool.mtr.start", &json!({"address": "8.8.8.8", "use_dns": "maybe"}))
+                .is_err()
+        );
+        assert!(
+            s.execute(
+                "tool.mtr.start",
+                &json!({"address": "8.8.8.8", "max_hops": 0})
+            )
+            .is_err()
+        );
+        assert!(
+            s.execute(
+                "tool.mtr.start",
+                &json!({"address": "8.8.8.8", "interval_ms": 10})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn traceroute_one_pass_over_udp_tcp_and_icmp() {
+        let mut s = lab();
+        for (proto, end) in [("udp", "port unreachable"), ("tcp", "syn-ack"), ("icmp", "")] {
+            let r = s
+                .execute(
+                    "tool.traceroute.start",
+                    &json!({"address": "8.8.8.8", "protocol": proto, "timeout_ms": 50, "use_dns": false}),
+                )
+                .unwrap();
+            let id = r["task_id"].as_u64().unwrap();
+            let p = until_done(&mut s, id);
+            assert_eq!(p["kind"], "traceroute");
+            let sum = &p["summary"];
+            assert_eq!((sum["mode"].as_str(), sum["protocol"].as_str(), sum["paris"].as_bool()), (Some("traceroute"), Some(proto), Some(true)));
+            assert_eq!(sum["reached"], true);
+            let hops = sum["hops"].as_array().unwrap();
+            assert!(hops.iter().all(|h| h["rtts"].as_array().unwrap().len() == 3), "{sum}");
+            if !end.is_empty() {
+                assert_eq!(hops.last().unwrap()["note"], end);
+            }
+            let t = s.execute("tool.task.poll", &json!({"id": id, "text": true})).unwrap();
+            let table = t["summary_lines"].as_array().unwrap();
+            assert!(table.iter().any(|l| l.as_str().unwrap().contains("8.8.8.8")), "{table:?}");
+            assert!(t["lines"].as_array().unwrap().is_empty(), "the table is the output");
+        }
+        for bad in [
+            json!({"address": "8.8.8.8", "protocol": "sctp"}),
+            json!({"address": "8.8.8.8", "port": 80}),
+            json!({"address": "8.8.8.8", "protocol": "udp", "port": 0}),
+            json!({"address": "8.8.8.8", "probes": 11}),
+            json!({"address": "8.8.8.8", "paris": "yes"}),
+        ] {
+            assert!(s.execute("tool.traceroute.start", &bad).is_err(), "accepted {bad}");
+        }
+        // The MTR takes the same knobs.
+        let r = s
+            .execute("tool.mtr.start", &json!({"address": "8.8.8.8", "count": 1, "protocol": "tcp", "port": 443, "paris": false, "interval_ms": 100, "timeout_ms": 50}))
+            .unwrap();
+        let p = until_done(&mut s, r["task_id"].as_u64().unwrap());
+        assert_eq!((p["summary"]["protocol"].as_str(), p["summary"]["port"].as_u64(), p["summary"]["paris"].as_bool()), (Some("tcp"), Some(443), Some(false)));
+    }
+
+    #[test]
+    fn stop_a_continuous_ping() {
+        // The wall clock: the job must still be running when the stop comes.
+        let mut s = Session::virtual_lab();
+        s.set_runner(test_runner::threads());
+        let r = s
+            .execute(
+                "tool.ping.start",
+                &json!({"address": ["10.1.1.1"], "interval_ms": 50}),
+            )
+            .unwrap();
+        let id = r["task_id"].as_u64().unwrap();
+        thread::sleep(Duration::from_millis(120));
+        let stop = s.execute("tool.task.stop", &json!({"id": id})).unwrap();
+        assert_eq!(stop["stopping"], true);
+        let p = until_done(&mut s, id);
+        assert_eq!(p["state"], "stopped");
+        assert!(p["summary"]["targets"][0]["sent"].as_u64().unwrap() >= 1);
+        let list = s.execute("tool.task.list", &json!({})).unwrap();
+        assert_eq!(list[0]["kind"], "ping");
+        assert_eq!(list[0]["title"], "ping 10.1.1.1");
+    }
+
+    #[test]
+    fn bad_parameters_are_refused_before_anything_starts() {
+        let mut s = lab();
+        let bad = [
+            json!({"address": ""}),
+            json!({"address": "bad name!"}),
+            json!({"address": "-x.com"}),
+            json!({"address": vec!["1.1.1.1"; 17].join(",")}),
+            json!({"address": "1.1.1.1", "count": -1}),
+            json!({"address": "1.1.1.1", "interval_ms": 5}),
+            json!({"address": "1.1.1.1", "size": 20}),
+            json!({"address": "1.1.1.1", "ttl": 0}),
+            json!({"address": "1.1.1.1", "dscp": 64}),
+            json!({"address": "1.1.1.1", "src_address": "::1"}),
+            json!({"address": "1.1.1.1", "interface": "nope0"}),
+            json!({"address": "1.1.1.1", "routing_table": "blue"}),
+            json!({"address": "1.1.1.1", "do_not_fragment": "yes"}),
+            json!({"address": "1.1.1.1", "bogus": 1}),
+            json!({"address": 7}),
+        ];
+        for p in bad {
+            assert!(s.execute("tool.ping.start", &p).is_err(), "accepted {p}");
+        }
+        assert!(s.task_list().as_array().unwrap().is_empty());
+        assert!(s.execute("tool.task.poll", &json!({"id": 99})).is_err());
+        assert!(s.execute("tool.task.stop", &json!({"id": 99})).is_err());
+    }
+
+    #[test]
+    fn interface_and_vrf_become_the_bound_device() {
+        let mut s = lab();
+        let targets = targets(&json!({"address": "1.1.1.1"})).unwrap();
+        let o = options(&s, &json!({"interface": "ether1", "dscp": 46}), &targets).unwrap();
+        assert_eq!(o.device.as_deref(), Some("ether1"));
+        assert_eq!(o.tos, 46 << 2);
+        s.execute(
+            "ip.vrf.add",
+            &json!({"name": "blue", "interfaces": ["ether2"]}),
+        )
+        .unwrap();
+        let o = options(&s, &json!({"routing_table": "blue"}), &targets).unwrap();
+        assert_eq!(o.device.as_deref(), Some("blue"));
+        let o = options(
+            &s,
+            &json!({"routing_table": "blue", "interface": "ether2"}),
+            &targets,
+        )
+        .unwrap();
+        assert_eq!(o.device.as_deref(), Some("ether2"));
+        assert!(
+            options(
+                &s,
+                &json!({"routing_table": "blue", "interface": "ether1"}),
+                &targets
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn names_are_checked() {
+        assert!(valid_name("example.com"));
+        assert!(valid_name("a_b.example.com."));
+        assert!(!valid_name("a..b"));
+        assert!(!valid_name(&"a".repeat(64)));
+        assert!(!valid_name("x-.com"));
+        assert!(!valid_name("ex ample.com"));
+        assert!(!valid_name("192.168.0."));
+        assert!(!valid_name("10.1"));
+        assert!(valid_name("host1"));
+    }
+
+    #[test]
+    fn disabled_without_a_runner() {
+        let mut s = Session::virtual_lab();
+        let e = s
+            .execute("tool.ping.start", &json!({"address": "127.0.0.1"}))
+            .unwrap_err();
+        assert!(e.to_string().contains("disabled"), "{e}");
+    }
+}

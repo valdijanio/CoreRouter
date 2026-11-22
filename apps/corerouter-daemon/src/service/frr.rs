@@ -1,0 +1,229 @@
+//! FRR (G3.1): with `--frr <dir>`, the routing daemons of the FRR suite
+//! whose vty sockets are in `<dir>` take the routing part of every commit
+//! (`hal-frr`: only the difference, no restart, rollback on a refusal), and
+//! this thread reads their state for `routing.bgp.session.list`.
+//!
+//! The read runs here, on its own connections, never under the session
+//! lock: the lock is taken only to read the config (a clone of the routing
+//! part) and to store the sample. When FRR comes back after being down
+//! (restart, upgrade), the running config is installed again
+//! (`Session::routing_resync`, under the lock: a commit cannot interleave).
+//!
+//! Without the flag nothing changes: the virtual lab and a router without
+//! FRR keep the routing config and list no session.
+
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use corerouter_engine::{Shared, lock};
+use corerouter_hal::routing::RoutingReader;
+use corerouter_hal_frr::Frr;
+use corerouter_hal_frr::on_demand::OnDemand;
+use corerouter_model::Config;
+use corerouter_model::routing_state::RoutingStatus;
+
+/// How often the sessions are read (RouterOS refreshes `session print`
+/// on demand; a 2 s sample keeps the UI live and costs ~1 ms of bgpd's
+/// time for 100 sessions, see docs/architecture.md).
+const TICK: Duration = Duration::from_secs(2);
+
+pub(crate) const SERVICE: super::Service = super::Service {
+    name: "frr",
+    flags: &[
+        super::Flag {
+            name: "--frr",
+            value: Some("<dir>"),
+            help: "drive FRR through the vty sockets in <dir> (FRR's default is\n/var/run/frr): \
+                   routing commits and routing.bgp.session.list",
+        },
+        super::Flag {
+            name: "--frr-daemons",
+            value: Some("<file>"),
+            help: "with --frr: write the protocol daemons the config uses (bgpd, ospfd,\n\
+                   ospf6d, ldpd, bfdd) to <file>, for the image's init to start (G1.6i)",
+        },
+    ],
+    topic: "route",
+    enable: "--frr /var/run/frr",
+    depends: &[],
+    start,
+};
+
+fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
+    let session = ctx.session.clone();
+    let dir = ctx.flag("--frr").map(str::to_owned);
+    if dir.as_deref() == Some("") {
+        return Err("--frr needs the directory of FRR's vty sockets".into());
+    }
+    let daemons = ctx.flag("--frr-daemons").map(str::to_owned);
+    if daemons.as_deref() == Some("") {
+        return Err("--frr-daemons needs a file".into());
+    }
+    Ok(Box::new(move |health: &super::Health| {
+        let Some(dir) = &dir else {
+            health.disabled(Some("no --frr <dir>"));
+            health.idle_until_shutdown();
+            return Ok(());
+        };
+        let mut frr = Frr::new(dir);
+        if let Some(f) = &daemons {
+            frr = frr.with_on_demand(OnDemand::new(f));
+        }
+        let (reader, synced) = lock(&session).attach_routing(Box::new(frr));
+        match &synced {
+            Ok(()) => health.event(format!("attached to FRR in {dir}")),
+            Err(e) => health.error(e.to_string()),
+        }
+        run(&session, reader, synced.is_ok(), health);
+        Ok(())
+    }))
+}
+
+fn unix_now() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+fn run(session: &Shared, mut reader: Box<dyn RoutingReader>, synced: bool, health: &super::Health) {
+    // Whether the running config is known to be on FRR.
+    let mut in_sync = synced;
+    let mut status = RoutingStatus::default();
+    let mut seen = reader.incarnation();
+    loop {
+        health.beat();
+        match reader.version() {
+            Ok(v) => {
+                // Restarted between two polls: up both times, other PIDs.
+                let now = reader.incarnation();
+                if now != seen {
+                    if seen.is_some() && in_sync {
+                        log::warn!("FRR restarted ({now:?}); installing the running config again");
+                    }
+                    in_sync = false;
+                    seen = now;
+                }
+                if !in_sync {
+                    match lock(session).routing_resync() {
+                        Ok(()) => {
+                            log::info!("FRR is up ({v}); running config installed");
+                            health.event(format!("{v}: running config installed"));
+                            in_sync = true;
+                        }
+                        Err(e) => health.error(e.to_string()),
+                    }
+                }
+                status.backend = v;
+                let cfg = routing_only(session);
+                match reader.bgp_sessions(&cfg) {
+                    Ok(s) => {
+                        status.bgp_sessions = s;
+                        status.updated = unix_now();
+                        status.error = None;
+                        if in_sync {
+                            health.clear_error();
+                        }
+                    }
+                    Err(e) => {
+                        status.error = Some(e.to_string());
+                        health.error(e.to_string());
+                    }
+                }
+                // G3.4b: OSPF neighbors and interfaces, every poll (two
+                // JSON answers per instance, on a kept connection; 4 000
+                // interfaces and 500 neighbors: see docs/ospf.md, G3.4n).
+                if !cfg.routing.ospf.instances.is_empty() {
+                    match reader.ospf_state(&cfg) {
+                        Ok((n, i)) => {
+                            status.ospf_neighbors = n;
+                            status.ospf_interfaces = i;
+                        }
+                        Err(e) => {
+                            status.error = Some(e.to_string());
+                            health.error(e.to_string());
+                        }
+                    }
+                    // G3.9c: stub router (one more small answer each).
+                    match reader.ospf_stub_state(&cfg) {
+                        Ok(st) => status.ospf_stub = st,
+                        Err(e) => {
+                            status.error = Some(e.to_string());
+                            health.error(e.to_string());
+                        }
+                    }
+                } else {
+                    status.ospf_neighbors.clear();
+                    status.ospf_interfaces.clear();
+                    status.ospf_stub.clear();
+                }
+            }
+            Err(e) => {
+                if in_sync {
+                    log::warn!("FRR is down: {e}");
+                }
+                in_sync = false;
+                status.error = Some(e.to_string());
+                status.bgp_sessions.clear();
+                status.ospf_neighbors.clear();
+                status.ospf_interfaces.clear();
+                status.ospf_stub.clear();
+                health.error(e.to_string());
+            }
+        }
+        // G3.5: LDP's state, when the running config has LDP.
+        let ldp = match reader.ldp_state(&routing_only(session)) {
+            Ok(st) => Ok(st),
+            Err(e) => Err(e.to_string()),
+        };
+        corerouter_engine::mpls::set_ldp(&mut lock(session), ldp);
+        // Copied before the lock is taken (126 µs for 1 000 sessions,
+        // **medido**): under it only the move.
+        let sample = status.clone();
+        let (wanted, ospf_wanted, old) = {
+            let mut s = lock(session);
+            let old = s.set_routing_status(sample);
+            (s.bgp_routes_wanted(), s.ospf_db_wanted(), old)
+        };
+        // G3.4z: the RIB inside the guarded networks a window asked for
+        // (a handful of routes each), read here and handed back.
+        let rib_wanted = lock(session).mgmt_guard_rib_wanted();
+        for (table, net) in rib_wanted {
+            let got = reader.rib_inside(&table, net).map_err(|e| e.to_string());
+            lock(session).mgmt_guard_set_rib(table, net, got);
+        }
+        // Freed out of the lock (G3.4n).
+        drop(old);
+        // G3.4b: the OSPF databases a window asked for, streamed here
+        // (10 000 LSAs: see docs/ospf.md) and handed back under the lock.
+        if !ospf_wanted.is_empty() {
+            let cfg = routing_only(session);
+            for inst in ospf_wanted {
+                let got = reader.ospf_lsdb(&cfg, &inst).map_err(|e| e.to_string());
+                lock(session).set_ospf_db(inst, got);
+            }
+        }
+        // G3.2b: the tables the filter preview asked for, read here (a
+        // full table takes seconds) and handed back under the lock.
+        for key in wanted {
+            let got = reader
+                .bgp_filter_routes(&Config::default(), &key.instance, &key.neighbor, key.received)
+                .map(corerouter_engine::bgp_routes::to_routes)
+                .map_err(|e| e.to_string());
+            lock(session).set_bgp_routes(key, got);
+        }
+        if !health.sleep(TICK) {
+            return;
+        }
+    }
+}
+
+/// The running config's routing part (all the reader needs), copied under
+/// the lock so the read itself runs outside it. The sections are shared
+/// (`CowArc`): ~1 µs whatever the size of the config (G3.4n, **medido**).
+fn routing_only(session: &Shared) -> Config {
+    let routing = lock(session).store().running().routing.clone();
+    Config {
+        routing,
+        ..Config::default()
+    }
+}

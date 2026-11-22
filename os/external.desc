@@ -1,0 +1,2 @@
+name: COREROUTER
+desc: CoreRouter OS image (G1.6a): kernel, read-only rootfs, corerouter-init and corerouter-daemon

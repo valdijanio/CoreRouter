@@ -1,0 +1,946 @@
+//! The LAN forwarder (G4.1b, `allow_remote_requests`): a query from a
+//! client goes through a chain of stages, each in its own file under
+//! `stage/`, until one answers:
+//!
+//! ```text
+//! acl → limit → special → adlist → static → zones → cache → upstream → statistics
+//!  10     20       25        30       40      50      60       90         100
+//! ```
+//!
+//! A stage is a `pub(crate) const STAGE: Stage` (found by `build.rs`, placed
+//! by its `order`): it looks at the [`Query`], and says go on
+//! ([`Step::Next`]), answer ([`Step::Reply`]), drop, or — only a stage that
+//! waits on the network — [`Step::Wait`]. The chain runs on the listener's
+//! thread up to the first stage that would wait; the rest runs on a worker
+//! ([`Forwarder::finish`]), so a cache hit never queues behind a slow
+//! upstream. Its `after` hook sees every reply (address lists, statistics).
+//! How to add one: `docs/dns.md`, "Uma etapa nova".
+//!
+//! No sockets here either: the daemon brings bytes and a [`Transport`]. The
+//! config is the running [`Config`] (each stage reads its own section) and
+//! the networks `allowed_from` stands for, which the engine computes.
+
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+
+use corerouter_model::Config;
+use hickory_proto::op::{Edns, Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
+use hickory_proto::rr::{DNSClass, Record, RecordType};
+use ipnet::IpNet;
+
+use crate::message::{Answer, QName};
+use crate::resolver::{Begin, ResolveError, Resolved, Resolver, Source, Transport};
+
+include!(concat!(env!("OUT_DIR"), "/stages.rs"));
+
+pub mod explain;
+
+use explain::{Decision, Note, Outcome};
+
+/// The stripe of the calling thread (statistics, states, adlists).
+pub(crate) use statistics::my_stripe;
+
+pub use statistics::{
+    CATEGORIES, CLIENT_V6_PREFIX, ClientStats, Counters, DomainStats, MAX_CLIENTS, NameStats,
+    STRIPES, Snapshot, Statistics, client_key, ede_name, ede_text, type_name,
+};
+
+/// The smallest message a client must accept (RFC 1035 §4.2.1).
+pub const MIN_UDP: usize = 512;
+/// Longest message read from a client (RFC 1035 §4.2.2: TCP length is 16
+/// bits). A query is far smaller; anything bigger is not a query.
+pub const MAX_QUERY: usize = 65_535;
+
+/// One link of the chain.
+pub struct Stage {
+    pub name: &'static str,
+    /// Position: lower runs first. Leave gaps for stages to come.
+    pub order: u16,
+    /// Looks at the query. `t` is `None` on the listener's thread: a stage
+    /// that needs the network returns [`Step::Wait`] then, and is called
+    /// again on a worker with a transport.
+    pub handle: fn(&Forwarder, &mut Query, Option<&mut dyn Transport>) -> Step,
+    /// Sees every reply the chain gave (whoever answered), and drops too
+    /// ([`Query::dropped`]; the reply is then a placeholder SERVFAIL).
+    pub after: Option<fn(&Forwarder, &mut Query, &Reply)>,
+}
+
+/// What a stage decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    Next,
+    Reply(Reply),
+    /// No answer at all (floods, junk): nothing to reflect.
+    Drop,
+    /// Needs the network: run again on a worker.
+    Wait,
+}
+
+/// An answer to a client, before encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reply {
+    pub rcode: ResponseCode,
+    pub answers: Vec<Record>,
+    pub authority: Vec<Record>,
+    /// Additional section (glue, addresses of NS/MX/SRV targets: zones).
+    pub additional: Vec<Record>,
+    /// AA: the router is the authority (static entries, zones).
+    pub authoritative: bool,
+}
+
+impl Reply {
+    pub fn code(rcode: ResponseCode) -> Self {
+        Self {
+            rcode,
+            answers: Vec::new(),
+            authority: Vec::new(),
+            additional: Vec::new(),
+            authoritative: false,
+        }
+    }
+
+    pub fn from_answer(a: &Answer) -> Self {
+        Self {
+            rcode: a.rcode.code(),
+            answers: a.records.clone(),
+            authority: a.authority.clone(),
+            additional: Vec::new(),
+            authoritative: false,
+        }
+    }
+
+    /// The A and AAAA addresses answered.
+    pub fn addresses(&self) -> Vec<IpAddr> {
+        Answer::local(crate::message::Rcode::NoError, self.answers.clone()).addresses()
+    }
+}
+
+/// Something the daemon does after replying (the forwarder has no access
+/// to the rest of the router).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Effect {
+    /// A static entry's `address_list`: add (or refresh) `address` in
+    /// firewall list `list` for `timeout_secs`.
+    AddressList {
+        list: String,
+        address: IpAddr,
+        timeout_secs: u64,
+    },
+}
+
+/// What the forwarder works with.
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    /// Bumped by [`Forwarder::configure`]; stages that compile config
+    /// (regexps) redo it when this changes ([`Forwarder::compiled`]).
+    pub generation: u64,
+    pub config: Arc<Config>,
+    /// What `allowed_from` stands for now (interface lists → networks).
+    pub allowed: Vec<IpNet>,
+}
+
+/// One query from a client, as it goes down the chain.
+#[derive(Debug, Clone)]
+pub struct Query {
+    pub client: IpAddr,
+    pub tcp: bool,
+    pub now_ms: u64,
+    pub config: Arc<ServerConfig>,
+    /// The name asked.
+    pub asked: QName,
+    /// The name being resolved: the asked one, or a static CNAME's target.
+    pub name: QName,
+    pub qtype: RecordType,
+    /// Records answered before `name` (a static CNAME), put in front.
+    pub prefix: Vec<Record>,
+    /// A static FWD entry: ask these servers (or this forwarders group)
+    /// instead.
+    pub forward_to: Option<crate::resolver::Upstreams>,
+    /// A static entry's address list, for its `after`.
+    pub address_list: Option<String>,
+    /// Which stage answered.
+    pub answered_by: &'static str,
+    /// Where the upstream stage got its answer.
+    pub source: Option<Source>,
+    pub effects: Vec<Effect>,
+    /// The RFC 8914 extended error the reply stands for, when a stage
+    /// knows one (counted by the statistics, and sent to a client that
+    /// used EDNS, G4.1ze).
+    pub ede: Option<u16>,
+    /// G4.1t: the upstream lookup's result, brought by [`Forwarder::resume`].
+    upstream: Option<Result<Resolved, ResolveError>>,
+    /// Refused for `max_concurrent_queries` (answered as "busy").
+    busy: bool,
+    /// `explain` (G6.8): each stage's decision so far.
+    explain: Option<Vec<Decision>>,
+    /// What the running stage said about itself ([`Query::note`]).
+    pending: Option<Note>,
+    /// Asked on behalf of a LAN address (`as_client`, G6.8): no packet
+    /// came, so nothing is counted, no bucket token taken, no address
+    /// list touched.
+    simulated: bool,
+    /// The client's message (id, flags, question, EDNS), for the reply.
+    request: Message,
+    /// Largest reply the client takes over UDP.
+    udp_limit: usize,
+    reply: Option<Reply>,
+    dropped: bool,
+    /// The UDP reply went without records and with TC (too large).
+    truncated: bool,
+    /// G4.1zd: set by the `querylog` stage's `after`.
+    pub log: Option<Box<crate::querylog::Entry>>,
+}
+
+/// A query waiting for a worker (it needs the network).
+#[derive(Debug)]
+pub struct Pending {
+    query: Query,
+    next: usize,
+}
+
+/// The chain's result: bytes to send (none: drop) and what to do after.
+#[derive(Debug, Default)]
+pub struct Done {
+    pub reply: Option<Vec<u8>>,
+    pub effects: Vec<Effect>,
+    pub answered_by: &'static str,
+    /// Each stage's decision, when asked with [`How::explain`].
+    pub explain: Vec<Decision>,
+    /// G4.1zd: the query for the log (`ip.dns.log` on, the client not
+    /// excluded); the daemon adds the time to answer and hands it to the
+    /// [`crate::querylog::Sink`]. Boxed: `Query` and `Done` move several
+    /// times per query, and an inline entry made every query ~2 % more
+    /// instructions with the log off (**medido**, `perf stat`).
+    pub log: Option<Box<crate::querylog::Entry>>,
+}
+
+/// How a query the router asks itself (DNS Lookup, G6.8) goes down the
+/// chain.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct How {
+    /// Keep each stage's decision ([`Done::explain`]).
+    pub explain: bool,
+    /// The client is simulated (`as_client`): see [`Query`].
+    pub simulated: bool,
+}
+
+/// Stages that only count (they never decide): left out of `explain`.
+const NOT_EXPLAINED: [&str; 2] = ["statistics", "querylog"];
+
+pub enum Start {
+    Done(Done),
+    Pending(Box<Pending>),
+}
+
+type AnyArc = Arc<dyn Any + Send + Sync>;
+
+/// The forwarder: the shared resolver, the config, the stages' state.
+pub struct Forwarder {
+    pub resolver: Arc<Resolver>,
+    config: RwLock<Arc<ServerConfig>>,
+    /// Also in `states`; kept here so counting a reply takes no lock of
+    /// the map (G4.1h).
+    stats: Arc<statistics::Statistics>,
+    states: Mutex<HashMap<TypeId, AnyArc>>,
+    /// Copies of `states`, one per stripe of threads (G4.1z): a stage
+    /// reaches its state through the stripe of its thread, a lock no other
+    /// thread takes while there are no more threads than stripes.
+    state_stripes: Box<[StateStripe]>,
+    compiled: Mutex<HashMap<TypeId, (u64, AnyArc)>>,
+}
+
+/// The states a stripe of threads has reached, on cache lines of its own.
+/// A short list: a forwarder keeps a handful of states.
+#[derive(Default)]
+#[repr(align(128))]
+struct StateStripe(Mutex<Vec<(TypeId, AnyArc)>>);
+
+/// A static entry's `regexp`, compiled as the forwarder matches it.
+pub(crate) fn stage_statics_compile(pattern: &str) -> Result<regex::Regex, String> {
+    statics::compile(pattern)
+}
+
+/// The networks `allowed_from` stands for in `cfg`: its prefixes, and the
+/// networks of the addresses of each listed interface list's members
+/// (an address still marked `from_pool` holds only the bits after the
+/// pool's prefix and is left out). The engine passes the effective config,
+/// with the DHCP-learned addresses in and the pools' addresses resolved
+/// (`Session::dns_allowed_networks`, G4.1e).
+pub fn allowed_networks(cfg: &Config) -> Vec<IpNet> {
+    use corerouter_model::dns::AllowedFrom;
+    let mut out: Vec<IpNet> = Vec::new();
+    for item in &cfg.ip.dns.allowed_from {
+        match AllowedFrom::parse(item) {
+            Ok(AllowedFrom::Net(n)) => out.push(n),
+            Ok(AllowedFrom::List(list)) => {
+                let members: Vec<_> = cfg.interface_lists.interfaces_of(&list).collect();
+                for iface in &members {
+                    out.extend(
+                        cfg.ip
+                            .addresses
+                            .iter()
+                            .filter(|a| {
+                                !a.disabled && a.from_pool.is_none() && a.interface == **iface
+                            })
+                            .map(|a| a.address.trunc()),
+                    );
+                }
+                // G4.3x: the subscribers of a PPPoE server on one of the
+                // list's interfaces are of the list (RouterOS puts their
+                // dynamic interfaces in the profile's `interface-list`):
+                // the pools the PPP profiles hand out, `next_pool`s
+                // included. Without it, a profile whose `dns_server` is the
+                // router got REFUSED (a notebook, dev.607).
+                if corerouter_model::ppp::subscribers_in_list(&cfg.interface_lists, &cfg.ppp, &list)
+                {
+                    out.extend(ppp_pool_networks(cfg));
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The networks of the pools the PPP profiles give subscribers
+/// (`remote_address` a pool, and its `next_pool` chain), as prefixes.
+fn ppp_pool_networks(cfg: &Config) -> Vec<IpNet> {
+    use corerouter_model::ppp::AddrOrPool;
+    let mut out = Vec::new();
+    for prof in &cfg.ppp.profiles {
+        let Some(AddrOrPool::Pool(name)) = &prof.remote_address else {
+            continue;
+        };
+        for pool in cfg.ip.pools.chain(name) {
+            for r in &pool.ranges {
+                out.extend(range_prefixes(u32::from(r.start), u32::from(r.end)));
+            }
+        }
+    }
+    out
+}
+
+/// The fewest prefixes that cover `start..=end` exactly (at most 62).
+fn range_prefixes(start: u32, end: u32) -> Vec<IpNet> {
+    let mut out = Vec::new();
+    let mut at = u64::from(start);
+    let end = u64::from(end);
+    while at <= end && out.len() < 64 {
+        // The largest block aligned at `at` that ends inside the range.
+        let mut bits = at.trailing_zeros().min(32);
+        while bits > 0 && at + (1u64 << bits) - 1 > end {
+            bits -= 1;
+        }
+        let len = u8::try_from(32 - bits).unwrap_or(32);
+        if let Ok(n) = ipnet::Ipv4Net::new(
+            std::net::Ipv4Addr::from(u32::try_from(at).unwrap_or(0)),
+            len,
+        ) {
+            out.push(IpNet::V4(n));
+        }
+        at += 1u64 << bits;
+    }
+    out
+}
+
+/// The stages in chain order.
+pub fn stages() -> &'static [&'static Stage] {
+    static SORTED: OnceLock<Vec<&'static Stage>> = OnceLock::new();
+    SORTED.get_or_init(|| {
+        let mut v: Vec<&'static Stage> = FOUND.to_vec();
+        v.sort_by_key(|s| s.order);
+        v
+    })
+}
+
+impl Forwarder {
+    pub fn new(resolver: Arc<Resolver>) -> Self {
+        let stats = Arc::new(statistics::Statistics::default());
+        let mut states: HashMap<TypeId, AnyArc> = HashMap::new();
+        states.insert(
+            TypeId::of::<statistics::Statistics>(),
+            stats.clone() as AnyArc,
+        );
+        Self {
+            resolver,
+            stats,
+            config: RwLock::new(Arc::new(ServerConfig {
+                generation: 0,
+                config: Arc::new(Config::default()),
+                allowed: Vec::new(),
+            })),
+            states: Mutex::new(states),
+            state_stripes: (0..STRIPES).map(|_| StateStripe::default()).collect(),
+            compiled: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// New running config (or new networks behind `allowed_from`).
+    pub fn configure(&self, config: Arc<Config>, allowed: Vec<IpNet>) {
+        let mut cur = self.config.write().unwrap_or_else(|e| e.into_inner());
+        let generation = cur.generation.wrapping_add(1);
+        *cur = Arc::new(ServerConfig {
+            generation,
+            config,
+            allowed,
+        });
+    }
+
+    pub fn config(&self) -> Arc<ServerConfig> {
+        self.config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The state of type `T` a stage keeps across queries (made on first
+    /// use). Stages own their state: nothing to add here for a new one.
+    pub fn state<T: Default + Send + Sync + 'static>(&self) -> Arc<T> {
+        self.stripe_state::<T, _>(|any| {
+            any.clone()
+                .downcast::<T>()
+                // Unreachable by construction (keyed by the type); a fresh
+                // one keeps the forwarder going.
+                .unwrap_or_else(|_| Arc::new(T::default()))
+        })
+    }
+
+    /// `f` on the state of type `T`, borrowed (G4.1z): no reference count
+    /// shared by every thread changes, so the stages that run for every
+    /// query use this rather than [`Forwarder::state`]. `f` runs under the
+    /// lock of the thread's stripe: it must not reach a state itself.
+    pub fn with_state<T: Default + Send + Sync + 'static, R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        self.stripe_state::<T, _>(|any| match any.downcast_ref::<T>() {
+            Some(t) => f(t),
+            // Unreachable, as in `state`.
+            None => f(&T::default()),
+        })
+    }
+
+    /// `look` on the state of type `T` as this thread's stripe holds it,
+    /// copied from `states` (made there if new) on first use.
+    fn stripe_state<T: Default + Send + Sync + 'static, R>(
+        &self,
+        look: impl FnOnce(&AnyArc) -> R,
+    ) -> R {
+        let id = TypeId::of::<T>();
+        let Some(stripe) = self.state_stripes.get(my_stripe()) else {
+            return look(&self.shared_state::<T>());
+        };
+        let mut list = stripe.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, any)) = list.iter().find(|(t, _)| *t == id) {
+            return look(any);
+        }
+        let any = self.shared_state::<T>();
+        list.push((id, any.clone()));
+        look(&any)
+    }
+
+    /// The one state of type `T` all stripes copy.
+    fn shared_state<T: Default + Send + Sync + 'static>(&self) -> AnyArc {
+        let mut map = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(TypeId::of::<T>())
+            .or_insert_with(|| Arc::new(T::default()) as AnyArc)
+            .clone()
+    }
+
+    /// The statistics (the same as `state::<Statistics>()`, without its
+    /// lock).
+    pub fn statistics(&self) -> &statistics::Statistics {
+        &self.stats
+    }
+
+    /// `build(config)`, made once per config generation (compiled regexps,
+    /// lookup tables).
+    pub fn compiled<T: Send + Sync + 'static>(
+        &self,
+        cfg: &ServerConfig,
+        build: fn(&Config) -> T,
+    ) -> Arc<T> {
+        let mut map = self.compiled.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((generation, v)) = map.get(&TypeId::of::<T>())
+            && *generation == cfg.generation
+            && let Ok(t) = v.clone().downcast::<T>()
+        {
+            return t;
+        }
+        let t = Arc::new(build(&cfg.config));
+        map.insert(TypeId::of::<T>(), (cfg.generation, t.clone() as AnyArc));
+        t
+    }
+
+    /// A message from `client`: runs the chain as far as it can without
+    /// waiting on the network.
+    pub fn start(&self, packet: &[u8], client: IpAddr, tcp: bool, now_ms: u64) -> Start {
+        self.start_as(packet, client, tcp, now_ms, How::default())
+    }
+
+    /// [`Self::start`] for a query the router asks itself (G6.8).
+    pub fn start_as(
+        &self,
+        packet: &[u8],
+        client: IpAddr,
+        tcp: bool,
+        now_ms: u64,
+        how: How,
+    ) -> Start {
+        let config = self.config();
+        // G4.1zo: the per-client limit first, on the source address alone
+        // (UDP): a flood that never parses (junk) is limited too, and a
+        // message over the limit costs a table lookup, not a decoding and a
+        // FORMERR sent back. TCP keeps it in the chain (REFUSED needs the
+        // question; a TCP client cannot spoof its address).
+        if !tcp && !how.simulated && !self.within_limit(&config, client, now_ms) {
+            self.stats.limited(client, now_ms);
+            return Start::Done(Done {
+                reply: None,
+                effects: Vec::new(),
+                answered_by: "limit",
+                explain: Vec::new(),
+                log: None,
+            });
+        }
+        let request = match parse_request(packet) {
+            Ok(m) => m,
+            Err(reply) => {
+                if !how.simulated {
+                    self.stats.malformed(client, tcp, reply.as_deref(), now_ms);
+                }
+                return Start::Done(Done {
+                    reply,
+                    effects: Vec::new(),
+                    answered_by: "parse",
+                    explain: Vec::new(),
+                    log: None,
+                });
+            }
+        };
+        let mut query = match Query::new(request, client, tcp, now_ms, config) {
+            Ok(mut q) => {
+                q.simulated = how.simulated;
+                if how.explain {
+                    q.explain = Some(Vec::new());
+                }
+                q
+            }
+            Err(reply) => {
+                if !how.simulated {
+                    self.stats.malformed(client, tcp, Some(&reply), now_ms);
+                }
+                return Start::Done(Done {
+                    reply: Some(reply),
+                    effects: Vec::new(),
+                    answered_by: "parse",
+                    explain: Vec::new(),
+                    log: None,
+                });
+            }
+        };
+        match self.run(&mut query, 0, None) {
+            Some(i) => Start::Pending(Box::new(Pending { query, next: i })),
+            None => Start::Done(self.done(query)),
+        }
+    }
+
+    /// `client` may send one more UDP message now (`max_queries_per_client`;
+    /// the router itself always may).
+    fn within_limit(&self, config: &ServerConfig, client: IpAddr, now_ms: u64) -> bool {
+        let rate = config.config.ip.dns.max_queries_per_client;
+        rate == 0
+            || client.is_loopback()
+            || self.state::<limit::Buckets>().take(client, rate, now_ms)
+    }
+
+    /// The rest of the chain, on a worker, with the network.
+    pub fn finish(&self, p: Pending, t: &mut dyn Transport) -> Done {
+        let Pending { mut query, next } = p;
+        query.now_ms = t.now_ms();
+        if self.run(&mut query, next, Some(t)).is_some() {
+            // A stage waited although it had the network: answer anyway.
+            query.reply = Some(Reply::code(ResponseCode::ServFail));
+        }
+        self.done(query)
+    }
+
+    /// No room for it (no worker): SERVFAIL, so the client tries its other
+    /// server instead of waiting.
+    pub fn fail(&self, p: Pending) -> Done {
+        let mut query = p.query;
+        query.answered_by = "busy";
+        query.reply = Some(Reply::code(ResponseCode::ServFail));
+        self.done(query)
+    }
+
+    /// G4.1t: the upstream lookup of `p` without waiting: an answer now
+    /// (the cache filled meanwhile, a held failure, busy), the same lookup
+    /// in flight to follow, or a lookup to lead. Whatever it is, the result
+    /// goes back through [`Self::resume`].
+    pub fn upstream(&self, p: &Pending, now_ms: u64) -> Begin {
+        let q = &p.query;
+        let b = self
+            .resolver
+            .begin(&q.name, q.qtype, q.forward_to.as_ref(), now_ms);
+        self.count_in_flight();
+        b
+    }
+
+    /// The rest of the chain of `p` with its upstream result `got`.
+    pub fn resume(&self, p: Pending, got: Result<Resolved, ResolveError>, now_ms: u64) -> Done {
+        let Pending { mut query, next } = p;
+        query.now_ms = now_ms;
+        query.upstream = Some(got);
+        if self.run(&mut query, next, None).is_some() {
+            query.reply = Some(Reply::code(ResponseCode::ServFail));
+        }
+        self.done(query)
+    }
+
+    /// G4.1h: lookups in flight upstream and the equal ones waiting for
+    /// them, for `ip.dns.statistics.print`.
+    pub fn count_in_flight(&self) {
+        let (leading, following) = self.resolver.in_flight();
+        self.stats.set_in_flight(leading.saturating_add(following));
+    }
+
+    /// Stages from `from`; `Some(i)`: stage `i` must wait for a worker.
+    fn run(&self, q: &mut Query, from: usize, mut t: Option<&mut dyn Transport>) -> Option<usize> {
+        let waiting = t.is_none();
+        for (i, stage) in stages().iter().enumerate().skip(from) {
+            let tt: Option<&mut dyn Transport> = match t {
+                Some(ref mut x) => Some(&mut **x),
+                None => None,
+            };
+            let step = (stage.handle)(self, q, tt);
+            match step {
+                Step::Next => q.decided(stage, Outcome::Passed),
+                Step::Wait if waiting => {
+                    // Called again on a worker: it decides then.
+                    q.pending = None;
+                    return Some(i);
+                }
+                Step::Wait => {
+                    q.decided(stage, Outcome::Answered);
+                    q.answered_by = stage.name;
+                    q.reply = Some(Reply::code(ResponseCode::ServFail));
+                    q.not_reached(i + 1);
+                    return None;
+                }
+                Step::Drop => {
+                    q.decided(stage, Outcome::Dropped);
+                    q.answered_by = stage.name;
+                    q.dropped = true;
+                    q.not_reached(i + 1);
+                    return None;
+                }
+                Step::Reply(mut r) => {
+                    q.decided(stage, Outcome::Answered);
+                    q.answered_by = if q.busy { "busy" } else { stage.name };
+                    if !q.prefix.is_empty() {
+                        let mut all = q.prefix.clone();
+                        all.append(&mut r.answers);
+                        r.answers = all;
+                    }
+                    q.reply = Some(r);
+                    q.not_reached(i + 1);
+                    return None;
+                }
+            }
+        }
+        // Nobody answered (no upstream stage?): a server failure.
+        q.reply = Some(Reply::code(ResponseCode::ServFail));
+        None
+    }
+
+    fn done(&self, mut q: Query) -> Done {
+        let reply = q
+            .reply
+            .take()
+            .unwrap_or_else(|| Reply::code(ResponseCode::ServFail));
+        // Encoded first: the statistics count the truncated ones.
+        let bytes = if q.dropped {
+            None
+        } else {
+            encode(&q, &reply).map(|(b, tc)| {
+                q.truncated = tc;
+                b
+            })
+        };
+        // A simulated client sent nothing: nothing to count or act on.
+        if !q.simulated {
+            for stage in stages() {
+                if let Some(after) = stage.after {
+                    after(self, &mut q, &reply);
+                }
+            }
+        }
+        let explain = q.explain.take().unwrap_or_default();
+        if q.dropped {
+            return Done {
+                reply: None,
+                effects: q.effects,
+                answered_by: q.answered_by,
+                explain,
+                log: q.log,
+            };
+        }
+        Done {
+            reply: bytes,
+            effects: std::mem::take(&mut q.effects),
+            answered_by: q.answered_by,
+            explain,
+            log: q.log.take(),
+        }
+    }
+}
+
+impl Query {
+    fn new(
+        request: Message,
+        client: IpAddr,
+        tcp: bool,
+        now_ms: u64,
+        config: Arc<ServerConfig>,
+    ) -> Result<Self, Vec<u8>> {
+        let q = request.queries.first().cloned();
+        let Some(q) = q.filter(|_| request.queries.len() == 1) else {
+            // RFC 1035 §4.1.2: one question; anything else is malformed.
+            return Err(error(&request, ResponseCode::FormErr));
+        };
+        if q.query_class() != DNSClass::IN {
+            return Err(error(&request, ResponseCode::Refused));
+        }
+        // Zone transfers are answered before the chain (`zone::xfr::intercept`).
+        if matches!(q.query_type(), RecordType::AXFR | RecordType::IXFR) {
+            return Err(error(&request, ResponseCode::Refused));
+        }
+        if q.query_type() == RecordType::OPT {
+            return Err(error(&request, ResponseCode::FormErr));
+        }
+        let max = usize::from(config.config.ip.dns.max_udp_packet_size);
+        // RFC 6891 §6.2.3: the client's payload size, at least 512; we
+        // never send more than our own limit.
+        let udp_limit = request
+            .edns
+            .as_ref()
+            .map_or(MIN_UDP, |e| usize::from(e.max_payload()))
+            .clamp(MIN_UDP, max.max(MIN_UDP));
+        let asked = QName::from_name(q.name());
+        Ok(Self {
+            client: client.to_canonical(),
+            tcp,
+            now_ms,
+            config,
+            name: asked.clone(),
+            asked,
+            qtype: q.query_type(),
+            prefix: Vec::new(),
+            forward_to: None,
+            address_list: None,
+            answered_by: "",
+            source: None,
+            effects: Vec::new(),
+            ede: None,
+            upstream: None,
+            busy: false,
+            explain: None,
+            pending: None,
+            simulated: false,
+            request,
+            udp_limit,
+            reply: None,
+            dropped: false,
+            truncated: false,
+            log: None,
+        })
+    }
+
+    /// Asked for a simulated client (`as_client`): no packet came.
+    pub fn simulated(&self) -> bool {
+        self.simulated
+    }
+
+    /// `stage` is done with the query: its decision, with what it noted.
+    fn decided(&mut self, stage: &Stage, outcome: Outcome) {
+        let Some(log) = self.explain.as_mut() else {
+            return;
+        };
+        let note = self.pending.take().unwrap_or_default();
+        if NOT_EXPLAINED.contains(&stage.name) {
+            return;
+        }
+        log.push(Decision {
+            stage: stage.name,
+            outcome,
+            why: note.why,
+            args: note.args,
+            rule: note.rule,
+        });
+    }
+
+    /// The stages from `from` on never saw the query.
+    fn not_reached(&mut self, from: usize) {
+        let Some(log) = self.explain.as_mut() else {
+            return;
+        };
+        for stage in stages().iter().skip(from) {
+            if !NOT_EXPLAINED.contains(&stage.name) {
+                log.push(Decision {
+                    stage: stage.name,
+                    outcome: Outcome::NotReached,
+                    why: "not-reached",
+                    args: vec![("stage", self.answered_by.to_owned())],
+                    rule: None,
+                });
+            }
+        }
+    }
+
+    /// A stage dropped it: no reply goes out.
+    pub fn dropped(&self) -> bool {
+        self.dropped
+    }
+
+    /// The reply went over UDP without records and with TC set.
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// The client's question was sent with EDNS(0).
+    pub fn has_edns(&self) -> bool {
+        self.request.edns.is_some()
+    }
+
+    /// The client asked for recursion (RD).
+    pub fn recursion_desired(&self) -> bool {
+        self.request.metadata.recursion_desired
+    }
+
+    /// The client wants DNSSEC records (EDNS DO bit, RFC 3225).
+    pub fn dnssec_ok(&self) -> bool {
+        self.request
+            .edns
+            .as_ref()
+            .is_some_and(|e| e.flags().dnssec_ok)
+    }
+}
+
+/// Reads a client's message. `Err(Some(bytes))`: answer with an error;
+/// `Err(None)`: drop (not a query, or not even a header).
+fn parse_request(packet: &[u8]) -> Result<Message, Option<Vec<u8>>> {
+    if packet.len() < 12 || packet.len() > MAX_QUERY {
+        return Err(None);
+    }
+    // Byte 2, bit 7: QR. A response sent to us is never answered (it could
+    // be a reflection loop between two servers).
+    if packet.get(2).is_some_and(|b| b & 0x80 != 0) {
+        return Err(None);
+    }
+    match Message::from_vec(packet) {
+        Ok(m) if m.metadata.message_type == MessageType::Query => {
+            if m.metadata.op_code != OpCode::Query {
+                return Err(Some(error(&m, ResponseCode::NotImp)));
+            }
+            Ok(m)
+        }
+        Ok(_) => Err(None),
+        // RFC 1035 §4.1.1: FORMERR, echoing the id (the header is there).
+        Err(_) => {
+            let id = u16::from_be_bytes([
+                packet.first().copied().unwrap_or(0),
+                packet.get(1).copied().unwrap_or(0),
+            ]);
+            Err(Message::error_msg(id, OpCode::Query, ResponseCode::FormErr)
+                .to_vec()
+                .ok())
+        }
+    }
+}
+
+/// A bare error reply to `m`.
+fn error(m: &Message, rcode: ResponseCode) -> Vec<u8> {
+    let mut r = Message::error_msg(m.metadata.id, m.metadata.op_code, rcode);
+    r.metadata.recursion_desired = m.metadata.recursion_desired;
+    r.metadata.recursion_available = true;
+    if m.queries.len() == 1 {
+        r.add_queries(m.queries.clone());
+    }
+    r.to_vec().unwrap_or_default()
+}
+
+/// RFC 8914 §2: OPTION-CODE of an Extended DNS Error.
+pub const EDE_OPTION: u16 = 15;
+
+/// RFC 8914 §2: the option's data, INFO-CODE (16 bits, network order) and
+/// EXTRA-TEXT (UTF-8, no terminating NUL: its length is the option's).
+pub fn ede_option(code: u16) -> EdnsOption {
+    let mut data = code.to_be_bytes().to_vec();
+    data.extend_from_slice(ede_text(code).as_bytes());
+    EdnsOption::Unknown(EDE_OPTION, data)
+}
+
+/// The reply's bytes: the client's id, question (as sent: RFC 1035
+/// §2.3.3 case kept) and RD, our RA; EDNS only if the client used it
+/// (RFC 6891 §7). Over UDP, a reply larger than the client takes goes
+/// without records and with TC set, so it asks again over TCP (RFC 1035
+/// §4.2.1, RFC 6891 §7); `true` with it.
+///
+/// G4.1ze: with EDNS, the RFC 8914 extended error the reply stands for
+/// goes in an option 15 (§2: only to a query that carried an OPT). When it
+/// would make the UDP reply too large, it is the first thing dropped and
+/// TC is set (§3: "SHOULD truncate messages by dropping EDE options before
+/// dropping other data", "SHOULD set the truncation bit").
+fn encode(q: &Query, r: &Reply) -> Option<(Vec<u8>, bool)> {
+    let req = &q.request;
+    let mut m = Message::response(req.metadata.id, OpCode::Query);
+    m.metadata.recursion_desired = req.metadata.recursion_desired;
+    m.metadata.recursion_available = true;
+    m.metadata.checking_disabled = req.metadata.checking_disabled;
+    m.metadata.authoritative = r.authoritative;
+    m.metadata.response_code = r.rcode;
+    m.add_queries(req.queries.clone());
+    m.add_answers(r.answers.iter().cloned());
+    m.add_authorities(r.authority.iter().cloned());
+    m.add_additionals(r.additional.iter().cloned());
+    if req.edns.is_some() {
+        let mut e = Edns::new();
+        e.set_max_payload(q.config.config.ip.dns.max_udp_packet_size.max(512));
+        // RFC 3225 §3: DO is copied into the response.
+        e.set_dnssec_ok(q.dnssec_ok());
+        if let Some(code) = statistics::extended_error(q) {
+            e.options_mut().insert(ede_option(code));
+        }
+        m.set_edns(e);
+    }
+    fit(m, if q.tcp { usize::MAX } else { q.udp_limit })
+}
+
+/// `m` in at most `limit` bytes: whole; without its EDE options and with
+/// TC (RFC 8914 §3); else without records and with TC (RFC 1035 §4.2.1).
+/// `true` when TC was set.
+fn fit(mut m: Message, limit: usize) -> Option<(Vec<u8>, bool)> {
+    let bytes = m.to_vec().ok()?;
+    if bytes.len() <= limit {
+        return Some((bytes, false));
+    }
+    m.metadata.truncation = true;
+    let ede = EdnsCode::from(EDE_OPTION);
+    if let Some(e) = m.edns.as_mut().filter(|e| e.options().get(ede).is_some()) {
+        e.options_mut().remove(ede);
+        let bytes = m.to_vec().ok()?;
+        if bytes.len() <= limit {
+            return Some((bytes, true));
+        }
+    }
+    m.answers.clear();
+    m.authorities.clear();
+    m.additionals.clear();
+    m.to_vec().ok().map(|b| (b, true))
+}
+
+#[cfg(test)]
+pub(crate) mod tests;

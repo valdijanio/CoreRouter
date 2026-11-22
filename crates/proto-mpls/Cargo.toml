@@ -1,0 +1,26 @@
+[package]
+name = "corerouter-proto-mpls"
+description = "L2: MPLS/LDP validation, FRR ldpd render, forwarding-table view"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+corerouter-model.workspace = true
+corerouter-hal.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+criterion.workspace = true
+ipnet.workspace = true
+
+[[bench]]
+name = "forwarding"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,1379 @@
+//! The tabs of an "Interface <name>" window (G1.19), WinBox style:
+//! General (the editable fields, in `interfaces.rs`, plus MAC addresses and
+//! L2 MTU), Status (`interface.ethernet.monitor`), Hardware
+//! (`interface.hardware`), Traffic (live bps/pps from `interface.stats`)
+//! and Statistics (every counter, with a "Zero view" that only moves this
+//! window's baseline; the kernel counters are never reset).
+//!
+//! While a window is open its queries go out with the UI refresh (the
+//! monitor and counters every second, the hardware every 10 s), one of
+//! each at a time. Values the router cannot report read "not supported".
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use egui::{CollapsingHeader, Grid, RichText, ScrollArea, Ui};
+use egui_plot::{Legend, Line, Plot, PlotPoints};
+use serde_json::{Value, json};
+
+use crate::avail::Avail;
+use crate::ethernet_tab::{self, CABLE_TEST, Cable, EthEdit, SET, TASK_POLL};
+use crate::{CoreRouterUi, Pending, REFRESH_SECS, value_text};
+
+pub(crate) const MONITOR: &str = "interface.ethernet.monitor";
+pub(crate) const HARDWARE: &str = "interface.hardware";
+pub(crate) const STATS: &str = "interface.stats";
+/// G1.30g: the link of a Wi-Fi port, and what its radio is.
+pub(crate) const WIFI_MONITOR: &str = "interface.wifi.monitor";
+pub(crate) const WIFI_RADIO: &str = "interface.wifi.radio";
+/// The hardware rarely changes: asked again this often.
+const HARDWARE_SECS: f64 = 10.0;
+/// A query unanswered this long is asked again (the reply was lost).
+const STALE_SECS: f64 = 15.0;
+/// Traffic samples kept (about two minutes at one per second).
+const HISTORY: usize = 120;
+/// Least size of the tab area, so switching tabs does not resize the
+/// window. G1.30g: the window resizes with the mouse, the tabs fill it.
+const BODY_HEIGHT: f32 = 380.0;
+const BODY_WIDTH: f32 = 470.0;
+const NOT_SUPPORTED: &str = "not supported";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Tab {
+    #[default]
+    General,
+    Ethernet,
+    Status,
+    Sfp,
+    /// G1.30g: the link of a Wi-Fi port (network, signal, channel, rates).
+    Wifi,
+    /// G1.30g: what the radio is and can do.
+    Radio,
+    Hardware,
+    Traffic,
+    Stats,
+}
+
+impl Tab {
+    pub(crate) const ALL: [Tab; 9] = [
+        Tab::General,
+        Tab::Ethernet,
+        Tab::Status,
+        Tab::Sfp,
+        Tab::Wifi,
+        Tab::Radio,
+        Tab::Hardware,
+        Tab::Traffic,
+        Tab::Stats,
+    ];
+
+    /// The tabs a port has (G1.30g): a Wi-Fi port has Wi-Fi and Radio and
+    /// no Ethernet, Status or SFP; SFP only on a port with a module cage
+    /// (the router read one, empty or not).
+    pub(crate) fn of(view: Option<&NicView>) -> Vec<Tab> {
+        let wifi = view.is_some_and(|v| v.wifi);
+        let cage = view
+            .and_then(NicView::monitor_value)
+            .and_then(|m| m.get("sfp"))
+            .is_some_and(|v| !v.is_null());
+        Tab::ALL
+            .into_iter()
+            .filter(|t| match t {
+                Tab::Ethernet | Tab::Status => !wifi,
+                Tab::Sfp => !wifi && cage,
+                Tab::Wifi | Tab::Radio => wifi,
+                _ => true,
+            })
+            .collect()
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Tab::General => "General",
+            Tab::Ethernet => "Ethernet",
+            Tab::Status => "Status",
+            Tab::Sfp => "SFP",
+            Tab::Wifi => "Wi-Fi",
+            Tab::Radio => "Radio",
+            Tab::Hardware => "Hardware",
+            Tab::Traffic => "Traffic",
+            Tab::Stats => "Statistics",
+        }
+    }
+}
+
+/// Which query a reply answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum What {
+    Monitor,
+    Hardware,
+    Stats,
+    /// G1.30g: `interface.wifi.monitor` and `interface.wifi.radio`.
+    WifiMonitor,
+    WifiRadio,
+    /// The operator's actions from the Ethernet tab (G1.20).
+    CableStart,
+    CablePoll,
+    Reset,
+}
+
+impl What {
+    /// The periodic queries of a port; a Wi-Fi port asks its link and
+    /// radio instead of the Ethernet monitor.
+    fn periodic(wifi: bool) -> &'static [What] {
+        if wifi {
+            &[What::WifiMonitor, What::WifiRadio, What::Hardware, What::Stats]
+        } else {
+            &[What::Monitor, What::Hardware, What::Stats]
+        }
+    }
+
+    fn command(self) -> &'static str {
+        match self {
+            What::Monitor => MONITOR,
+            What::Hardware => HARDWARE,
+            What::Stats => STATS,
+            What::WifiMonitor => WIFI_MONITOR,
+            What::WifiRadio => WIFI_RADIO,
+            What::CableStart => CABLE_TEST,
+            What::CablePoll => TASK_POLL,
+            What::Reset => SET,
+        }
+    }
+
+    fn every(self) -> f64 {
+        match self {
+            What::Hardware | What::WifiRadio => HARDWARE_SECS,
+            What::CablePoll => 0.5,
+            _ => REFRESH_SECS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NicReq {
+    pub name: String,
+    pub what: What,
+}
+
+/// Rates at one moment: seconds since the window opened, then rx/tx bits
+/// and packets per second.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Rate {
+    t: f64,
+    rx_bps: f64,
+    tx_bps: f64,
+    rx_pps: f64,
+    tx_pps: f64,
+}
+
+/// Live data of one open "Interface <name>" window (UI state only).
+#[derive(Default)]
+pub(crate) struct NicView {
+    monitor: Option<Result<Value, String>>,
+    hardware: Option<Result<Value, String>>,
+    stats: Option<Result<Value, String>>,
+    wifi_monitor: Option<Result<Value, String>>,
+    wifi_radio: Option<Result<Value, String>>,
+    /// G1.30g: a Wi-Fi port (set by the window from its interface row).
+    pub(crate) wifi: bool,
+    asked: BTreeMap<What, f64>,
+    pending: BTreeSet<What>,
+    opened: Option<f64>,
+    /// Last counters seen (time, rx/tx bytes, rx/tx packets), for rates.
+    last: Option<(f64, [u64; 4])>,
+    last_errors: Option<(u64, u64)>,
+    recent_errors: Option<(u64, u64)>,
+    rates: VecDeque<Rate>,
+    /// "Zero view": the value of each (group, counter) when pressed.
+    zero: BTreeMap<(String, String), u64>,
+    /// The Ethernet tab's edit buffer (G1.20).
+    pub(crate) eth: EthEdit,
+    pub(crate) cable: Cable,
+    /// "Reset to Port Defaults" was pressed.
+    pub(crate) reset: bool,
+    /// Why the last Ethernet-tab action failed.
+    pub(crate) action_error: Option<String>,
+    /// G1.29c: a USB recovery level picked, waiting for the confirmation.
+    pub(crate) usb_ask: Option<&'static str>,
+    /// G1.29c: a confirmed USB recovery level, sent by the dialog.
+    pub(crate) usb_go: Option<&'static str>,
+    /// G1.29c: until then the Hardware tab refreshes every second, so the
+    /// recovery's outcome shows as soon as it is known.
+    pub(crate) usb_fast_until: f64,
+    /// G1.29d: the watchdog switch flipped (sent by the dialog).
+    pub(crate) usb_watchdog_set: Option<bool>,
+    /// G1.29g: why the port is not CoreRouter's (`None`: it is in the
+    /// configuration). Set by the window from its interface row.
+    pub(crate) unmanaged: Option<String>,
+    /// G1.29g: "Adopt" pressed on a port outside the configuration (sent
+    /// by the dialog as `interface.ethernet.adopt`).
+    pub(crate) adopt_go: bool,
+    /// G1.30h: a button of the Wi-Fi tab (Set Country…, Scan…, Connect…),
+    /// acted on by the window.
+    pub(crate) wifi_go: Option<crate::iface_wifi::WifiGo>,
+}
+
+impl NicView {
+    pub(crate) fn live_rates(&self) -> Option<(f64, f64)> {
+        self.rates.back().map(|r| (r.rx_bps, r.tx_bps))
+    }
+
+    pub(crate) fn recent_errors(&self) -> Option<(u64, u64)> {
+        self.recent_errors
+    }
+    pub(crate) fn monitor_value(&self) -> Option<&Value> {
+        match &self.monitor {
+            Some(Ok(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// G1.30h: the router's Wi-Fi country on a Wi-Fi port whose monitor
+    /// answered, `Some(None)` when there is none (`None` otherwise).
+    pub(crate) fn wifi_country(&self) -> Option<Option<String>> {
+        if !self.wifi {
+            return None;
+        }
+        crate::iface_wifi::country(&self.wifi_monitor)
+    }
+
+    pub(crate) fn hardware_value(&self) -> Option<&Value> {
+        match &self.hardware {
+            Some(Ok(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// MAC, factory MAC and L2 MTU for the General tab.
+    pub(crate) fn general(&self) -> (Option<String>, Option<String>, Option<String>) {
+        let hw = match &self.hardware {
+            Some(Ok(v)) => v,
+            _ => return (None, None, None),
+        };
+        let s = |k: &str| hw.get(k).filter(|v| !v.is_null()).map(value_text);
+        (s("mac"), s("perm_mac"), s("max_mtu"))
+    }
+
+    fn stats_value(&self) -> Option<&Value> {
+        match &self.stats {
+            Some(Ok(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// A new `interface.stats` at UI time `now`: one traffic sample.
+    fn sample(&mut self, now: f64, stats: &Value) {
+        let get = |n: &str| counter(stats, "interface", n);
+        let errors = get("rx_errors").zip(get("tx_errors"));
+        self.recent_errors = errors.zip(self.last_errors).and_then(|((rx, tx), (old_rx, old_tx))| {
+            Some((rx.checked_sub(old_rx)?, tx.checked_sub(old_tx)?))
+        });
+        self.last_errors = errors;
+        let (Some(rb), Some(tb), Some(rp), Some(tp)) = (
+            get("rx_bytes"),
+            get("tx_bytes"),
+            get("rx_packets"),
+            get("tx_packets"),
+        ) else {
+            return;
+        };
+        let cur = [rb, tb, rp, tp];
+        let start = *self.opened.get_or_insert(now);
+        if let Some((t0, prev)) = self.last {
+            let dt = now - t0;
+            // A counter that went back (driver reload, wrap) gives no rate.
+            let back = cur.iter().zip(prev).any(|(c, p)| *c < p);
+            if dt > 0.05 && !back {
+                let per = |i: usize| {
+                    let d = cur.get(i).zip(prev.get(i)).map_or(0, |(c, p)| c - p);
+                    d as f64 / dt
+                };
+                self.rates.push_back(Rate {
+                    t: now - start,
+                    rx_bps: per(0) * 8.0,
+                    tx_bps: per(1) * 8.0,
+                    rx_pps: per(2),
+                    tx_pps: per(3),
+                });
+                while self.rates.len() > HISTORY {
+                    self.rates.pop_front();
+                }
+            }
+        }
+        self.last = Some((now, cur));
+    }
+
+    fn zero_view(&mut self) {
+        let Some(stats) = self.stats_value() else {
+            return;
+        };
+        self.zero = groups(stats)
+            .flat_map(|(g, cs)| cs.into_iter().map(move |(n, v)| ((g.clone(), n), v)))
+            .collect();
+    }
+}
+
+/// `value` of counter `name` in group `group` of an `interface.stats`.
+fn counter(stats: &Value, group: &str, name: &str) -> Option<u64> {
+    groups(stats)
+        .find(|(g, _)| g == group)?
+        .1
+        .into_iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v)
+}
+
+/// The groups of an `interface.stats`, as (name, [(counter, value)]).
+fn groups(stats: &Value) -> impl Iterator<Item = (String, Vec<(String, u64)>)> + '_ {
+    stats
+        .get("groups")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|g| {
+            let name = g.get("name").map(value_text).unwrap_or_default();
+            let counters = g
+                .get("counters")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|c| {
+                    Some((
+                        c.get("name").map(value_text)?,
+                        c.get("value").and_then(Value::as_u64)?,
+                    ))
+                })
+                .collect();
+            (name, counters)
+        })
+}
+
+impl CoreRouterUi {
+    /// Names of the open "Interface <name>" windows.
+    fn props_open(&self) -> Vec<String> {
+        self.dialogs
+            .iter()
+            .filter_map(|d| match &d.dialog {
+                crate::interfaces::Dialog::Props(p) => Some(p.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Ask what the open interface windows show, when due.
+    pub(crate) fn nic_tick(&mut self, now: f64) {
+        let mut open = self.props_open();
+        if self.open.contains(&crate::Win::Interfaces) {
+            let selected: Vec<_> = self.ifaces().into_iter()
+                .filter(|i| self.tables.interfaces.is_selected(&i.name))
+                .map(|i| i.name).collect();
+            if let [name] = selected.as_slice() && !open.contains(name) {
+                open.push(name.clone());
+            }
+        }
+        self.nic.retain(|name, _| open.contains(name));
+        // G1.30g: a Wi-Fi port asks for its link and radio, not Ethernet's.
+        let wifi: Vec<String> = self
+            .ifaces()
+            .into_iter()
+            .filter(|i| i.kind == "wifi")
+            .map(|i| i.name)
+            .collect();
+        for name in open {
+            let view = self.nic.entry(name.clone()).or_default();
+            view.wifi = wifi.contains(&name);
+            view.opened.get_or_insert(now);
+            // A reply lost with the link: ask again after a while.
+            let asked = view.asked.clone();
+            view.pending
+                .retain(|w| asked.get(w).is_some_and(|t| now - t < STALE_SECS));
+            let due: Vec<What> = What::periodic(view.wifi)
+                .iter()
+                .copied()
+                .filter(|w| !view.pending.contains(w))
+                .filter(|w| {
+                    let every = if *w == What::Hardware && now < view.usb_fast_until { 1.0 } else { w.every() };
+                    view.asked.get(w).is_none_or(|t| now - t >= every)
+                })
+                .collect();
+            let mut due = due;
+            if let Some(v) = self.nic.get(&name) {
+                due.extend(actions(v, now));
+            }
+            for what in due {
+                let params = match self.nic.get_mut(&name) {
+                    Some(v) => action_params(v, what, &name),
+                    None => json!({ "name": name }),
+                };
+                if let Err(why) = self.can.check(what.command()) {
+                    if let Some(v) = self.nic.get_mut(&name) {
+                        let slot = v.slot(what);
+                        *slot = Some(Err(why));
+                        v.asked.insert(what, now);
+                    }
+                    continue;
+                }
+                let req = self.backend.submit(
+                    "engine.execute",
+                    json!({"command": what.command(), "params": params}),
+                );
+                self.pending.insert(
+                    req,
+                    Pending::Nic(NicReq {
+                        name: name.clone(),
+                        what,
+                    }),
+                );
+                if let Some(v) = self.nic.get_mut(&name) {
+                    v.pending.insert(what);
+                    v.asked.insert(what, now);
+                }
+            }
+        }
+        self.nic_clock = now;
+    }
+
+    /// A reply to one of [`Self::nic_tick`]'s queries (not logged: the UI
+    /// asked it, not the operator).
+    pub(crate) fn nic_reply(&mut self, req: NicReq, result: Result<Value, String>) {
+        let now = self.nic_clock;
+        let Some(view) = self.nic.get_mut(&req.name) else {
+            return;
+        };
+        view.pending.remove(&req.what);
+        match (req.what, &result) {
+            (What::Stats, Ok(v)) => view.sample(now, v),
+            (What::Monitor, Ok(v)) => view.eth.seed_link(v),
+            (What::Hardware, Ok(v)) => view.eth.seed_offloads(v),
+            _ => {}
+        }
+        match req.what {
+            What::Monitor | What::Hardware | What::Stats | What::WifiMonitor | What::WifiRadio => {
+                *view.slot(req.what) = Some(result);
+            }
+            What::CableStart => {
+                view.cable = match result {
+                    Ok(v) => match v.get("id").and_then(Value::as_u64) {
+                        Some(id) => Cable::Running { id },
+                        None => Cable::Failed(format!("no task id in {v}")),
+                    },
+                    Err(e) => Cable::Failed(e),
+                };
+            }
+            What::CablePoll => match result {
+                Ok(v) if v.get("done") == Some(&Value::Bool(true)) => {
+                    view.cable = if v.get("state").and_then(Value::as_str) == Some("done") {
+                        Cable::Done(v.get("summary").cloned().unwrap_or(Value::Null))
+                    } else {
+                        let why = v.get("reason").map(value_text).unwrap_or_default();
+                        Cable::Failed(format!(
+                            "cable test {}: {why}",
+                            v.get("state").map(value_text).unwrap_or_default()
+                        ))
+                    };
+                }
+                Ok(_) => {}
+                Err(e) => view.cable = Cable::Failed(e),
+            },
+            What::Reset => match result {
+                Ok(_) => {
+                    // The form starts over from the router's next answers.
+                    view.eth = EthEdit::default();
+                    view.action_error = None;
+                    view.asked.remove(&What::Monitor);
+                    view.asked.remove(&What::Hardware);
+                }
+                Err(e) => view.action_error = Some(e),
+            },
+        }
+    }
+}
+
+/// The Ethernet tab's actions due now: a pressed button, a running test.
+fn actions(v: &NicView, now: f64) -> Vec<What> {
+    let mut out = Vec::new();
+    let free = |w: What| !v.pending.contains(&w);
+    if v.cable == Cable::Requested && free(What::CableStart) {
+        out.push(What::CableStart);
+    }
+    if matches!(v.cable, Cable::Running { .. })
+        && free(What::CablePoll)
+        && v.asked
+            .get(&What::CablePoll)
+            .is_none_or(|t| now - t >= What::CablePoll.every())
+    {
+        out.push(What::CablePoll);
+    }
+    if v.reset && free(What::Reset) {
+        out.push(What::Reset);
+    }
+    out
+}
+
+/// The params of `what` for window `name` (and the state change it means).
+fn action_params(v: &mut NicView, what: What, name: &str) -> Value {
+    match what {
+        What::CableStart => {
+            v.cable = Cable::Starting;
+            json!({ "name": name })
+        }
+        What::CablePoll => match v.cable {
+            Cable::Running { id } => json!({ "id": id }),
+            _ => json!({ "name": name }),
+        },
+        What::Reset => {
+            v.reset = false;
+            json!({ "name": name, "reset": true })
+        }
+        What::Monitor | What::Hardware | What::Stats | What::WifiMonitor | What::WifiRadio => {
+            json!({ "name": name })
+        }
+    }
+}
+
+impl NicView {
+    fn slot(&mut self, what: What) -> &mut Option<Result<Value, String>> {
+        match what {
+            What::Monitor => &mut self.monitor,
+            What::Hardware => &mut self.hardware,
+            What::WifiMonitor => &mut self.wifi_monitor,
+            What::WifiRadio => &mut self.wifi_radio,
+            What::Stats | What::CableStart | What::CablePoll | What::Reset => &mut self.stats,
+        }
+    }
+}
+
+/// The tab buttons on top of the window; SFP is coloured while a module
+/// reading is past its thresholds.
+pub(crate) fn tab_bar(ui: &mut Ui, tab: &mut Tab, view: Option<&NicView>) {
+    let alert = view.and_then(ethernet_tab::sfp_alert);
+    let tabs = Tab::of(view);
+    // A tab the port does not have (the SFP tab of a copper port once its
+    // monitor answered) goes back to General.
+    if !tabs.contains(tab) {
+        *tab = Tab::General;
+    }
+    ui.horizontal(|ui| {
+        for t in tabs {
+            let label = match (t, alert) {
+                (Tab::Sfp, Some(true)) => RichText::new("SFP !").color(ui.visuals().error_fg_color),
+                (Tab::Sfp, Some(false)) => RichText::new("SFP !").color(ui.visuals().warn_fg_color),
+                _ => RichText::new(t.label()),
+            };
+            ui.selectable_value(tab, t, label);
+        }
+    });
+    ui.separator();
+}
+
+/// Draw tab `tab` in a fixed-size scrolling area (switching tabs does not
+/// resize the window); `general` draws the General tab's fields.
+pub(crate) fn body(
+    ui: &mut Ui,
+    tab: Tab,
+    view: Option<&mut NicView>,
+    can: &Avail,
+    help: &mut Option<(&'static str, &'static str)>,
+    general: impl FnOnce(&mut Ui, Option<&NicView>, &mut Option<(&'static str, &'static str)>),
+) {
+    // G1.30g: at least the old fixed size; more when the window is resized.
+    let size = egui::vec2(
+        ui.available_width().max(BODY_WIDTH),
+        // The dialog keeps the footer's room out of it (`dialog::show`).
+        (ui.available_height() - ui.spacing().item_spacing.y).max(BODY_HEIGHT),
+    );
+    ui.set_min_width(size.x);
+    if tab == Tab::General {
+        // Editable fields: no scrolling, so they lay out on the first frame.
+        ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_min_size(size);
+            general(ui, view.as_deref(), help);
+        });
+        return;
+    }
+    ScrollArea::vertical()
+        .id_salt(("iface-tab", tab.label()))
+        .max_height(size.y)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.set_min_height(size.y);
+            let Some(view) = view else {
+                ui.weak("Loading…");
+                return;
+            };
+            match tab {
+                Tab::General => {}
+                Tab::Ethernet => ethernet_tab::ethernet(ui, view, can),
+                Tab::Status => status(ui, view),
+                Tab::Sfp => ethernet_tab::sfp(ui, view),
+                Tab::Wifi => {
+                    crate::iface_wifi::wifi(ui, &view.wifi_monitor, can, help, &mut view.wifi_go);
+                }
+                Tab::Radio => crate::iface_wifi::radio(ui, &view.wifi_radio, help),
+                Tab::Hardware => hardware(ui, view, can, help),
+                Tab::Traffic => traffic(ui, view),
+                Tab::Stats => statistics(ui, view),
+            }
+        });
+}
+
+/// The reply of a query, or why there is none yet: "Loading…", the error.
+pub(crate) fn loaded<'a>(ui: &mut Ui, r: &'a Option<Result<Value, String>>) -> Option<&'a Value> {
+    match r {
+        None => {
+            ui.weak("Loading…");
+            None
+        }
+        Some(Err(e)) => {
+            ui.colored_label(ui.visuals().error_fg_color, e);
+            None
+        }
+        Some(Ok(v)) => {
+            if v.get("available") == Some(&Value::Bool(false)) {
+                let why = v.get("reason").map(value_text).unwrap_or_default();
+                ui.label(
+                    RichText::new(format!("Not supported here: {why}"))
+                        .weak()
+                        .italics(),
+                );
+                ui.add_space(4.0);
+            }
+            Some(v)
+        }
+    }
+}
+
+/// One `label: value` row; a missing value reads "not supported".
+fn row(ui: &mut Ui, label: &str, value: Option<String>) {
+    ui.label(label);
+    match value {
+        Some(v) => ui.label(v),
+        None => ui.weak(NOT_SUPPORTED),
+    };
+    ui.end_row();
+}
+
+fn text(v: &Value, key: &str) -> Option<String> {
+    v.get(key).filter(|x| !x.is_null()).map(value_text)
+}
+
+fn yes_no(v: &Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(Value::as_bool)
+        .map(|b| if b { "yes" } else { "no" }.to_owned())
+}
+
+fn list(v: &Value, key: &str) -> Option<String> {
+    let items: Vec<String> = v.get(key)?.as_array()?.iter().map(value_text).collect();
+    (!items.is_empty()).then(|| items.join(", "))
+}
+
+/// `when` (unix seconds) relative to `now`: "5m12s ago".
+fn ago(v: &Value, key: &str) -> Option<String> {
+    let when = v.get(key)?.as_u64()?;
+    let now = v.get("now")?.as_u64()?;
+    Some(format!(
+        "{} ago",
+        crate::firewall::duration(now.saturating_sub(when))
+    ))
+}
+
+fn status(ui: &mut Ui, view: &NicView) {
+    let Some(m) = loaded(ui, &view.monitor) else {
+        return;
+    };
+    let ok = m.get("status").and_then(Value::as_str) == Some("link-ok");
+    Grid::new("iface-status")
+        .num_columns(2)
+        .spacing([12.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("Status");
+            // A state: a GREEN or RED chip (docs/ui-style.md).
+            let (hue, label) = if ok {
+                (&crate::chip::GREEN, "link-ok")
+            } else {
+                (&crate::chip::RED, "no-link")
+            };
+            crate::chip::chip(ui, label, hue.tone(ui.visuals()));
+            ui.end_row();
+            row(
+                ui,
+                "Rate",
+                text(m, "rate").or_else(|| ok.then(|| "unknown".into())),
+            );
+            row(ui, "Full Duplex", yes_no(m, "full_duplex"));
+            row(ui, "Auto Negotiation", text(m, "auto_negotiation"));
+            row(ui, "Port", text(m, "port"));
+            let mdix = match (text(m, "mdix"), text(m, "mdix_ctrl")) {
+                (Some(now), Some(ctrl)) => Some(format!("{now} ({ctrl})")),
+                (a, b) => a.or(b),
+            };
+            row(ui, "MDI/MDI-X", mdix);
+            row(ui, "Rx Flow Control", yes_no(m, "rx_flow_control"));
+            row(ui, "Tx Flow Control", yes_no(m, "tx_flow_control"));
+            row(
+                ui,
+                "Flow Control Autoneg",
+                yes_no(m, "flow_control_autoneg"),
+            );
+            row(ui, "Link Downs", text(m, "link_downs"));
+            row(ui, "Carrier Changes", text(m, "carrier_changes"));
+            // Times are known only since the router began watching (it
+            // has a clock); before that, "unknown".
+            let watching = m.get("watching_since").and_then(Value::as_u64);
+            let now = m.get("now").and_then(Value::as_u64);
+            let never = |what: &str| match (watching, now) {
+                (Some(s), Some(n)) => format!(
+                    "{what} watching began ({} ago)",
+                    crate::firewall::duration(n.saturating_sub(s))
+                ),
+                _ => "unknown (the router has no clock)".to_owned(),
+            };
+            let up = ago(m, "last_link_up_time")
+                .unwrap_or_else(|| never(if ok { "up since before" } else { "not since" }));
+            row(ui, "Last Link Up", Some(up));
+            let down = ago(m, "last_link_down_time").unwrap_or_else(|| never("not since"));
+            row(ui, "Last Link Down", Some(down));
+            if let Some(why) = text(m, "down_reason") {
+                row(ui, "Down Reason", Some(why));
+            }
+            for (label, key) in [
+                ("Supported", "supported_modes"),
+                ("Advertising", "advertising"),
+                ("Link Partner", "link_partner_advertising"),
+            ] {
+                ui.label(label);
+                match list(m, key) {
+                    Some(l) => ui.add(egui::Label::new(l).wrap()),
+                    None => ui.weak(NOT_SUPPORTED),
+                };
+                ui.end_row();
+            }
+        });
+    notes(ui, m);
+}
+
+fn hardware(ui: &mut Ui, view: &mut NicView, can: &Avail, help: &mut Option<(&'static str, &'static str)>) {
+    let Some(h) = loaded(ui, &view.hardware).cloned() else {
+        return;
+    };
+    let h = &h;
+    let named = |name: &str, id: &str| match (text(h, name), text(h, id)) {
+        (Some(n), Some(i)) => Some(format!("{n} [{i}]")),
+        (n, i) => n.or(i),
+    };
+    let pair = |a: &str, b: &str, sep: &str| match (text(h, a), text(h, b)) {
+        (Some(x), Some(y)) => Some(format!("{x}{sep}{y}")),
+        (x, y) => x.or(y),
+    };
+    // G1.29b: on a USB adapter, the USB part first (it is what limits it).
+    if let Some(u) = h.get("usb").filter(|u| u.is_object()) {
+        usb_section(ui, u, view, can, help);
+        usb_recovery(ui, u, view, can, help);
+        ui.add_space(6.0);
+    }
+    // G1.30g: a row the driver does not report is left out; their names go
+    // in one line under the table (a Wi-Fi card has no rings or channels).
+    let mut missing: Vec<&str> = Vec::new();
+    Grid::new("iface-hw")
+        .num_columns(2)
+        .spacing([12.0, 4.0])
+        .show(ui, |ui| {
+            let mut row = |ui: &mut Ui, label: &'static str, value: Option<String>| match value {
+                Some(v) => {
+                    ui.label(label);
+                    ui.label(v);
+                    ui.end_row();
+                }
+                None => missing.push(label),
+            };
+            row(ui, "Vendor", named("vendor", "vendor_id"));
+            row(ui, "Model", named("model", "device_id"));
+            let sub = match (
+                text(h, "subsystem"),
+                pair("subsystem_vendor_id", "subsystem_device_id", ":"),
+            ) {
+                (Some(n), Some(i)) => Some(format!("{n} [{i}]")),
+                (n, i) => n.or(i),
+            };
+            row(ui, "Subsystem", sub);
+            row(ui, "Driver", text(h, "driver"));
+            row(ui, "Driver Version", text(h, "driver_version"));
+            row(ui, "Firmware", text(h, "firmware"));
+            row(ui, "Serial", text(h, "serial"));
+            row(ui, "Bus", pair("bus", "bus_address", " "));
+            row(ui, "NUMA Node", text(h, "numa_node"));
+            row(ui, "Queues (rx/tx)", pair("rx_queues", "tx_queues", " / "));
+            row(
+                ui,
+                "Channels",
+                pair("combined_channels", "combined_channels_max", " of max "),
+            );
+            row(ui, "Rx Ring", pair("ring_rx", "ring_rx_max", " of max "));
+            row(ui, "Tx Ring", pair("ring_tx", "ring_tx_max", " of max "));
+            row(ui, "IRQs", list(h, "irqs"));
+            row(ui, "MTU range", pair("min_mtu", "max_mtu", " – "));
+        });
+
+    let offloads: Vec<&Value> = h
+        .get("offloads")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    if offloads.is_empty() {
+        missing.push("Offloads");
+    }
+    if !missing.is_empty() {
+        ui.add_space(4.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("Not reported by this driver: {}", missing.join(", ")))
+                    .weak()
+                    .italics(),
+            )
+            .wrap(),
+        );
+    }
+    if !offloads.is_empty() {
+        ui.add_space(6.0);
+        ui.label(RichText::new("Offloads").strong());
+        Grid::new("iface-offloads")
+            .num_columns(3)
+            .spacing([12.0, 2.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for o in offloads {
+                    let on = o.get("active").and_then(Value::as_bool).unwrap_or(false);
+                    let fixed = o.get("fixed").and_then(Value::as_bool).unwrap_or(false);
+                    ui.label(o.get("name").map(value_text).unwrap_or_default())
+                        .on_hover_text(o.get("feature").map(value_text).unwrap_or_default());
+                    ui.label(if on { "on" } else { "off" });
+                    if fixed {
+                        ui.weak("fixed");
+                    } else {
+                        ui.label("");
+                    }
+                    ui.end_row();
+                }
+            });
+    }
+    notes(ui, h);
+}
+
+/// One row of the USB section: the label, its ⓘ (explanation `key`) and
+/// the value.
+fn usb_row(
+    ui: &mut Ui,
+    label: &'static str,
+    key: &'static str,
+    value: Option<String>,
+    help: &mut Option<(&'static str, &'static str)>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        if crate::help::info_button(ui, ui.scope_id().with(key), "What is this?").clicked() {
+            *help = Some((key, label));
+        }
+    });
+    match value {
+        Some(v) => ui.label(v),
+        None => ui.weak(NOT_SUPPORTED),
+    };
+    ui.end_row();
+}
+
+/// G1.29b: the USB device behind a USB adapter: the bus rate it
+/// negotiated (green, or amber when the port is slower than the adapter),
+/// what it could do, the port, power and the kernel's transmit timeouts.
+fn usb_section(
+    ui: &mut Ui,
+    u: &Value,
+    view: &mut NicView,
+    can: &Avail,
+    help: &mut Option<(&'static str, &'static str)>,
+) {
+    let slow = u.get("slow_port").and_then(Value::as_bool).unwrap_or(false);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("USB").strong());
+        if crate::help::info_button(ui, ui.scope_id().with("iface_usb.section"), "USB adapters in production").clicked() {
+            *help = Some(("iface_usb.section", "USB"));
+        }
+    });
+    Grid::new("iface-usb")
+        .num_columns(2)
+        .spacing([12.0, 4.0])
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("USB Speed");
+                if crate::help::info_button(ui, ui.scope_id().with("iface_usb.speed"), "What is this?").clicked() {
+                    *help = Some(("iface_usb.speed", "USB Speed"));
+                }
+            });
+            match text(u, "speed") {
+                Some(sp) => {
+                    let (label, kind) = if slow {
+                        (format!("{sp} · slow port"), crate::chip::Kind::Amber)
+                    } else {
+                        (sp, crate::chip::Kind::Green)
+                    };
+                    let r = crate::chip::chip(ui, &label, kind.tone(ui.visuals()));
+                    if let Some(a) = text(u, "alert") {
+                        r.on_hover_text(a);
+                    }
+                }
+                None => {
+                    ui.weak(NOT_SUPPORTED);
+                }
+            }
+            ui.end_row();
+            usb_row(ui, "Adapter Supports", "iface_usb.adapter", text(u, "adapter"), help);
+            let port = text(u, "port").map(|p| {
+                let kind = match u.get("port_max_mbps").and_then(Value::as_u64) {
+                    Some(m) if m >= 5000 => " · USB 3 port",
+                    Some(_) => " · USB 2 port",
+                    None => "",
+                };
+                format!("{p}{kind}")
+            });
+            usb_row(ui, "Port", "iface_usb.port", port, help);
+            let id = match (text(u, "vendor_id"), text(u, "product_id")) {
+                (Some(v), Some(p)) => Some(match text(u, "revision") {
+                    Some(r) => format!("{v}:{p} rev {r}"),
+                    None => format!("{v}:{p}"),
+                }),
+                _ => None,
+            };
+            usb_row(ui, "USB ID", "iface_usb.id", id, help);
+            usb_row(ui, "USB Version", "iface_usb.version", text(u, "version"), help);
+            usb_row(ui, "Max Power", "iface_usb.power", text(u, "max_power_ma").map(|m| format!("{m} mA")), help);
+            let saving = match (u.get("autosuspend").and_then(Value::as_bool), text(u, "lpm")) {
+                (None, None) => None,
+                (a, l) => Some(format!(
+                    "autosuspend {}{}",
+                    match a {
+                        Some(true) => "on",
+                        Some(false) => "off",
+                        None => "?",
+                    },
+                    l.map(|l| format!(" · LPM {}", l.replacen('0', "off", 1)))
+                        .unwrap_or_default()
+                )),
+            };
+            usb_row(ui, "Power Saving", "iface_usb.power_saving", saving, help);
+            usb_row(ui, "Tx Timeouts", "iface_usb.tx_timeouts", text(u, "tx_timeouts"), help);
+            usb_row(ui, "Over-current", "iface_usb.over_current", text(u, "over_current"), help);
+            if let Some(t) = recoveries_text(u) {
+                usb_row(ui, "Recoveries", "iface_usb.recoveries", Some(t), help);
+            }
+            if let Some(w) = u.get("watchdog").filter(|w| w.is_object()) {
+                ui.horizontal(|ui| {
+                    ui.label("Watchdog");
+                    if crate::help::info_button(ui, ui.scope_id().with("iface_usb.watchdog"), "What is this?").clicked() {
+                        *help = Some(("iface_usb.watchdog", "Watchdog"));
+                    }
+                });
+                ui.horizontal(|ui| usb_watchdog(ui, w, view, can));
+                ui.end_row();
+            }
+        });
+    if let Some(a) = text(u, "alert").filter(|_| slow) {
+        ui.add_space(4.0);
+        ui.add(egui::Label::new(RichText::new(a).color(crate::chip::AMBER.tone(ui.visuals()).ink)).wrap());
+    }
+}
+
+/// The three recovery levels: (command level, button, what it costs).
+const USB_LEVELS: [(&str, &str, &str); 3] = [
+    ("link", "Down/Up", "The interface goes down and up: about 1 s without link."),
+    ("driver", "Restart Driver", "The driver lets go of the adapter and probes it again: about 3 s without link; its configuration goes back on by itself."),
+    ("port", "Reset USB Port", "The USB port is powered off and on (or the device re-authorized): about 5 s without link; its configuration goes back on by itself."),
+];
+
+/// G1.29c: the recoveries so far and the three buttons, each confirmed
+/// inline before it is sent (by the dialog, through `usb_go`).
+fn usb_recovery(
+    ui: &mut Ui,
+    u: &Value,
+    view: &mut NicView,
+    can: &Avail,
+    help: &mut Option<(&'static str, &'static str)>,
+) {
+    let r = u.get("recoveries").cloned().unwrap_or(Value::Null);
+    let running = r.get("running").is_some_and(|v| !v.is_null());
+    let allowed = can.check("interface.usb.reset");
+    // Asking: the question takes the buttons' place (the tab has a fixed
+    // height; a line more would push Confirm out of sight).
+    if let Some(level) = view.usb_ask {
+        let (_, label, cost) = USB_LEVELS.iter().find(|(l, _, _)| *l == level).copied().unwrap_or(("", "", ""));
+        ui.add(egui::Label::new(RichText::new(format!("{label}? {cost}")).color(crate::chip::AMBER.tone(ui.visuals()).ink)).wrap());
+        ui.horizontal(|ui| {
+            if ui.button("Confirm").clicked() {
+                view.usb_go = Some(level);
+                view.usb_ask = None;
+            }
+            if ui.button("Cancel").clicked() {
+                view.usb_ask = None;
+            }
+        });
+        return;
+    }
+    // G1.29g: a port outside the configuration (a USB adapter that came
+    // back with the kernel's name, one not adopted yet): the router does
+    // not reset what it does not manage; adopting it is one click.
+    let allowed = match &view.unmanaged {
+        Some(_) => Err("Not in the configuration: adopt the port first".to_owned()),
+        None => allowed,
+    };
+    ui.horizontal(|ui| {
+        for (level, label, cost) in USB_LEVELS {
+            let enabled = allowed.is_ok() && !running && view.usb_ask.is_none();
+            let resp = ui.add_enabled(enabled, egui::Button::new(label));
+            let resp = match &allowed {
+                Err(why) => resp.on_disabled_hover_text(why.as_str()),
+                Ok(()) => resp.on_hover_text(cost),
+            };
+            if resp.clicked() {
+                view.usb_ask = Some(level);
+            }
+        }
+        if crate::help::info_button(ui, ui.scope_id().with("iface_usb.recovery"), "Recovering a stalled USB adapter").clicked() {
+            *help = Some(("iface_usb.recovery", "USB recovery"));
+        }
+    });
+    if let Some(why) = &view.unmanaged {
+        let adopt = can.check("interface.ethernet.adopt");
+        ui.horizontal(|ui| {
+            ui.add(egui::Label::new(RichText::new(capitalized(why)).color(crate::chip::AMBER.tone(ui.visuals()).ink)).wrap());
+            if crate::help::info_button(ui, ui.scope_id().with("iface_usb.unmanaged"), "Why the recovery is off").clicked() {
+                *help = Some(("iface_usb.unmanaged", "Port not in the configuration"));
+            }
+        });
+        let r = ui.add_enabled(adopt.is_ok() && !view.adopt_go, egui::Button::new("Adopt"));
+        let r = match &adopt {
+            Err(why) => r.on_disabled_hover_text(why.as_str()),
+            Ok(()) => r.on_hover_text("Add this port to the configuration (interface.ethernet.adopt)"),
+        };
+        if r.clicked() {
+            view.adopt_go = true;
+        }
+    }
+}
+
+/// "not in the configuration (…)" as a sentence.
+fn capitalized(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
+/// G1.29d: the watchdog's state and its per-adapter switch.
+fn usb_watchdog(ui: &mut Ui, w: &Value, view: &mut NicView, can: &Avail) {
+    let enabled = w.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    let state = text_of(w, "state").unwrap_or_default();
+    let stalls = w.get("stalls").and_then(Value::as_u64).unwrap_or(0);
+    let mut line = format!("{state} · {stalls} stall(s)");
+    if let Some(last) = w.get("last_action").filter(|l| l.is_object()) {
+        line = format!(
+            "{line} · last: {} {} s ago ({})",
+            text_of(last, "level").unwrap_or_default(),
+            last.get("secs_ago").and_then(Value::as_u64).unwrap_or(0),
+            text_of(last, "why").unwrap_or_default()
+        );
+    }
+    let kind = match state.as_str() {
+        "gave-up" => Some(crate::chip::Kind::Red),
+        "cooldown" => Some(crate::chip::Kind::Amber),
+        _ => None,
+    };
+    {
+        let allowed = match &view.unmanaged {
+            Some(_) => Err("Not in the configuration: adopt the port first".to_owned()),
+            None => can.check("interface.usb.watchdog.set"),
+        };
+        let mut on = view.usb_watchdog_set.unwrap_or(enabled);
+        let r = ui.add_enabled(allowed.is_ok(), egui::Checkbox::new(&mut on, "enabled"));
+        let r = match &allowed {
+            Err(why) => r.on_disabled_hover_text(why.as_str()),
+            Ok(()) => r,
+        };
+        if r.changed() {
+            view.usb_watchdog_set = Some(on);
+        }
+        match kind {
+            Some(k) => {
+                crate::chip::chip(ui, &line, k.tone(ui.visuals()));
+            }
+            None => {
+                ui.weak(line);
+            }
+        }
+    }
+}
+
+/// "1 link · 0 driver · 0 port · last: link, came back".
+fn recoveries_text(u: &Value) -> Option<String> {
+    let r = u.get("recoveries").filter(|r| r.is_object())?;
+    let n = |k: &str| r.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let text = format!("{} link · {} driver · {} port", n("link"), n("driver"), n("port"));
+    Some(if let Some(running) = text_of(r, "running") {
+        format!("{text} · {running} reset running…")
+    } else if let Some(e) = text_of(r, "last_error") {
+        format!("{text} · last failed: {e}")
+    } else if let Some(last) = text_of(r, "last_level") {
+        let back = r.get("last_back").and_then(Value::as_bool) == Some(true);
+        format!("{text} · last: {last}, {}", if back { "came back" } else { "did not come back" })
+    } else {
+        text
+    })
+}
+
+fn text_of(v: &Value, key: &str) -> Option<String> {
+    v.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+/// Driver notes (what was not supported and why), folded.
+pub(crate) fn notes(ui: &mut Ui, v: &Value) {
+    let Some(notes) = v
+        .get("notes")
+        .and_then(Value::as_array)
+        .filter(|n| !n.is_empty())
+    else {
+        return;
+    };
+    ui.add_space(6.0);
+    CollapsingHeader::new(format!("Notes ({})", notes.len()))
+        .id_salt("iface-notes")
+        .show(ui, |ui| {
+            for n in notes {
+                ui.weak(value_text(n));
+            }
+        });
+}
+
+/// 1_500_000 → "1.5 Mbps".
+pub(crate) fn bits(v: f64) -> String {
+    scaled(v, "bps")
+}
+
+pub(crate) fn packets(v: f64) -> String {
+    scaled(v, "pps")
+}
+
+fn scaled(v: f64, unit: &str) -> String {
+    let (n, p) = if v >= 1e9 {
+        (v / 1e9, "G")
+    } else if v >= 1e6 {
+        (v / 1e6, "M")
+    } else if v >= 1e3 {
+        (v / 1e3, "k")
+    } else {
+        return format!("{v:.0} {unit}");
+    };
+    format!("{n:.1} {p}{unit}")
+}
+
+/// Transmit and receive colours, as in WinBox's traffic graphs.
+const TX: egui::Color32 = egui::Color32::from_rgb(220, 60, 60);
+const RX: egui::Color32 = egui::Color32::from_rgb(40, 120, 220);
+
+fn traffic(ui: &mut Ui, view: &NicView) {
+    let last = view.rates.back();
+    Grid::new("iface-rates")
+        .num_columns(4)
+        .spacing([12.0, 2.0])
+        .show(ui, |ui| {
+            ui.label("Tx");
+            ui.label(RichText::new(last.map_or("-".into(), |r| bits(r.tx_bps))).color(TX));
+            ui.label(RichText::new(last.map_or("-".into(), |r| packets(r.tx_pps))).color(TX));
+            ui.end_row();
+            ui.label("Rx");
+            ui.label(RichText::new(last.map_or("-".into(), |r| bits(r.rx_bps))).color(RX));
+            ui.label(RichText::new(last.map_or("-".into(), |r| packets(r.rx_pps))).color(RX));
+            ui.end_row();
+        });
+    if view.rates.is_empty() {
+        ui.weak("Collecting samples…");
+    }
+    let series =
+        |f: fn(&Rate) -> f64| -> Vec<[f64; 2]> { view.rates.iter().map(|r| [r.t, f(r)]).collect() };
+    let chart = |ui: &mut Ui, id: &str, unit: &str, tx: Vec<[f64; 2]>, rx: Vec<[f64; 2]>| {
+        let fmt: fn(f64) -> String = if unit == "bps" { bits } else { packets };
+        Plot::new(id)
+            .height(130.0)
+            .legend(Legend::default())
+            .include_y(0.0)
+            .x_axis_label("s")
+            .y_axis_formatter(move |m, _| fmt(m.value))
+            .allow_scroll(false)
+            .allow_drag(false)
+            .allow_zoom(false)
+            .show(ui, |p| {
+                p.line(
+                    Line::new(format!("Tx {unit}"), PlotPoints::from(tx))
+                        .color(TX)
+                        .width(1.5),
+                );
+                p.line(
+                    Line::new(format!("Rx {unit}"), PlotPoints::from(rx))
+                        .color(RX)
+                        .width(1.5),
+                );
+            });
+    };
+    chart(
+        ui,
+        "iface-bps",
+        "bps",
+        series(|r| r.tx_bps),
+        series(|r| r.rx_bps),
+    );
+    chart(
+        ui,
+        "iface-pps",
+        "pps",
+        series(|r| r.tx_pps),
+        series(|r| r.rx_pps),
+    );
+}
+
+/// `rx_crc_errors` → `rx-crc-errors` (RouterOS spelling).
+fn kebab(s: &str) -> String {
+    s.replace('_', "-")
+}
+
+fn statistics(ui: &mut Ui, view: &mut NicView) {
+    let mut zero = false;
+    let mut unzero = false;
+    ui.horizontal(|ui| {
+        zero = ui
+            .button("Zero view")
+            .on_hover_text(
+                "Count from now in this window only; the router's counters are not reset",
+            )
+            .clicked();
+        if !view.zero.is_empty() {
+            unzero = ui.button("Show totals").clicked();
+            ui.weak("counting from \"Zero view\"");
+        }
+    });
+    if zero {
+        view.zero_view();
+    }
+    if unzero {
+        view.zero.clear();
+    }
+    let Some(st) = loaded(ui, &view.stats) else {
+        return;
+    };
+    for (i, (group, counters)) in groups(st).enumerate() {
+        CollapsingHeader::new(RichText::new(group.clone()).strong())
+            .id_salt(("iface-stats", i))
+            .default_open(true)
+            .show(ui, |ui| {
+                Grid::new(("iface-stats-grid", i))
+                    .num_columns(2)
+                    .spacing([24.0, 2.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for (name, value) in counters {
+                            let base = view
+                                .zero
+                                .get(&(group.clone(), name.clone()))
+                                .copied()
+                                .unwrap_or(0);
+                            ui.label(kebab(&name));
+                            // Right-aligned in a fixed column, so digits line up.
+                            let h = ui.text_style_height(&egui::TextStyle::Monospace);
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(150.0, h), egui::Sense::hover());
+                            ui.painter().text(
+                                rect.right_center(),
+                                egui::Align2::RIGHT_CENTER,
+                                value.saturating_sub(base).to_string(),
+                                egui::TextStyle::Monospace.resolve(ui.style()),
+                                ui.visuals().text_color(),
+                            );
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+    notes(ui, st);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats(rx: u64, tx: u64) -> Value {
+        json!({"groups": [{"name": "interface", "counters": [
+            {"name": "rx_bytes", "value": rx},
+            {"name": "tx_bytes", "value": tx},
+            {"name": "rx_packets", "value": rx / 100},
+            {"name": "tx_packets", "value": tx / 100},
+        ]}]})
+    }
+
+    #[test]
+    fn rates_come_from_counter_deltas() {
+        let mut v = NicView::default();
+        v.sample(10.0, &stats(0, 0));
+        assert!(v.rates.is_empty(), "one sample has no rate");
+        v.sample(12.0, &stats(2_000, 1_000));
+        let r = v.rates.back().copied().unwrap();
+        assert_eq!(r.t, 2.0);
+        assert_eq!(r.rx_bps, 8_000.0);
+        assert_eq!(r.tx_bps, 4_000.0);
+        assert_eq!(r.rx_pps, 10.0);
+        // Counters that went back (reset) give no sample, then resume.
+        v.sample(13.0, &stats(10, 10));
+        assert_eq!(v.rates.len(), 1);
+        v.sample(14.0, &stats(110, 10));
+        assert_eq!(v.rates.back().unwrap().rx_bps, 800.0);
+        for i in 0..300u32 {
+            v.sample(15.0 + f64::from(i), &stats(200 + u64::from(i), 10));
+        }
+        assert_eq!(v.rates.len(), HISTORY);
+    }
+
+    #[test]
+    fn error_deltas_require_two_samples_and_do_not_survive_a_reset() {
+        let sample = |rx, tx| json!({"groups":[{"name":"interface", "counters":[
+            {"name":"rx_errors", "value":rx}, {"name":"tx_errors", "value":tx}
+        ]}]});
+        let mut v = NicView::default();
+        v.sample(1.0, &sample(10, 20));
+        assert_eq!(v.recent_errors(), None);
+        v.sample(2.0, &sample(12, 21));
+        assert_eq!(v.recent_errors(), Some((2, 1)));
+        v.sample(3.0, &sample(0, 0));
+        assert_eq!(v.recent_errors(), None);
+        v.sample(4.0, &stats(0, 0));
+        assert_eq!(v.recent_errors(), None);
+    }
+
+    #[test]
+    fn zero_view_moves_only_the_baseline() {
+        let mut v = NicView {
+            stats: Some(Ok(stats(5_000, 7_000))),
+            ..NicView::default()
+        };
+        v.zero_view();
+        assert_eq!(
+            v.zero.get(&("interface".into(), "rx_bytes".into())),
+            Some(&5_000)
+        );
+        assert_eq!(
+            counter(v.stats_value().unwrap(), "interface", "rx_bytes"),
+            Some(5_000)
+        );
+    }
+
+    #[test]
+    fn units_scale() {
+        assert_eq!(bits(999.0), "999 bps");
+        assert_eq!(bits(1_500_000.0), "1.5 Mbps");
+        assert_eq!(bits(10e9), "10.0 Gbps");
+        assert_eq!(packets(2_500.0), "2.5 kpps");
+        assert_eq!(kebab("rx_crc_errors"), "rx-crc-errors");
+    }
+}

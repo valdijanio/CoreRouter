@@ -1,0 +1,27 @@
+[package]
+name = "corerouter-proto-ha"
+description = "L2: BNG high availability (G4.3h): the session sync protocol, the active/standby role machine with fencing and the access-side hello, pure (no I/O)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+# The access-side hello is authenticated (HMAC-SHA-256 under the pair's
+# shared secret): the workspace's RustCrypto digest 0.11 line, as proto-pppoe.
+hmac.workspace = true
+sha2 = { version = "0.11.0", default-features = false }
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "ha"
+harness = false
+
+[lints]
+workspace = true

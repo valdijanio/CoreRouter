@@ -1,0 +1,52 @@
+//! Portuguese labels and explanations of System › Reboot and Shutdown (G1.6qh), sorted by key.
+
+/// Labels: (English, Portuguese).
+pub(super) const LABELS: &[(&str, &str)] = &[
+    ("Asking the router…", "Perguntando ao roteador…"),
+    ("BGP sessions", "sessões BGP"),
+    ("Booting undoes the changes made since it started.", "O boot desfaz as mudanças feitas desde que ele começou."),
+    ("Cancel", "Cancelar"),
+    ("Cancel the erase", "Cancelar a limpeza"),
+    ("Checks", "Verificações"),
+    ("Clear what is above, or tick Force", "Resolva o que está acima ou marque Forçar"),
+    ("Commit", "Confirmar (commit)"),
+    ("Connection", "Conexão"),
+    ("Done. The checks follow.", "Feito. As verificações já acompanham."),
+    ("Force", "Forçar"),
+    ("It comes back only when someone turns it on; the connection then returns on its own.", "Só volta quando alguém o ligar; depois disso, a conexão volta sozinha."),
+    ("It counts this power-off as the power button. Cancel it first.", "Ela contaria este desligamento como o botão de energia. Cancele antes."),
+    ("It did not come back yet. Look at the console: it shows the address and the port.", "Ainda não voltou. Olhe o console: ele mostra o endereço e a porta."),
+    ("Leave Safe Mode, keep changes", "Sair do Safe Mode, manter mudanças"),
+    ("OSPF neighbors", "vizinhos OSPF"),
+    ("PPP sessions", "sessões PPP"),
+    ("Reboot", "Reiniciar"),
+    ("Safe Mode is off and nothing is waiting for a commit.", "O Safe Mode está desligado e nada espera commit."),
+    ("Safe Mode on", "Safe Mode ligado"),
+    ("Shutdown", "Desligar"),
+    ("The changes not committed are lost.", "As mudanças sem commit se perdem."),
+    ("The connection comes back on its own after the boot: this window waits for it.", "A conexão volta sozinha depois do boot: esta janela espera por ela."),
+    ("The connection comes back on its own; this window says when.", "A conexão volta sozinha; esta janela avisa quando."),
+    ("The router answered again.", "O roteador respondeu de novo."),
+    ("The router stays off until someone turns it on. The connection then comes back on its own.", "O roteador fica desligado até alguém ligá-lo. Depois disso, a conexão volta sozinha."),
+    ("Traffic through the router stops until the boot ends, and every connection to it drops.", "O tráfego pelo roteador para até o fim do boot, e toda conexão com ele cai."),
+    ("Traffic through the router stops, and every connection to it drops, until someone turns it on.", "O tráfego pelo roteador para, e toda conexão com ele cai, até alguém ligá-lo."),
+    ("Version", "Versão"),
+    ("What goes down", "O que vai cair"),
+    ("back", "voltou"),
+    ("disk erase waiting", "limpeza de disco pendente"),
+    ("do it anyway, losing what is above", "fazer mesmo assim, perdendo o que está acima"),
+    ("not available", "indisponível"),
+    ("pending changes", "mudanças pendentes"),
+    ("powering off", "desligando"),
+    ("rebooting", "reiniciando"),
+];
+
+/// Explanations: (key, Markdown).
+pub(super) const HELP: &[(&str, &str)] = &[
+    ("menu.reboot", "## O que faz\nReinicia o roteador de forma limpa: o daemon grava o checkpoint, a suíte de roteamento para, o `/config` é sincronizado e desmontado, e a máquina sobe de novo. É o `/system reboot` do RouterOS.\n\n## Cuidado\nTodo o tráfego pelo roteador para até o fim do boot. Um reboot durante o Safe Mode desfaz as mudanças feitas desde que ele começou."),
+    ("menu.shutdown", "## O que faz\nPara o roteador de forma limpa e desliga a máquina. É o `/system shutdown` do RouterOS.\n\n## Cuidado\nEle só volta **à mão**: alguém precisa apertar o botão de energia ou usar o acesso fora de banda. Não use num roteador que você não alcança fisicamente."),
+    ("power.checks", "## Verificações\n\nO que o roteador recusa sem **Forçar**. **Safe Mode ligado**: o boot parte da configuração do momento em que o Safe Mode começou, o que desfaz tudo o que veio depois. **Mudanças pendentes**: uma transação sem commit nunca é gravada. Cada linha tem um botão que resolve. **Limpeza de disco pendente** não pode ser forçada: o PID 1 tomaria este desligamento pelo botão de energia da confirmação do instalador."),
+    ("power.comes_back", "## Conexão\n\nA GUI, o terminal e o navegador tentam de novo sozinhos. Depois de um reboot, esta janela mostra quando o roteador responde; não há nada a fazer. Se o endereço veio por DHCP, ele pode mudar: o console mostra o atual."),
+    ("power.force", "## Forçar\n\nReinicia ou desliga mesmo com Safe Mode ligado ou mudanças sem commit, perdendo-as. Prefira os botões acima, que mantêm o trabalho. O journal e o log registram o comando, com o resultado dizendo o que se perdeu."),
+    ("power.impact", "## O que vai cair\n\nTudo o que passa pelo roteador e toda conexão com ele. As contagens são o que está de pé agora: assinantes PPP, sessões BGP estabelecidas e vizinhos OSPF. Eles voltam sozinhos depois do boot, no tempo dos seus temporizadores."),
+];

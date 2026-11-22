@@ -1,0 +1,24 @@
+[package]
+name = "corerouter-proto-flow"
+description = "L2: flow export (G4.4b): IPFIX (RFC 7011) and NetFlow v9 (RFC 3954) messages, NAT events (RFC 8158), and the meter that turns conntrack events into flow records"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+corerouter-hal.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "flow_codec"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CoreRouter <noreply@corerouter>
+Date: Fri, 13 Nov 2026 00:00:00 -0300
+Subject: [PATCH 6/6] tests: ospfd with many interfaces configured in a batch
+
+r1 has 300 dummy interfaces with "ip ospf area 0", configured by the
+"vtysh -f" that loads frr.conf. Check that each stub route of r1 is
+directly attached to the interface that owns the prefix (the interface of
+a router-LSA link is found by its position, ospf_if_lookup_by_lsa_pos()),
+that the router-LSA has all the links and that r2 learns every prefix;
+then the same after a batch takes OSPF off 100 of the interfaces (the
+positions of the links that remain change) and another puts it back,
+neither of them originating one router-LSA instance per interface.
+
+Without "ospfd: one router-LSA per configuration batch", the last check
+fails: each of those batches takes the sequence number 100 further.
+---
+ .../ospf_many_interfaces/__init__.py          |   0
+ .../ospf_many_interfaces/r2/frr.conf          |  10 +
+ .../test_ospf_many_interfaces.py              | 190 ++++++++++++++++++
+ 3 files changed, 200 insertions(+)
+ create mode 100644 tests/topotests/ospf_many_interfaces/__init__.py
+ create mode 100644 tests/topotests/ospf_many_interfaces/r2/frr.conf
+ create mode 100644 tests/topotests/ospf_many_interfaces/test_ospf_many_interfaces.py
+
+diff --git a/tests/topotests/ospf_many_interfaces/__init__.py b/tests/topotests/ospf_many_interfaces/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/topotests/ospf_many_interfaces/r2/frr.conf b/tests/topotests/ospf_many_interfaces/r2/frr.conf
+new file mode 100644
+index 0000000000..23519a0af7
+--- /dev/null
++++ b/tests/topotests/ospf_many_interfaces/r2/frr.conf
+@@ -0,0 +1,10 @@
++interface r2-eth0
++ ip address 10.0.0.2/24
++ ip ospf area 0
++ ip ospf hello-interval 2
++ ip ospf dead-interval 8
++exit
++!
++router ospf
++ ospf router-id 10.254.254.2
++exit
+diff --git a/tests/topotests/ospf_many_interfaces/test_ospf_many_interfaces.py b/tests/topotests/ospf_many_interfaces/test_ospf_many_interfaces.py
+new file mode 100644
+index 0000000000..900b386d02
+--- /dev/null
++++ b/tests/topotests/ospf_many_interfaces/test_ospf_many_interfaces.py
+@@ -0,0 +1,190 @@
++#!/usr/bin/env python
++# SPDX-License-Identifier: ISC
++
++"""
++test_ospf_many_interfaces.py: OSPF on many interfaces of one router.
++
++r1 has N dummy interfaces, each with a /30 and "ip ospf area 0" (point to
++point, no neighbor: one stub link each in its router-LSA), configured by
++the "vtysh -f" that loads frr.conf, a configuration batch. Checks that:
++
++- each stub route of r1 is directly attached to the interface that owns
++  the prefix (the interface of a router-LSA link is found by its position
++  in the LSA, ospf_if_lookup_by_lsa_pos());
++- the router-LSA describes every link;
++- r2 learns every prefix;
++- the same holds after a batch takes OSPF off part of the interfaces (the
++  positions of the links that remain change) and another puts it back, and
++  neither batch originated one router-LSA instance per interface.
++"""
++
++import os
++import sys
++import pytest
++
++CWD = os.path.dirname(os.path.realpath(__file__))
++sys.path.append(os.path.join(CWD, "../"))
++
++# pylint: disable=C0413
++from lib import topotest
++from lib.topogen import Topogen, get_topogen
++
++pytestmark = [pytest.mark.ospfd]
++
++# Interfaces with OSPF on r1, besides r1-eth0.
++N = 300
++# OSPF is taken off and put back on these in the runtime batches.
++OFF = range(1, 101)
++
++
++def stub(i):
++    "The /30 of dummy interface i (1-based): its prefix and r1's address."
++    a, b = (i - 1) // 64, ((i - 1) % 64) * 4
++    return f"10.100.{a}.{b}/30", f"10.100.{a}.{b + 1}/30"
++
++
++def setup_module(mod):
++    topodef = {"s1": ("r1", "r2")}
++    tgen = Topogen(topodef, mod.__name__)
++    tgen.start_topology()
++
++    r1 = tgen.gears["r1"]
++    # The interfaces exist before the configuration is read, as on a router
++    # that boots with them.
++    batch = os.path.join(tgen.logdir, "r1-dummies.batch")
++    with open(batch, "w") as f:
++        for i in range(1, N + 1):
++            f.write(f"link add dum{i} type dummy\n")
++            f.write(f"link set dum{i} up\n")
++            f.write(f"address add {stub(i)[1]} dev dum{i}\n")
++    r1.cmd_raises(f"ip -batch {batch}")
++
++    conf = os.path.join(tgen.logdir, "r1-frr.conf")
++    with open(conf, "w") as f:
++        f.write("interface r1-eth0\n ip address 10.0.0.1/24\n ip ospf area 0\n")
++        f.write(" ip ospf hello-interval 2\n ip ospf dead-interval 8\nexit\n")
++        for i in range(1, N + 1):
++            f.write(f"interface dum{i}\n ip ospf network point-to-point\n")
++            f.write(" ip ospf area 0\nexit\n")
++        f.write("router ospf\n ospf router-id 10.254.254.1\nexit\n")
++    r1.load_frr_config(conf)
++    tgen.gears["r2"].load_frr_config(os.path.join(CWD, "r2/frr.conf"))
++
++    tgen.start_router()
++
++
++def teardown_module():
++    get_topogen().stop_topology()
++
++
++def r1_batch(name, enable):
++    "Type a configuration batch on r1 that puts OSPF on (or off) OFF."
++    tgen = get_topogen()
++    path = os.path.join(tgen.logdir, name)
++    no = "" if enable else "no "
++    with open(path, "w") as f:
++        for i in OFF:
++            f.write(f"interface dum{i}\n {no}ip ospf area 0\nexit\n")
++    tgen.gears["r1"].cmd_raises(f"vtysh -f {path}")
++
++
++def expect_ospf(enabled):
++    "r1's stub routes, its router-LSA and r2's routes for the enabled set."
++    tgen = get_topogen()
++    r1, r2 = tgen.gears["r1"], tgen.gears["r2"]
++
++    def r1_routes():
++        out = r1.vtysh_cmd("show ip ospf route json", isjson=True)
++        expected = {
++            stub(i)[0]: {
++                "routeType": "N",
++                "nexthops": [{"ip": " ", "directlyAttachedTo": f"dum{i}"}],
++            }
++            for i in enabled
++        }
++        gone = [stub(i)[0] for i in range(1, N + 1) if i not in enabled]
++        stale = [p for p in gone if p in out]
++        if stale:
++            return f"r1 still has OSPF routes for {stale[:5]}"
++        return topotest.json_cmp(out, expected)
++
++    _, result = topotest.run_and_expect(r1_routes, None, count=60, wait=1)
++    assert result is None, f"r1's stub routes: {result}"
++
++    def r1_lsa():
++        out = r1.vtysh_cmd(
++            "show ip ospf database router self-originate json", isjson=True
++        )
++        lsas = out["routerLinkStates"]["areas"]["0.0.0.0"]
++        # the stubs and the link to the network with r2
++        return topotest.json_cmp(lsas, [{"numOfLinks": len(enabled) + 1}])
++
++    _, result = topotest.run_and_expect(r1_lsa, None, count=60, wait=1)
++    assert result is None, f"r1's router-LSA: {result}"
++
++    def r2_routes():
++        out = r2.vtysh_cmd("show ip route ospf json", isjson=True)
++        missing = [stub(i)[0] for i in enabled if stub(i)[0] not in out]
++        return f"r2 is missing {missing[:5]}" if missing else None
++
++    _, result = topotest.run_and_expect(r2_routes, None, count=60, wait=1)
++    assert result is None, result
++
++
++def test_ospf_neighbor_convergence():
++    tgen = get_topogen()
++    if tgen.routers_have_failure():
++        pytest.skip(tgen.errors)
++
++    tgen.gears["r1"].expect_ospfv2_neighbor("10.254.254.2")
++    tgen.gears["r2"].expect_ospfv2_neighbor("10.254.254.1")
++
++
++def r1_seq():
++    "The sequence number of r1's router-LSA."
++    out = (
++        get_topogen()
++        .gears["r1"]
++        .vtysh_cmd("show ip ospf database router self-originate json", isjson=True)
++    )
++    return int(out["routerLinkStates"]["areas"]["0.0.0.0"][0]["lsaSeqNumber"], 16)
++
++
++def test_ospf_many_interfaces():
++    tgen = get_topogen()
++    if tgen.routers_have_failure():
++        pytest.skip(tgen.errors)
++
++    expect_ospf(set(range(1, N + 1)))
++
++
++def test_ospf_many_interfaces_batch_off_on():
++    tgen = get_topogen()
++    if tgen.routers_have_failure():
++        pytest.skip(tgen.errors)
++
++    # Each batch changes len(OFF) interfaces; one new router-LSA instance per
++    # interface would advance the sequence number by about as many.
++    seq = r1_seq()
++    r1_batch("r1-off.conf", False)
++    expect_ospf(set(range(1, N + 1)) - set(OFF))
++    assert r1_seq() - seq < len(OFF) // 4, f"router-LSA {seq:#x} -> {r1_seq():#x}"
++
++    seq = r1_seq()
++    r1_batch("r1-on.conf", True)
++    expect_ospf(set(range(1, N + 1)))
++    assert r1_seq() - seq < len(OFF) // 4, f"router-LSA {seq:#x} -> {r1_seq():#x}"
++
++
++def test_memory_leak():
++    "Run the memory leak test and report results."
++    tgen = get_topogen()
++    if not tgen.is_memleak_enabled():
++        pytest.skip("Memory leak test/report is disabled")
++
++    tgen.report_memory_leaks()
++
++
++if __name__ == "__main__":
++    args = ["-s"] + sys.argv[1:]
++    sys.exit(pytest.main(args))

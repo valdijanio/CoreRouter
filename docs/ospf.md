@@ -1,0 +1,552 @@
+# OSPF (G3.4)
+
+OSPFv2 (IPv4) e OSPFv3 (IPv6) no modelo do RouterOS v7. O FRR (`ospfd`, `ospf6d`) roda o
+protocolo e o SPF; o CoreRouter é dono do modelo de configuração, da validação, do render para o
+FRR (só a diferença, com rollback: `hal-frr`), das checagens antes do commit e da leitura do
+estado (vizinhos, LSDB, rotas, topologia: G3.4b).
+
+## Comandos
+
+| Menu RouterOS | Comandos | O que é |
+|---|---|---|
+| `/routing ospf instance` | `routing.ospf.instance.{add,set,remove,list}` | Uma por versão e VRF: `router-id`, `redistribute` (connected, static, bgp, kernel), `out_filter_chain` (a chain do `/routing filter`, G3.2b), `originate_default`, `subscriber_pools` |
+| `/routing ospf area` | `routing.ospf.area.{add,set,remove,list}` | `area_id`, `type` (default, stub, nssa), `no_summaries`, `default_cost`, `nssa_translate` |
+| `/routing ospf area range` | `routing.ospf.area.range.{add,set,remove,list}` | Sumarização num ABR (RFC 2328 §12.4.3): `advertise`, `cost` |
+| `/routing ospf interface-template` | `routing.ospf.interface-template.{add,set,remove,move,list,check}` | Casa interfaces por nome, por interface list ou por rede; o primeiro template que casa ganha |
+| `/routing ospf static-neighbor` | `routing.ospf.static-neighbor.{add,remove,list}` | Vizinhos de link NBMA (RFC 2328 §9.5.1) |
+| (nosso) | `routing.ospf.keychain.{add,set,remove,list}`, `routing.ospf.keychain.key.{add,set,remove}` | Várias chaves com janela de envio e de aceite (RFC 8177) |
+| (nosso) | `routing.ospf.impact` | O que o commit faz às adjacências ("estes vizinhos vão cair") |
+
+Exemplo (dois roteadores no backbone, uplink /30 com sha256):
+
+```sh
+corerouter-cli run routing.ospf.instance.add '{"name":"v2","router_id":"10.255.0.1","redistribute":"connected"}'
+corerouter-cli run routing.ospf.area.add '{"name":"backbone","instance":"v2","area_id":"0.0.0.0"}'
+corerouter-cli run routing.ospf.interface-template.add '{"area":"backbone","networks":"10.0.0.0/16","type":"ptp","auth_key":"segredo"}'
+corerouter-cli run routing.ospf.interface-template.check '{"area":"backbone","networks":"192.168.0.0/16"}'
+```
+
+`redistribute=static` anuncia as rotas estáticas do CoreRouter (`/ip route`). Como o backend
+linux as instala direto no kernel (`proto static`), o `zebra` as vê como rotas *kernel*: o render
+usa `redistribute kernel` com um route-map que recusa toda rota kernel que não seja uma estática
+configurada (`CR-O2-<instância>-NOTSTATIC`), antes da chain do `out_filter_chain`. Com `kernel`
+pedido também, tudo do kernel vai (e as estáticas com ele). Uma estática nova chega ao vizinho no
+mesmo commit (~0,12 s, **medido**, G3.9fe).
+
+## Como funciona
+
+- **Templates → interfaces** (`proto_ospf::bind`): para cada interface habilitada, o primeiro
+  template (na ordem da lista) de cada instância que a nomeia, nomeia uma interface list dela ou
+  tem uma rede com um endereço dela. Cada casamento vira o contexto `interface X` do FRR com os
+  valores do template (`ip ospf area`, `ip ospf cost`, …). O FRR não mistura `network … area` com
+  `ip ospf area`; ficamos com o por interface, que serve às duas versões.
+- **Chaves**: toda chave cripto vai numa key chain do FRR `CR-…` (o `ospfd` do FRR 10 autentica
+  HMAC-SHA por key chain, RFC 5709; o `ospf6d` faz o trailer da RFC 7166 do mesmo jeito). A chave
+  própria de um template é a chain `CR-T<id>`; a `/routing ospf keychain K` é `CR-K-K`. As
+  janelas viram `send-lifetime`/`accept-lifetime` no horário local da caixa: o CoreRouter roda em
+  UTC. `simple` usa `ip ospf authentication-key` (8 bytes, RFC 2328 §D.3). O FRR 10.7.1 de
+  deb.frrouting.org só aceita `md5` e `hmac-sha-256` na key chain (sem OpenSSL); sha1, sha384 e
+  sha512 são recusados no commit com a mensagem do FRR (G3.9: antes o commit passava e o `ospfd`
+  ficava sem a chain).
+- **Selagem**: `auth_key` e `key_string` chegam em claro e são selados na hora (AES-256-GCM, a
+  mesma das senhas PPPoE e da chave TCP MD5 do BGP). Config, histórico, journal, MCP e respostas
+  mostram a caixa ou `key_set: true`; só o render abre. O `hal-frr` mascara `key-string`,
+  `authentication-key`, `md5 …` e `key …` em erro e log; as duas chaves estão em
+  `auth::SECRET_KEYS`.
+- **BFD**: o campo `bfd` do template é o nome de um perfil da G3.6 (`/routing bfd profile`, ou os de
+  fábrica `default` e `fast`), conferido no commit, e vira `ip ospf bfd` + `ip ospf bfd profile P`
+  (`ipv6 ospf6 …` no v3): o `ospfd` pede a sessão ao `bfdd`, que a entrega ao nosso motor (data
+  plane, G3.6b), e a adjacência cai com ela. Até a G3.9 essas linhas não eram geradas e o OSPF
+  esperava o dead interval num corte silencioso (achado contra o RouterOS, `docs/producao-core.md`).
+- **Redistribuição**: um route-map por instância e tipo (`CR-O2-<inst>-connected`): primeiro os
+  pools de assinantes, depois a `out_filter_chain` compilada pelo compilador da G3.2b com as
+  listas renomeadas `CR-O2-…`/`CR-O3-…` (o BGP continua com as dele no `bgpd`). Uma chain que testa
+  ou muda algo que rota OSPF não tem (AS path, communities, local-pref) é recusada no commit.
+- **Pools de assinantes (G4.3ce, parte OSPF)**: com `subscriber_pools`, os `/ip pool` dos perfis
+  PPPoE (`remote-address`) e dos servidores DHCP IPoE são cobertos pelo menor prefixo de cada
+  faixa e agregados; as rotas dos assinantes (PPP: conectada /32; IPoE: kernel) entram pelo
+  prefix-list e o `summary-address` do `ospfd` as junta num LSA tipo 5 por prefixo. O núcleo vê
+  uma rota por pool, e ela sai sozinha quando o último assinante do pool cai.
+- **Contextos no FRR** (`hal_frr::render::OWNED`): `router ospf`, `router ospf6`, `interface`
+  (só as linhas `ip ospf …` no `ospfd` e `ipv6 ospf6 …` no `ospf6d`, `render::CHILDREN`: a
+  `description` do zebra que o `ospfd` imprime não é nossa), `key chain CR-`, `ip prefix-list
+  CR-O2-`, `ipv6 prefix-list CR-O3-`, `route-map CR-O2-`/`CR-O3-`.
+- **Forma canônica**: o render escreve como o FRR 10.7.1 imprime de volta (lido dos
+  `config_write_*` do `ospfd/ospf_vty.c`, `ospf6d/ospf6_interface.c`, `lib/keychain_cli.c`): área
+  pontuada, `%e` com espaço nas datas, valores do `ospf6d` iguais ao padrão omitidos (ele não os
+  imprime). Linha que o FRR imprime diferente aparece no log como "leftover".
+
+## Estado (G3.4b)
+
+| Comando | O que é |
+|---|---|
+| `routing.ospf.neighbor.list` | `/routing ospf neighbor`: estado (RFC 2328 §10.1), papel, selo "Full · DR", tempo no estado, BFD |
+| `routing.ospf.interface.list` | As interfaces como o daemon as roda (tipo, estado, MTU, hello/dead, DR/BDR), com o template; busca por nome ou área e página de até 1 000 com o `total` (G3.4n) |
+| `routing.ospf.lsa.list` | `/routing ospf lsa`, paginado, por tipo, área e originador |
+| `routing.ospf.route.list` | As rotas que o `ospfd` calculou (intra, inter-área, E1/E2), paginadas (200 por padrão, até 1 000) com o `total` e a contagem por tipo (G3.4n) |
+| `routing.ospf.topology` | Roteadores e redes de trânsito da LSDB com posição (layout por forças) e custo de cada ponta; com `known` (o `token` do mapa que o chamador tem) responde `unchanged` sem refazer nem reenviar o mapa (G3.4n) |
+| `routing.ospf.path` | "Por que esse caminho?": o caminho mais curto até um endereço ou router id, custo somado salto a salto, conferido com a rota do daemon (`agrees`) |
+| `routing.ospf.neighbor.diagnose` | Por que um vizinho não chega a Full, com a seção da RFC |
+
+- **Vizinhos e interfaces** vêm em toda leitura do serviço `frr` (a cada 2 s, fora do lock), por
+  uma conexão vty mantida entre as leituras (G3.4n).
+- **A LSDB e as rotas** são lidas sob demanda, fora do lock: o comando pede (`crate::ospf_state`),
+  a thread do FRR lê em fluxo direto do socket (`show ip ospf database <tipo> json`) para a tabela
+  compacta `Lsdb` (uma linha fixa por LSA, links num vetor só) e devolve; a primeira resposta pode
+  vir `pending`. O resultado vale 10 s e é compartilhado (`Arc`) por páginas, topologia e caminho;
+  o layout fica guardado enquanto a mesma cópia da LSDB estiver em uso.
+- **Diagnose** (`proto_ospf::diagnose`): com o estado do daemon, explica ExStart/Exchange parado
+  (MTU, §10.6), Init (os Hellos chegam mas não nos listam: autenticação, área, timers, máscara,
+  §10.5), 2-Way normal em link multiacesso (§10.4), interface passiva ou caída. Com pacotes
+  capturados (`proto_ospf::packet`, parser do cabeçalho, Hello e DD de v2 e v3, RFC 2328 §A.3 e
+  RFC 5340 §A.3, com proptest) compara campo a campo: área, hello/dead, máscara, bits E/N do tipo
+  de área (RFC 3101 §2.3), tipo e key id de autenticação (§D.3), MTU do DD, router id duplicado
+  (§C.1) e tipo de rede diferente.
+- **Laboratório virtual**: sem FRR, vizinhos, LSDB e rotas são uma amostra feita a partir da
+  config (`proto_ospf::sample`: um vizinho por interface ativa, um anel de roteadores e uma LAN de
+  trânsito atrás de cada um, a segunda interface parada em ExStart), com `source: "virtual lab
+  sample"`.
+- **Teste com FRR real**: `cargo xtask vm-lab run -- scripts/frr-ospf-live.sh` (dois FRRs em
+  namespaces: Full com HMAC-SHA-256, rotação da chave sem queda, MTU diferente parado antes de
+  Full e explicado pelo Diagnose, LSDB e topologia lidas). Rodado em 2026-10-27 com o FRR 10.7.1,
+  **medido**: commit em 17,5 ms, Full com HMAC-SHA-256 em 0,3 s, a chave 2 entra sem queda (a
+  adjacência segue Full por 20 s, 2,5 intervalos de dead), o vizinho com MTU 1400 para em
+  Exchange e o Diagnose aponta o RFC 2328 §10.6; LSDB com 2 LSAs e 5 ligações. A rodada achou dois
+  defeitos, corrigidos: o Diagnose escrevia "for 0 min" abaixo de um minuto (agora segundos) e um
+  template ponto a ponto **passivo** (a loopback) não tinha o /32 anunciado pelo `ospfd`, que o
+  toma como enlace não numerado — o render agora escreve `broadcast` nesse caso (achado no teste
+  do LDP, `docs/mpls.md`).
+- **Limites**: VRF diferente de `main` e a LSDB do OSPFv3 ainda não são lidas (G3.4h).
+
+## Janela Routing › OSPF (G3.4c)
+
+Abas **Neighbors** (estado em selo "Full · DR", área em selo colorido pelo id, uptime, BFD; a linha
+selecionada mostra o detalhe e o botão **Diagnose**), **Instances**, **Areas**, **Interface
+Templates** e **Key Chains** (o padrão de lista G0.24: barra + − ✓ ✗ 💬, modal com a prévia do
+engine: interfaces que entram, tipo e `passive` sugeridos, autenticação ausente, adjacências que
+caem com Safe Mode), **LSDB** (paginada por tipo), **Routes** (selecionar uma rota mostra "Por que
+esse caminho?") e **Topology** (o mapa desenhado da LSDB; clique num roteador para o caminho; arraste
+e role para mover e aproximar). A resposta da topologia vira vetores planos ao chegar: 500
+roteadores pintam e tesselam em 3,2 ms por quadro em debug (**medido**). Neighbors, LSDB e Routes
+montam as linhas quando a resposta chega, não a cada quadro; Routes vem em páginas de 200, e a
+busca de prefixo roda no roteador, sobre todas as rotas (G3.4n).
+
+## Segment Routing (G3.4f)
+
+SR-MPLS sobre OSPFv2 (RFC 8665): cada roteador anuncia um **índice** para a sua loopback e todos
+encaminham até ela com o rótulo **início do SRGB + índice**, sem LDP. O `ospfd` do FRR calcula e
+instala os rótulos; o CoreRouter é dono do modelo, da validação, do render, da prévia e da leitura
+do banco SR. O RouterOS não tem SR: os nomes são os do IOS-XR e do FRR.
+
+| Comando | O que é |
+|---|---|
+| `routing.ospf.segment-routing.set` / `unset` | Liga o SR na instância OSPFv2 em VRF main: `srgb` (padrão 16000–23999), `srlb` (15000–15999), `node_msd`, `auto_sid` (SID automático para cada /32 de loopback anunciada; o índice é o último octeto quando está livre aqui e na rede) |
+| `routing.ospf.segment-routing.check` | A prévia do modal: prefixos que passam a ir por rótulo, MTU curto (+4 bytes por rótulo), interfaces sem entrada MPLS, SIDs em conflito, o bloco do LDP, e o risco com Safe Mode |
+| `routing.ospf.segment-routing.database` | O banco SR do `ospfd` (`show ip ospf database segment-routing json`): roteadores com SRGB/SRLB/MSD, SIDs com rótulo de entrada e de saída, conflitos |
+| `routing.ospf.prefix-sid.{add,set,remove,list,check}` | Os prefix SIDs deste roteador (`behavior`: `php`, `no-php`, `explicit-null`, RFC 8665 §5) |
+
+- **Por instância, não por área:** o FRR roda um banco SR por processo `ospfd`, só na VRF
+  default, para todas as áreas da instância (`ospfd/ospf_sr.c`). O IOS-XR e o Junos também ligam
+  SR no processo IGP.
+- **Render** (`proto_ospf::sr::router_lines`), na forma que o `ospfd` imprime: `capability opaque`,
+  `router-info area`, `segment-routing global-block A B [local-block C D]` (só fora do padrão, com
+  a regra de impressão do FRR), `segment-routing on`, `node-msd`, `segment-routing prefix P index
+  N [no-php-flag|explicit-null]`. Os blocos são digitados antes do `on` (com o SR desligado o FRR
+  só guarda os valores) e os prefixos depois. Ao desligar, o diff do `hal-frr` remove os prefixos
+  antes do `segment-routing on`, e este antes de `router-info` e `capability opaque`
+  (`conf::delete_late`): na ordem inversa o FRR recusa (`OSPF SR is not turned on`). Índice novo de
+  um prefixo é digitado por cima (o FRR atualiza no lugar).
+- **Rótulos fora do LDP:** o zebra recusa um SRGB dentro de um `dynamic-block` estreitado
+  (`zebra/label_manager.c`), e com o bloco inteiro o LDP poderia pegar um rótulo do SRGB antes.
+  Com a faixa padrão do `/mpls settings`, o render manda `mpls label dynamic-block 24000 1048575`
+  (o maior trecho livre fora dos blocos do SR, como o IOS-XR); com uma faixa do operador, o commit
+  recusa sobreposição e bloco acima do fim da tabela de rótulos do kernel. LSP estático dentro do
+  SRGB/SRLB também é recusado.
+- **Validação:** instância v2 em VRF main, blocos em 16–1048575 com ≥ 16 rótulos sem sobreposição
+  (`sr_range_is_valid` do FRR), MSD 1–16, SID num /32 de interface loopback anunciada por um
+  template da instância, índice abaixo do tamanho do SRGB e único, um SID por prefixo.
+- **SID duplicado antes do commit:** `prefix-sid.add`/`set` e a prévia comparam o índice com o
+  banco SR lido: um índice que outro roteador usa para outro prefixo é recusado (RFC 8402 §3.2;
+  `force: true` aceita, para anycast). A aba mostra os conflitos da rede (um índice, dois
+  prefixos; um prefixo, dois índices; RFC 8660 §2.5 deixa ao operador).
+- **Convivência com o LDP (RFC 8661):** os dois rodam juntos; os rótulos de entrada não colidem
+  (blocos separados). Para o push na entrada (FTN), o zebra do FRR 10.7.1 fica com o rótulo que
+  chegou primeiro (`ftn_update_nexthop`): a preferência SR/LDP configurável não é garantida pelo
+  FRR e ficou para a G3.4j.
+- **Sem módulos MPLS no kernel:** os comandos que ligam ficam indisponíveis com o motivo
+  (`mpls_router`), como o resto do `/mpls`.
+- **Loopback na `lo` (G3.4i):** o `ospfd` só aceita prefix SID numa interface IFF_LOOPBACK (a
+  `lo` do Linux); a loopback do CoreRouter é um `dummy` no Linux e o FRR a recusa (medido na VM:
+  `interface crsr-lo is not a Loopback`). Por isso a loopback chamada `lo` é a `lo` do sistema
+  (G3.4i, como a `lo` do RouterOS v7 e a `interfaces loopback lo` do VyOS): o hal-linux só põe e
+  tira os endereços do CoreRouter nela, nunca a cria, apaga, desliga ou muda o MTU, e nunca toca no
+  127.0.0.1/8 nem no ::1 (o engine recusa esses endereços na `lo`). Desativar a `lo` tira os nossos
+  endereços sem derrubar a `lo` do kernel. A prévia avisa quando o prefix SID está numa loopback
+  com outro nome e há FRR de verdade. O render não escreve tipo de rede na `lo` (o `ospfd` recusa:
+  "This is a loopback interface").
+
+### Janela Routing › OSPF › Segment Routing
+
+Selo de estado (SR ligado, desativado, desligado, indisponível), instância, SRGB, SRLB e o bloco do
+LDP; **Ligar…/Configurar…/Desligar…** abrem o modal com a prévia (o OK espera o "entendi" ou o Safe
+Mode); três vistas: **Este roteador** (lista G0.24 dos prefix SIDs: + − ✓ ✗, rótulo, anunciado),
+**SIDs da rede** (prefixo, roteador, índice, rótulo, entrada, saída `implicit-null (pop)`,
+interface, próximo salto) e **Roteadores SR** (SRGB em âmbar quando difere do nosso).
+
+### Teste com FRR real
+
+`cargo xtask vm-lab run -- scripts/frr-sr-live.sh sr`: um quadrado de quatro roteadores (R1 é o
+FRR da VM com o nosso render, R2..R4 em namespaces), FRR 10.7.1, **medido** em 2026-10-28: commit
+em 15,4 ms; o banco SR com os quatro roteadores lido 5,8 s depois; rota do kernel para 10.255.0.3
+com `encap mpls 16003` e ping por ela; R2 faz PHP do 16003 para R3; SRGB/SRLB movidos e
+`explicit-null` em 1,9 ms, de novo canônicos; SID numa interface dummy recusado pelo `ospfd`; SR
+desligado em 1,4 ms sem sobra no `running-config`.
+
+## Fast Reroute: TI-LFA (G3.4d)
+
+TI-LFA (RFC 9855, antes `draft-ietf-rtgwg-segment-routing-ti-lfa`): para cada rota, o `ospfd` do
+FRR calcula um caminho de reserva sem laço com uma pilha de rótulos SR e o zebra o deixa
+instalado junto da rota. Liga-se no SR: `routing.ospf.segment-routing.set '{"ti_lfa":"link"}'`
+(`link`, `node` ou `off`), render `fast-reroute ti-lfa [node-protection]`.
+
+| Comando | O que é |
+|---|---|
+| `routing.ospf.fast-reroute.list` | Cobertura (% de rotas com reserva, tipo de proteção), cada rota com o próximo salto principal e o de reserva com a pilha de rótulos, e as rotas sem proteção com o motivo |
+| `routing.ospf.fast-reroute.simulate` | "Simular corte de link": para um vizinho (router id, endereço ou interface; `node` para o roteador inteiro), o reserva de cada rota afetada, os segmentos, os rótulos e o caminho depois da convergência, sem tocar a rede |
+
+- **Por instância:** o `ospfd` liga TI-LFA no processo inteiro (`ospf_vty.c`); "por área ou
+  template" não existe no FRR 10.7.1 (o IS-IS do FRR tem por nível e interface).
+- **De onde vêm os reservas:** o `ospfd` não os mostra; o zebra sim (`show ip route ospf json`,
+  `backupNexthops`/`backupIndex`). O `hal-frr` lê esse JSON do socket em linhas tipadas
+  (`fast_reroute::read`, sem árvore JSON) junto com a LSDB, fora do lock.
+- **Por que uma rota está sem proteção:** calculado como o `ospfd` faz (P-space, Q-space,
+  caminho pós-convergência, nó PQ ou nós P e Q; `netsim::tilfa`, uma reprodução simplificada de
+  `ospf_ti_lfa.c`): "único caminho" (o enlace é ponte), conectada, fora da área, "o destino é o
+  próximo salto" (proteção de nó), ou "existe reparo mas nada foi instalado" (roteador sem SID, ou
+  o FRR deixou de fora).
+- **Laboratório virtual:** sem FRR, os reservas são os calculados (selo `lab`); a amostra ganhou
+  um roteador central que une os anéis quando há dois vizinhos ou mais.
+- **Seguro por padrão:** a prévia do SR soma 2 rótulos de reparo no MTU com TI-LFA, avisa da
+  proteção de nó (a rota até o próprio vizinho fica sem reserva) e de templates sem BFD (um corte
+  silencioso esperaria o dead interval).
+
+### Janela Routing › OSPF › Fast Reroute
+
+Selo "TI-LFA · link/node" e a cobertura em selo (verde ≥ 95%, âmbar ≥ 70%, vermelho abaixo, como o
+`show isis fast-reroute summary` da Cisco), **TI-LFA…** (o modal do SR), e três vistas: **Rotas**
+(principal, reserva e pilha de rótulos em selos, como o next-hop de reserva do Junos), **Sem
+proteção** (prefixo e motivo) e **Simular corte de link** (vizinho, "o roteador cai", resultado
+com reserva instalado ou calculado, segmentos, rótulos e o caminho depois da convergência, e as
+rotas perdidas com o motivo).
+
+### Teste com FRR real e perda medida
+
+`cargo xtask vm-lab run -- scripts/frr-sr-live.sh frr` (o mesmo quadrado da G3.4f; R2 com BFD
+3 × 10 ms para R1). FRR 10.7.1, **medido** em 2026-10-28:
+
+- o reserva de 10.255.0.3 aparece 5,8 s depois do commit: via R4, rótulos `15003/16003` (a
+  adjacência R1→R4 e o SID de R3); leitura de LSDB + SR + rotas do zebra em 11 ms;
+- **fidelidade** do `netsim::tilfa` contra o `ospfd`: as rotas em que os dois têm reserva saem
+  pelo mesmo vizinho; o `ospfd` deixou sem reserva 10.255.0.2/32, cujo reparo pede nó P ≠ nó Q
+  (duas adjacências) — a aba mostra a rota como sem proteção, com esse motivo;
+- **perda real** (datagramas UDP do iperf3 do `proto-iperf`, 2 000/s, de R1 para a loopback de R3,
+  cortando R1–R2):
+
+  | Corte | Com TI-LFA | Sem TI-LFA |
+  |---|---|---|
+  | perda de portadora (o vizinho derruba a interface) | 12,5 ms | 13,5 ms |
+  | silencioso (netem 100%), detectado pelo BFD 3 × 10 ms | 59,5 ms | 51,0 ms |
+
+  Segunda rodada: 13,5 × 13,5 ms (portadora) e 50,5 × 50,5 ms (silencioso).
+
+  **O TI-LFA do FRR não encurta a perda no Linux:** o kernel não tem nexthop de reserva
+  pré-programado; o zebra guarda o reserva, mas a troca espera o `ospfd` (aviso do BFD, SPF,
+  instalação). O corte silencioso fica em ~50–60 ms, acima da meta de 50 ms; o tempo é o do BFD
+  (30 ms) mais o SPF e a instalação. Trocar no plano de dados é a G3.4k.
+- **O `ospfd` 10.7.1 abortava com TI-LFA** (G3.4l, `docs/frr-tilfa-abort.md`):
+  `ospf_spf.c:1269: get_reverse_distance(): assertion (w_lsa && w_lsa->data) failed`, no SPF
+  reverso do Q-space, quando a router-LSA de um vizinho sai do LSDB (troca de router-id ou
+  remoção do `router ospf` nele) enquanto a LSA de outro roteador ainda o cita: o custo reverso
+  era lido antes da checagem "LSA ausente" da RFC 2328 §16.1 (2b). O FRR da imagem leva a
+  correção (`os/patches/frr/`); o `.deb` da VM do laboratório não. O TI-LFA segue desligado em
+  produção pela G3.4k.
+
+## Proteção da LSDB (G3.4r)
+
+O `ospfd` aceitava LSAs sem limite: uma redistribuição errada em outro roteador (a tabela BGP
+inteira no OSPF) levava cada roteador da área à falta de memória. Cada LSA custa ~1,5 KiB no
+`ospfd` e cada rota ~0,6 KiB no `zebra` (**medido**). No laboratório, 175 436 LSAs chegaram em
+1 s e 192 721 em 5,2 s, com o `ospfd` em 293 MiB e o `zebra` em 120 MiB.
+
+**Como funciona.** Os parâmetros `max_lsa*` de `routing.ospf.instance.add/set` viram o
+`max-lsa` do `ospfd`. Como o FRR não tem limite, ele vem de um patch na imagem
+(`os/patches/frr/0007-ospfd-max-lsa.patch`), o mesmo enviado ao FRR
+(`docs/frr-upstream/ospfd-max-lsa/`). O modelo é o do Cisco `max-lsa` e do Junos
+`database-protection`:
+
+- só contam as LSAs de **outros** roteadores;
+- avisa no limiar (`max_lsa_threshold`, 75 %);
+- acima do limite, a instância cai por `max_lsa_ignore_time` (300 s): todas as interfaces
+  descem, as adjacências caem e a LSDB aprendida sai;
+- depois volta; após `max_lsa_ignore_count` (5) períodos seguidos, fica isolada até
+  `routing.ospf.instance.clear-lsdb-protection`;
+- `max_lsa_reset_time` (600 s) de pé zera a contagem;
+- `max_lsa_warning_only` só avisa.
+
+A checagem roda dentro do `ospfd`, num evento depois do pacote que trouxe a LSA: O(áreas) por
+passagem do laço. Por isso segura o pico. Uma leitura nossa a cada 2 s chegaria depois da
+enxurrada inteira.
+
+Cair inteira, em vez de recusar só as LSAs acima do limite (como faz o PR
+[FRRouting/frr#23897](https://github.com/FRRouting/frr/pull/23897)), mantém as bases da área
+iguais (RFC 2328 §13). Sem adjacência, ninguém calcula caminho por este roteador. Um roteador que
+fica com adjacências e base parcial calcula caminhos que os vizinhos não calculam.
+
+O estado é próprio (`ospf->max_lsa.state`), não a flag `shutdown`: o running-config não muda, e
+o resync do daemon não desfaz o ignore. Só OSPFv2; o `ospf6d` é a G3.4x.
+
+**Comandos e janela.**
+
+- `routing.ospf.instance.list` traz `lsdb`: `lsas`, `lsas_other`, `memory_mib` estimado e
+  `protection` (`state`, `limit`, `ignore_entries`, `ignore_count`, `remaining_secs`). Vem do
+  mesmo `show ip ospf json` que o serviço `frr` já lê a cada 2 s (`lsaOtherRoutersCounter` e
+  `maxLsa`, campos do patch).
+- A aba Instances ganha a coluna **LSDB**:
+  - `12 340 / 50 000`;
+  - âmbar a partir do limiar (`41 200 / 50 000 · 82 %`) e acima do limite com warning-only;
+  - vermelho em `ignore 4m12s · 2/5` e `isolated`.
+- O botão **Clear LSDB Protection** só fica ativo em ignore ou isolated.
+- O modal da instância tem duas páginas, General e **LSDB Protection**. A segunda mostra os seis
+  campos e o que a base tem agora.
+
+**Prévia do commit** (`routing.ospf.instance.check`):
+
+- o que o limite faz e a memória no limite (estimada);
+- **risco**, com Safe Mode oferecido, se o limite está abaixo das LSAs de outros roteadores de
+  agora: a instância cai assim que o commit aplica;
+- aviso se a folga é menor que 20 %;
+- aviso se o `ospfd` não tem o patch (o commit seria recusado);
+- extra: aviso quando a edição liga `redistribute bgp`, `static` ou `kernel` com 10 240 rotas ou
+  mais (o padrão do `redistribute maximum-prefix` do Cisco), com quantas LSAs e quantos MiB isso
+  põe em cada roteador do domínio.
+
+**Saúde** (`ospf.lsdb`, System › Health):
+
+- erro em ignore ou isolated, ou com as bases estimadas em metade da RAM;
+- aviso no limiar, acima do limite com warning-only, ou com 25 % da RAM;
+- vale **mesmo sem limite**: é o alerta que teria pego o caso da gap sem nada configurado.
+
+**Medido**, laboratório no host (FRR 10.7.1 com os patches 0001–0007, dois `ospfd` em
+namespaces de usuário, Ryzen AI Max+ 395, 13/11/2026). A enxurrada é de ~190 000 externas de um
+vizinho; o limite, 50 000 (`scripts/frr-ospf-max-lsa.sh`).
+
+| | sem limite | `max-lsa 50000` |
+|---|---|---|
+| LSAs na base no pico | 192 721 | 50 008 (8 acima do limite) |
+| tempo até cair | — | 817 ms |
+| pico do `ospfd` / `zebra` | 293 / 120 MiB | 84 / 42 MiB |
+| depois de 2 períodos e isolado | — | `ospfd` 124 MiB (a glibc não devolve, reaproveita) |
+| `clear` → Full | — | 0,7–1,5 s |
+| limite abaixo da contagem → ignore | — | 0,4 s |
+
+O teste `maxlsa` de `scripts/ospf-stress-lab.sh` faz o mesmo de ponta a ponta, com a imagem e o
+daemon (`docs/ospf-stress.md`, seção 8).
+
+### Pesquisa
+
+- **MikroTik RouterOS 7.25** (`/routing ospf instance`): nenhum limite de LSA nem de
+  redistribuição. VyOS usa o FRR: também nada.
+- **Cisco IOS/IOS XE** `max-lsa N [threshold] [warning-only] [ignore-time] [ignore-count]
+  [reset-time]`: a semântica adotada. O IOS XE 17.11 ligou `max-lsa 50000` por padrão, e isso
+  derrubou adjacências na atualização
+  ([FN74009](https://www.cisco.com/c/en/us/support/docs/field-notices/740/fn74009.html)): por
+  isso aqui o padrão é sem limite.
+- **Junos** `database-protection` (maximum-lsa, warning-threshold 30–100, ignore-time
+  30–3600 s, ignore-count 1–32, reset-time 60–86 400 s, `clear ospf database-protection`): os
+  intervalos adotados.
+- **Arista EOS** `max-lsa`: igual ao Cisco.
+- **Nokia SR OS**: `rtr-adv-lsa-limit` põe o roteador em overload, que desvia o trânsito mas
+  não contém a memória; `export-limit` limita a redistribuição (G3.4w).
+- **RFC 1765** (Database Overflow, Experimental, sem atualização nem errata): exige o mesmo
+  limite em todos os roteadores e cobre só as type-5. Não adotada.
+- **Stub router (RFC 6987) e "isolar o vizinho"** não protegem: a LSDB cresce igual, e o
+  culpado é quem origina, não quem repassa.
+- **FRR**:
+  - 10.7.1 e `master` (c9fe9ca040) sem limite; `ospf_snmp.c` responde `ospfExtLsdbLimit = -1`;
+  - [#23897](https://github.com/FRRouting/frr/pull/23897) recusa a LSA acima do limite em
+    silêncio. A base fica diferente da dos vizinhos, e o padrão de 100 000 quebraria a rodada de
+    200 000 da G3.4m.
+
+Fora agora (gaps):
+
+- G3.4w: limite de redistribuição;
+- G3.4x: OSPFv3;
+- G3.4y: os roteadores anunciantes com mais LSAs, na janela;
+- G1.6zz: `oom_score_adj` do daemon.
+
+## Seguro por padrão
+
+- `routing.ospf.interface-template.check` (o modal) mostra antes de aplicar: **quais interfaces
+  entram** e por quê (nome, lista, rede), o **tipo sugerido** por interface (/30, /31 ou PPP →
+  `ptp`, como o RouterOS 7 faz sozinho em link PtP: sem eleição de DR, adjacência até 40 s mais
+  cedo), **`passive` sugerido** em interface com servidor DHCP ou PPPoE (cliente não forma
+  adjacência nem injeta rota), **OSPF sem autenticação** em interface ativa e **md5/simple
+  inseguros**, o template que **fica escondido** por outro anterior, e o **risco**: as interfaces
+  cujas adjacências caem (área, autenticação, tipo de rede, hello/dead, `passive`, tipo da área,
+  router-id), com o Safe Mode oferecido.
+- `routing.ospf.impact` dá a mesma lista para o candidate inteiro (modo transacional).
+- `routing.ospf.keychain.list` diz, no relógio do roteador, qual chave é enviada agora e onde
+  uma rotação derrubaria vizinho: um momento sem chave de envio, chave enviada antes de ser
+  aceita, ou chave antiga que deixa de ser aceita quando a nova começa a ser enviada (o vizinho
+  com o relógio atrasado cai; RFC 8177).
+- Validação (recusa o commit): backbone stub/NSSA (RFC 2328 §3.6, RFC 3101 §2.1), dead ≤ hello
+  (§C.3), uma instância por versão e VRF, área/instância/key chain inexistentes, OSPFv3 com
+  `simple`/`md5` (RFC 7166 só HMAC-SHA), key id > 255 em v2 (§D.3), virtual link fora do backbone
+  ou por área stub (§15), janela de chave fora de 1993–2035 (limite do FRR), chain com teste BGP.
+
+## Desempenho e paralelismo
+
+Medido em 2026-10-27, 32 núcleos, build de bench (release), `cargo bench -p
+corerouter-proto-ospf --bench ospf_config`: 4 000 interfaces, 4 000 endereços, 1 000 templates
+(900 por nome, 100 por rede).
+
+| Medida | Antes | Depois |
+|---|---|---|
+| templates → interfaces (`bindings`) | 145,7 ms | 10,9 ms |
+| render FRR completo | 148,1 ms | 12,7 ms |
+| impacto do commit (uma mudança) | 284,8 ms | 32,8 ms |
+| validação | 0,30 ms | 0,31 ms |
+
+- **Onde está o trabalho por item:** cada interface tentava todos os templates (O(interfaces ×
+  templates × nomes)). Agora os templates são indexados uma vez pelos nomes que listam (listas
+  expandidas) e cada interface só tenta os que a nomeiam e os que casam por rede. A listagem e o
+  `check` montam o índice uma vez por chamada (antes, um `bindings` por template: O(templates²)).
+  Os pools são calculados uma vez por render.
+- **Threads:** não ajudam aqui. O render roda uma vez por commit e leva ~13 ms com 4 000
+  interfaces; o tempo do commit é do FRR digitando os contextos (G3.1: um thread por daemon, o
+  `ospfd` e o `ospf6d` em paralelo, já feito). Dividir o casamento por faixa de interfaces
+  ganharia ≤ 10 ms e não roda no WASM.
+
+### Estado: LSDB e layout (G3.4b)
+
+Medido em 2026-10-27, 32 núcleos (carga ~10 de outras sessões), build de bench.
+
+| Medida | Resultado |
+|---|---|
+| LSDB de 10 000 LSAs (2 000 router com 4 links, 500 network, 7 500 externas; 4,0 MiB de JSON): leitura em fluxo para a tabela compacta | 9,1 ms, 612 KiB |
+| a mesma como árvore `serde_json::Value` | 17,0 ms, +34 MiB de RSS |
+| layout de 500 roteadores (570 links, 300 rodadas): 1 thread | 66,8 ms |
+| idem, 4 threads | 27,1 ms |
+| idem, 16 threads | 29,1 ms (a barreira entre rodadas custa o que a divisão ganha) |
+
+- **Por item:** a LSDB vai direto do socket para linhas fixas (um LSA = 40 bytes, um link = 12),
+  sem árvore JSON; uma página de LSAs é um filtro sobre o vetor.
+- **Threads no layout:** a repulsão é O(n²) por rodada e cada nó só depende das posições da
+  rodada anterior, então os nós se dividem em pedaços, um thread por pedaço, criados uma vez, com
+  uma barreira entre as rodadas (criar threads a cada rodada custava mais do que ganhava: 16
+  threads em 69 ms contra 72 ms em um, **medido**). O mesmo resultado em 1 ou N threads (teste).
+  Limite de 8 threads; no WASM, um. O layout roda uma vez por LSDB nova e fica guardado, não a
+  cada quadro.
+
+### Custo do nosso lado com escala (G3.4n)
+
+Medido em 2026-11-12, 32 núcleos, build de bench, antes (a `main`) e depois rodados em seguida na
+mesma janela de carga (`CRITERION_HOME` comum). JSON no formato do FRR 10.7.1 (campos de
+`ospfd/ospf_vty.c`: `show_ip_ospf_neighbour_brief`, `show_ip_ospf_interface_sub`,
+`show_ip_ospf_route_network`). Benches: `hal-frr/benches/frr_ospf_poll.rs` (a volta do poll
+contra um `ospfd`/`zebra` falso em socket Unix), `engine/benches/ospf_queries.rs`
+(`perf::ospf_scale`: 4 000 interfaces, 500 vizinhos, LSDB de 100 000 LSAs de 2 000 roteadores,
+200 000 rotas) e `ui/benches/frames.rs` (`ospf_*`).
+
+| Medida | Antes | Depois |
+|---|---|---|
+| leitura de 500 vizinhos | 0,72 ms | 0,34 ms |
+| leitura de 4 000 interfaces (3,2 MiB) | 15,0 ms | 4,4 ms |
+| leitura de 200 000 rotas (43 MiB) | 566 ms | 128 ms (em fluxo, sem o teto de 64 MiB) |
+| volta do poll, 500 interfaces e 50 vizinhos | 2,79 ms | 0,89 ms |
+| idem, 4 000 interfaces e 500 vizinhos | 29,0 ms | 6,7 ms |
+| a mesma volta com conexões novas (o pool desligado) | — | 1,03 ms / 6,9 ms |
+| cópia da config de roteamento por volta (`CowArc`) | 1,0 µs | 1,1 µs (sem mudança: não vale mexer) |
+| tempo sob o lock para guardar a amostra (4 000 interfaces) | 508 µs | 0,2 µs (a anterior é solta fora) |
+| `routing.ospf.neighbor.list` (500) | 2,1 ms | 1,3 ms |
+| `routing.ospf.interface.list` (4 000) | 40,4 ms, 1,1 MiB | 6,1 ms, página de 1 000 (284 KiB) |
+| `routing.ospf.lsa.list` busca em 100 000 LSAs | 14,5 ms | 5,8 ms |
+| `routing.ospf.route.list` (200 000 rotas) | 36,5 ms, 10 000 linhas, 1,9 MiB | 4,0 ms, página de 200 (38 KiB) |
+| `routing.ospf.topology`, 2 000 roteadores já dispostos | 72,8 ms, 1 MiB | 18,0 ms |
+| idem, a janela já com o mapa (`known`) | 72,8 ms, 1 MiB | 0,77 ms, 113 B |
+| `routing.ospf.neighbor.diagnose` | 2,9 ms | 2,1 ms |
+| quadro da GUI, Routing › OSPF › Routes (10 000 rotas → página de 200) | 53,4 ms | 6,6 ms |
+| idem, Neighbors (500) | 9,6 ms | 7,1 ms |
+| idem, LSDB (página de 200 de 100 000) | 7,8 ms | 6,8 ms |
+| idem, Topology (2 000 roteadores, 2 500 nós) | 7,6 ms | 7,0 ms (≈6,5 ms é o quadro base da GUI inteira) |
+
+- **Onde está o trabalho por item:** no poll, cada vizinho e interface era uma árvore JSON
+  inteira (todas as chaves e textos alocados) e a resposta ainda era copiada para um `String`;
+  agora só os campos guardados, com o texto emprestado do buffer. Nas consultas havia três custos
+  O(n) por item escondidos: o template de cada interface achado por varredura (O(n²)), o vizinho
+  de cada nó do mapa achado por varredura com um `String` por comparação, e dois `String` por LSA
+  na busca. A cópia de 4 000 interfaces a cada consulta (`ospf_live`) virou empréstimo.
+- **O que ficou como estava, com o número:** `routing.ospf.path` (10–12 ms com 200 000 rotas:
+  o prefixo de cada rota é lido a cada clique; um índice guardado por cópia da LSDB pagaria só no
+  segundo clique da mesma cópia) e a busca de rotas (15–17 ms: um `contains` por rota). As duas
+  correm sob o lock, mas só a pedido do operador, não a cada atualização. Nas rodadas completas
+  elas saíram 40–70 % mais lentas depois; medidas isoladas e alternadas (antes, depois, antes,
+  depois) dão igual ou melhor (`path` 10,9–14,2 → 10,4–12,0 ms, busca 16,3–18,7 → 15,1–17,0 ms):
+  efeito da ordem dos casos no heap, não do código.
+- **Pular o que não mudou no poll:** não serve. As respostas de vizinhos e interfaces mudam a
+  cada leitura (`upTimeInMsec`, `routerDeadIntervalTimerDueMsec`, `timerHelloInMsecs` contam o
+  tempo), então nem o hash dos bytes nem o resultado repetem. O que dá para pular é ler as
+  interfaces sem ninguém olhar (só `interface.list` e o Diagnose as usam): depende do custo no
+  `ospfd`, a medir no laboratório da G3.4m (G3.4p). Na topologia, o `token` faz exatamente isso
+  do lado da janela.
+- **Threads:** não ajudam no poll: 6,7 ms a cada 2 s com 4 000 interfaces é 0,3 % de um núcleo, e
+  o `ospfd` responde um comando por vez numa thread só (dividir por instância cairia no mesmo
+  daemon). Ler `ospfd` e `bgpd` em paralelo economizaria a soma menor das duas leituras, abaixo
+  de 1 ms. As consultas rodam com o lock do `Session`; dividi-las não encurta o lock tanto quanto
+  não fazer o trabalho (índice, página, `unchanged`). O quadro da GUI é de uma thread (egui); o
+  ganho veio de não refazer as linhas a cada quadro. O layout do mapa já usa até 8 threads
+  (G3.4b) e roda uma vez por LSDB.
+- **Tamanho das respostas:** o canal de controle aceita até 256 MiB por linha, mas o MCP não corta
+  nada: 4 000 interfaces (1,1 MiB) ou 10 000 rotas (1,9 MiB) numa resposta enchem o contexto de
+  um cliente. As listas grandes agora têm página e `total`.
+
+## Pesquisa
+
+- **MikroTik RouterOS v7** ([OSPF](https://help.mikrotik.com/docs/spaces/ROS/pages/9863229/OSPF),
+  [interface-template 7.25](https://manual.mikrotik.com/docs/7.25/cli-reference/routing/ospf/interface-template)):
+  `instance` (version 2/3, vrf, router-id, redistribute, originate-default, out-filter-chain),
+  `area` (type default/stub/nssa, no-summaries), `area range` (advertise, cost),
+  `interface-template` (interfaces/networks como casadores, type broadcast/nbma/ptp/ptmp/…, cost,
+  priority 128, hello 10 s, dead 40 s, passive, auth simple/md5/sha1/sha256/sha384/sha512,
+  auth-id, auth-key, use-bfd), `static-neighbor`; `neighbor` e `lsa` só leitura. O tipo padrão é
+  `ptp` em interface PtP. Relato de interoperabilidade
+  ([bird-users, 2023](https://bird.network.cz/pipermail/bird-users/2023-January/016526.html)):
+  `auth-id` padrão 0 no RouterOS 7.7 quebrava com o BIRD — o `check` avisa que usamos 1 sem
+  `auth_id`.
+- **FRR 10.7.1** (código-fonte, tag `frr-10.7.1`, commit `f8c0b08`): HMAC-SHA no `ospfd` só por
+  key chain (`ospf_auth.c`), `ospf6d` com `authentication keychain` (RFC 7166), key chain é
+  northbound (`ietf-key-chain`) e cada daemon tem a sua cópia, `summary-address` para agregar
+  externas, `ip ospf passive` por interface.
+- **Cisco IOS-XE**: `ip ospf authentication key-chain` com `cryptographic-algorithm
+  hmac-sha-256` e `send-lifetime`/`accept-lifetime`; `area range`, `summary-address`, `passive-
+  interface default`; `ip ospf network point-to-point` recomendado em /30–/31.
+- **Juniper Junos**: `authentication keychain` com `tolerance` (folga entre envio e aceite, o que
+  inspirou o aviso de rotação), `interface-type p2p`, `passive`, `area-range`.
+- **Nokia SR OS**: `authentication-keychain` com `tolerance`, `interface-type point-to-point`,
+  `passive`, `area-range`, `loopfree-alternates`.
+- **RFCs (cadeia)**: RFC 2328 (OSPFv2; atualizada pelas 5709, 6549, 6845, 6860, 7474, 8042, 9355 e
+  9454, [rfc-editor](https://www.rfc-editor.org/info/rfc2328), e errata em
+  [rfc-editor.org/errata](https://www.rfc-editor.org/errata/rfc2328)), RFC 5709 (HMAC-SHA; atualizada pela 7474, que adiciona
+  proteção de replay), RFC 7474 (contador de sequência que não recua), RFC 3101 (NSSA), RFC 5250
+  (LSA opaco), RFC 3623 (graceful restart), RFC 6860 (esconder prefixos de trânsito), RFC 5340
+  (OSPFv3; atualizada pelas 6845, 6860, 7503, 8362 e 9454,
+  [rfc-editor](https://www.rfc-editor.org/info/rfc5340)), RFC 7166 (trailer de autenticação do v3,
+  substitui a 6506), RFC 8362 (OSPFv3 estendido), RFC 5882 (BFD genérico), RFC 8177 (modelo
+  YANG de key chain). Seções citadas no código e nos testes (§3.6, §10.5, §10.6, §12.4.3, §15,
+  §C.3, §D.3; RFC 3101 §2.1, §3.1; RFC 7166 §4.3).
+- **O que adotamos além do RouterOS:** key chains com janelas e análise de rotação, chaves
+  seladas, `sha256` por padrão quando só a chave é dada, prévia das interfaces que entram, tipo e
+  `passive` sugeridos, aviso de autenticação ausente/fraca, prévia "estes vizinhos vão cair" com
+  Safe Mode, pools de assinantes sumarizados, recusa de chain BGP-only no OSPF.
+- **Ficou para depois:** graceful restart com a atualização A/B
+  (RFC 3623, G3.4e), pools IPv6 no OSPFv3 (G3.4g). Segment Routing entrou na G3.4f (acima).

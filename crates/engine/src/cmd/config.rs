@@ -1,0 +1,198 @@
+//! Transaction control: commit, discard, rollback, history, diff, mode, Safe Mode.
+
+use serde_json::{Value, json};
+
+use super::args::{opt_bool, opt_text, opt_u32, req_str, req_u32};
+use super::{CommandSpec, always};
+use crate::{CommitMode, EngineError, Result, Session};
+
+pub(super) const COMMANDS: &[CommandSpec] = &[
+    cmd!(
+        "config.commit",
+        "Commit",
+        ["System", "Configuration"],
+        Some("Ctrl+Enter"),
+        "{comment?: string, force?: bool (commit even if the firewall would cut your management connection)} → {revision}",
+        dirty,
+        commit
+    ),
+    cmd!(
+        "config.discard",
+        "Discard Changes",
+        ["System", "Configuration"],
+        None,
+        "{} → {}",
+        dirty,
+        discard
+    ),
+    cmd!(
+        "config.rollback",
+        "Rollback",
+        ["System", "History"],
+        None,
+        "{revision: u32, force?: bool} → {loaded, pending}",
+        always,
+        rollback
+    ),
+    cmd!(query "config.history", "History", ["System", "History"], None,
+        "{} → [{number, comment, timestamp}]",
+        always, history),
+    cmd!(query "config.diff", "Pending Changes", ["System", "Configuration"], None,
+        "{} → [{op: add|remove|change, path, value | from, to}]",
+        always, diff),
+    cmd!(quiet "config.mode.set", "Commit Mode", ["System", "Configuration"], None,
+        "{mode: immediate|transactional} → {mode}",
+        always, mode_set),
+    cmd!(
+        "config.safe-mode.enter",
+        "Safe Mode",
+        ["System", "Configuration"],
+        None,
+        "{timeout_secs?: u32 (10..=86400; undone when it expires without confirmation), detach?: bool (G1.6qg: outlives this connection, ended only by the timeout, default 600 s, or by the same user from any connection) } → {active, owner, owner_user, detached, since, entry_revision, timeout_secs, expires_in}",
+        always,
+        safe_mode_enter
+    ),
+    cmd!(
+        "config.safe-mode.exit",
+        "Leave Safe Mode (keep changes)",
+        ["System", "Configuration"],
+        None,
+        "{force?: bool} → {active: false, last}",
+        in_safe_mode,
+        safe_mode_exit
+    ),
+    cmd!(
+        "config.safe-mode.cancel",
+        "Leave Safe Mode (undo changes)",
+        ["System", "Configuration"],
+        None,
+        "{force?: bool} → {active: false, last}",
+        in_safe_mode,
+        safe_mode_cancel
+    ),
+];
+
+fn dirty(s: &Session) -> std::result::Result<(), String> {
+    if s.store().is_dirty() {
+        Ok(())
+    } else {
+        Err("no pending changes".into())
+    }
+}
+
+fn in_safe_mode(s: &Session) -> std::result::Result<(), String> {
+    if s.in_safe_mode() {
+        Ok(())
+    } else {
+        Err("not in Safe Mode".into())
+    }
+}
+
+fn commit(s: &mut Session, p: &Value) -> Result<Value> {
+    crate::lockout::take_force(s, p)?;
+    let comment = opt_text(p, "comment", 256)?.unwrap_or_default();
+    let revision = s.commit_candidate(&comment)?;
+    Ok(json!({ "revision": revision }))
+}
+
+fn discard(s: &mut Session, _: &Value) -> Result<Value> {
+    s.store_mut().discard();
+    Ok(json!({}))
+}
+
+fn rollback(s: &mut Session, p: &Value) -> Result<Value> {
+    crate::lockout::take_force(s, p)?;
+    let rev = req_u32(p, "revision")?;
+    if let Err(e) = s.store_mut().rollback(rev) {
+        // G0.33: say what is left and how not to lose it next time.
+        let oldest = s.store().history().first().map_or(0, |r| r.number);
+        return Err(match e {
+            corerouter_model::StoreError::UnknownRevision(n) if n < oldest => EngineError::bad(
+                "revision",
+                format!(
+                    "revision {n} not found: the history keeps the newest {} and starts at \
+                     revision {oldest}; before long work save a point that stays, \
+                     config.checkpoint.add {{name}}, and go back with config.checkpoint.restore",
+                    corerouter_model::ConfigStore::DEFAULT_MAX_HISTORY
+                ),
+            ),
+            e => e.into(),
+        });
+    }
+    // In immediate mode `execute` commits right after this returns.
+    Ok(json!({ "loaded": rev, "pending": s.mode() == CommitMode::Transactional }))
+}
+
+fn history(s: &mut Session, _: &Value) -> Result<Value> {
+    serde_json::to_value(s.store().history()).map_err(|e| EngineError::Internal(e.to_string()))
+}
+
+fn diff(s: &mut Session, _: &Value) -> Result<Value> {
+    let lines = s.store().diff();
+    masked(s, &lines)
+}
+
+/// Diff lines as the caller may see them: below group full a changed
+/// secret shows as changed, not its value (also `config.checkpoint.diff`).
+pub(super) fn masked(s: &Session, lines: &[corerouter_model::DiffLine]) -> Result<Value> {
+    let mut lines =
+        serde_json::to_value(lines).map_err(|e| EngineError::Internal(e.to_string()))?;
+    if s.permit(crate::auth::Group::Full).is_err()
+        && let Some(lines) = lines.as_array_mut()
+    {
+        for line in lines {
+            let secret = line
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(crate::auth::is_secret_path);
+            if let (true, Some(o)) = (secret, line.as_object_mut()) {
+                for k in ["value", "from", "to"] {
+                    if let Some(v) = o.get_mut(k) {
+                        *v = json!("***");
+                    }
+                }
+            }
+        }
+    }
+    Ok(lines)
+}
+
+// A query (no journal, no auto-commit): it changes the session, not the config.
+fn mode_set(s: &mut Session, p: &Value) -> Result<Value> {
+    let mode = match req_str(p, "mode")? {
+        "immediate" => CommitMode::Immediate,
+        "transactional" => CommitMode::Transactional,
+        _ => {
+            return Err(EngineError::bad(
+                "mode",
+                "must be 'immediate' or 'transactional'",
+            ));
+        }
+    };
+    if mode == CommitMode::Immediate && s.store().is_dirty() {
+        return Err(EngineError::bad(
+            "mode",
+            format!(
+                "commit or discard the {} pending change(s) first (config.diff)",
+                s.store().diff().len()
+            ),
+        ));
+    }
+    s.set_mode(mode);
+    Ok(json!({ "mode": mode }))
+}
+
+// Safe Mode (G1.4): see `crate::safe_mode`. Journaled, so the history of who
+// entered and left is in `state.inspect {path: journal}`; none of them edits
+// the candidate, so `execute` never auto-commits after them.
+fn safe_mode_enter(s: &mut Session, p: &Value) -> Result<Value> {
+    s.safe_mode_enter(opt_u32(p, "timeout_secs")?, opt_bool(p, "detach")?.unwrap_or(false))
+}
+
+fn safe_mode_exit(s: &mut Session, p: &Value) -> Result<Value> {
+    s.safe_mode_exit(opt_bool(p, "force")?.unwrap_or(false))
+}
+
+fn safe_mode_cancel(s: &mut Session, p: &Value) -> Result<Value> {
+    s.safe_mode_cancel(opt_bool(p, "force")?.unwrap_or(false))
+}

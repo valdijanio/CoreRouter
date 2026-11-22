@@ -1,0 +1,89 @@
+From: CoreRouter <noreply@corerouter>
+Subject: [PATCH] ospfd: log a full router-LSA once, not once per link
+
+A router-LSA holds at most ~5330 links: the stream is grown once, to
+OSPF_MAX_PACKET_SIZE - OSPF_MAX_LSA_SIZE bytes. Past that, link_info_set()
+logs "Out of space in LSA stream" for every link left out, again on every
+new instance. With 10000 interfaces in one area, ospfd logged 21.8
+million such lines (2.5 GB) in about two minutes while they were being
+configured, and filled the disk of a small router.
+
+Count the links left out instead, and log once when the router-LSA of an
+area becomes full (how many links it has and how many did not fit) and
+once when all of them fit again.
+
+G3.4q (docs/frr-many-interfaces.md): the same patch sent to FRR
+(docs/frr-upstream/ospfd-many-interfaces/), applied to 10.7.1. To be
+dropped once the image carries an FRR with it.
+---
+ ospfd/ospf_lsa.c | 26 +++++++++++++++++++++-----
+ ospfd/ospfd.h    |  3 +++
+ 2 files changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/ospfd/ospf_lsa.c b/ospfd/ospf_lsa.c
+index 295417e74d..7b941b59c5 100644
+--- a/ospfd/ospf_lsa.c
++++ b/ospfd/ospf_lsa.c
+@@ -460,6 +460,12 @@ static uint16_t ospf_link_cost(struct ospf_interface *oi)
+ 		return OSPF_OUTPUT_COST_INFINITE;
+ }
+ 
++/*
++ * Links that did not fit in the router-LSA being built: counted here and
++ * logged once per area by ospf_router_lsa_body_set(), not once per link.
++ */
++static unsigned int router_lsa_links_left_out;
++
+ /* Set a link information. */
+ char link_info_set(struct stream **s, struct in_addr id, struct in_addr data,
+ 		   uint8_t type, uint8_t tos, uint16_t cost)
+@@ -490,11 +496,7 @@ char link_info_set(struct stream **s, struct in_addr id, struct in_addr data,
+ 		}
+ 
+ 		if (ret == OSPF_MAX_LSA_SIZE) {
+-			flog_warn(
+-				EC_OSPF_LSA_SIZE,
+-				"%s: Out of space in LSA stream, left %zd, size %zd",
+-				__func__, STREAM_WRITEABLE(*s),
+-				STREAM_SIZE(*s));
++			router_lsa_links_left_out++;
+ 			return 0;
+ 		}
+ 	}
+@@ -791,8 +793,22 @@ void ospf_router_lsa_body_set(struct stream **s, struct ospf_area *area)
+ 	stream_putw(*s, 0);
+ 
+ 	/* Set all link information. */
++	router_lsa_links_left_out = 0;
+ 	cnt = router_lsa_link_set(s, area);
+ 
++	/*
++	 * Out of space: say it when it starts and when it ends, not for each
++	 * link of each new instance (with thousands of interfaces in one
++	 * area that is millions of lines).
++	 */
++	if (router_lsa_links_left_out && !area->router_lsa_links_left_out)
++		flog_warn(EC_OSPF_LSA_SIZE,
++			  "Area %pI4: router-LSA is full with %u links, %u more left out",
++			  &area->area_id, cnt, router_lsa_links_left_out);
++	else if (!router_lsa_links_left_out && area->router_lsa_links_left_out)
++		zlog_info("Area %pI4: router-LSA fits all its %u links again", &area->area_id, cnt);
++	area->router_lsa_links_left_out = router_lsa_links_left_out;
++
+ 	/* Set # of links here. */
+ 	stream_putw_at(*s, putp, cnt);
+ }
+diff --git a/ospfd/ospfd.h b/ospfd/ospfd.h
+index af4064cb76..fb09d07d8e 100644
+--- a/ospfd/ospfd.h
++++ b/ospfd/ospfd.h
+@@ -517,6 +517,9 @@ struct ospf_area {
+ 	int lsa_pos_count; /* links in the router-LSA last built */
+ 	int lsa_pos_size;  /* allocated entries */
+ 
++	/* Links that did not fit in the router-LSA last built. */
++	unsigned int router_lsa_links_left_out;
++
+ 	/* Area ID. */
+ 	struct in_addr area_id;
+ 

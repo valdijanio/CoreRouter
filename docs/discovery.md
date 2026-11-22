@@ -1,0 +1,249 @@
+# CRDP — CoreRouter Discovery Protocol (v1)
+
+Status: implementado no G5.1 (Fase A). Codec em `crates/proto-discovery` (L2, puro), runtime em
+`crates/discovery` (L4, sockets + threads std), tabela de vizinhos no engine
+(`Session::record_neighbor`), comandos `ip.neighbor.*`, janela IP › Neighbors e tela de conexão
+da GUI.
+
+## 1. Por que um protocolo próprio
+
+O WinBox acha roteadores pelo MNDP (UDP 5678) e gerencia sem IP pelo RoMON. Os dois são
+proprietários e sem especificação pública: não os clonamos. O CRDP é nosso, documentado aqui e
+versionado. Para redes mistas, o G5.2 acrescenta LLDP (IEEE 802.1AB, aberto) e só a **escuta**
+do MNDP — o CoreRouter nunca anuncia MNDP. Todos alimentam a mesma tabela de vizinhos.
+
+## 2. Transporte
+
+| Item | Valor |
+|---|---|
+| Porta | **UDP 7979** — o número da porta TCP do canal de controle, para que um par de regras de firewall cubra a gerência. Não é a 5678 do MNDP. |
+| IPv6 | `ff02::1` (all-nodes, escopo de enlace) com o índice da interface de saída; hop limit 1 (padrão de multicast) |
+| IPv4 | broadcast dirigido de cada endereço IPv4 da interface (`10.0.0.255` para `10.0.0.1/24`), saindo de um socket ligado a esse endereço; prefixos /31 e /32 não têm broadcast e não anunciam por IPv4 |
+| Interfaces | só as da lista `ip.neighbor.discovery.set {interfaces}` com `enabled = true`, e nunca uma interface desabilitada |
+| Respostas | **nenhuma**. O CRDP só anuncia e escuta; um datagrama recebido nunca gera tráfego |
+
+Vários processos CRDP no mesmo host (daemons, GUI) compartilham a porta (`SO_REUSEADDR` +
+`SO_REUSEPORT`); cada um recebe a sua cópia de cada broadcast/multicast.
+
+## 3. Tempo
+
+- Anúncio a cada `interval_secs` (padrão **30 s**, aceito 1..=3600) e logo depois de qualquer
+  mudança nas configurações de descoberta.
+- `hold` anunciado = 4 × intervalo (**120 s** no padrão), limitado a 65535. O receptor esquece o
+  vizinho `hold` segundos depois do último anúncio.
+- **Despedida:** quando a descoberta para numa interface (saiu da lista, `enabled = false`), o
+  roteador manda um último anúncio com `hold = 0`; quem recebe apaga o vizinho na hora.
+- **Despedida ao encerrar (G5.5):** SIGINT (Ctrl+C) ou SIGTERM (`kill`) no `corerouter-daemon`
+  manda `hold = 0` em toda interface onde ele anunciava (no lab virtual, pelo loopback do §5.1;
+  no `--backend linux`, também o LLDPDU com TTL 0 do §6), espera no máximo 1 s e sai com código
+  0; o log diz `shutting down: sent CRDP goodbye on N interface(s)`. Um segundo sinal durante o
+  encerramento sai na hora (código 130, sem despedida). `kill -9`, queda de energia ou pânico não
+  avisam: aí vale o `hold`. A GUI nativa (`Listener`) também apaga o vizinho ao ouvir `hold = 0`.
+- O daemon expira a tabela uma vez por segundo.
+
+## 4. Formato
+
+Todos os inteiros em big endian. Um anúncio = um datagrama de no máximo **1232 bytes** (MTU
+mínima do IPv6, 1280, menos os cabeçalhos IPv6 e UDP), para nunca fragmentar.
+
+### Cabeçalho (8 bytes)
+
+| Bytes | Campo | Valor |
+|---|---|---|
+| 0..4 | magic | `"CRDP"` (`43 52 44 50`) |
+| 4 | versão | `1`. Outra versão → datagrama descartado |
+| 5 | reservado | enviado `0`, ignorado na recepção |
+| 6..8 | tamanho | bytes de TLV que seguem; tem de ser exatamente o resto do datagrama |
+
+### TLVs
+
+Cada TLV: tipo (u16), tamanho (u16), valor. Tipo `0` é inválido.
+
+| Tipo | Nome | Valor | Obrigatório | Repete |
+|---|---|---|---|---|
+| 1 | node id | 16 bytes, aleatório, nunca todo zero | sim | não |
+| 2 | hold | u16, segundos (0 = despedida) | sim | não |
+| 3 | identity | texto (`system.identity`) | sim | não |
+| 4 | version | texto (versão do software) | não | não |
+| 5 | platform | texto (`CoreRouter`) | não | não |
+| 6 | board | texto (arquitetura e backend, ex. `x86_64 linux`) | não | não |
+| 7 | uptime | u64, segundos desde que o daemon subiu | não | não |
+| 8 | interface | texto, nome da interface de saída no remetente | não | não |
+| 9 | MAC | 6 bytes, MAC da interface de saída | não | não |
+| 10 | IPv4 | 4 bytes de endereço + 1 byte de prefixo (≤ 32) | não | até 16 |
+| 11 | IPv6 | 16 bytes de endereço + 1 byte de prefixo (≤ 128) | não | até 16 |
+| 12 | porta de controle | u16 ≠ 0, TCP do canal de controle (`--control`) | não | não |
+| 13 | porta WebSocket | u16 ≠ 0, GUI web (`--ws`) | não | não |
+
+Texto: UTF-8 válido, no máximo **128 bytes**, sem caracteres de controle. O remetente corta a
+identity no limite (num limite de caractere); o receptor recusa o que passar dele.
+
+### Regras de recepção (entrada hostil)
+
+Qualquer um no enlace manda qualquer coisa. O decodificador (`proto_discovery::decode`) nunca dá
+panic (proptest com bytes arbitrários, cabeçalho válido + lixo, e bytes trocados de anúncios
+válidos) e descarta o datagrama inteiro quando:
+
+- é maior que 1232 bytes ou menor que o cabeçalho; magic ou versão errados;
+- o tamanho do cabeçalho difere do resto do datagrama; um TLV passa do fim;
+- um TLV conhecido tem tamanho ou valor inválido (porta 0, prefixo > 32/128, node id zero,
+  texto inválido); um TLV não repetível aparece duas vezes; IPv4/IPv6 passam de 16;
+- falta node id, hold ou identity.
+
+**TLVs de tipo desconhecido são pulados**: versões futuras acrescentam TLVs sem quebrar quem
+lê v1. Mudança incompatível = nova versão no cabeçalho.
+
+Depois de decodificar, o receptor:
+
+1. ignora o próprio node id (cópias de loopback);
+2. aceita no máximo 200 anúncios por segundo (50 por endereço de origem) **antes** de pegar o
+   lock da sessão; o excesso é descartado, para uma enxurrada não travar comandos e serviços;
+3. descobre a interface de chegada: o *scope id* do endereço link-local de origem (IPv6), ou a
+   sub-rede configurada que contém a origem (IPv4);
+4. só guarda o vizinho se a descoberta estiver ativa nessa interface (config **running**);
+5. o hold time aceito é no máximo 14 400 s (4 × 3600 s, o nosso maior intervalo); a tabela tem
+   no máximo 4096 entradas no total e 256 por interface. Cheia, sai a entrada ouvida há mais
+   tempo da mesma interface (ou, com a tabela toda cheia, da interface com mais entradas): uma
+   enxurrada numa porta só despeja vizinhos daquela porta. Vale para CRDP, LLDP e MNDP.
+
+O MNDP (só escuta) aceita apenas datagramas enviados para 255.255.255.255, para o broadcast de
+uma sub-rede da interface de chegada ou para multicast IPv6 (`ff02::1`): um datagrama unicast
+para um endereço do roteador pode vir de qualquer lugar da Internet.
+
+## 5. Configuração e estado
+
+| O quê | Onde | Persistido |
+|---|---|---|
+| `enabled`, `interfaces`, `interval_secs` | `Config.ip.neighbor_discovery` (`ip.neighbor.discovery.set` / `.get`) | sim, como qualquer config (revisão, rollback) |
+| Vizinhos | `Session::neighbors()` (`ip.neighbor.list`) | **não** — estado operacional |
+| Node id | `<config-dir>/node-id` (32 dígitos hex) | sim; sem `--config-dir`, vale só enquanto o processo vive |
+
+**Padrão: `enabled = true` com nenhuma interface.** O CoreRouter ainda não tem listas de
+interfaces LAN/WAN, então não sabe qual porta é WAN; anunciar numa WAN contaria à internet a
+identity, a versão e as portas de gerência. O operador liga a descoberta nomeando as
+interfaces do lado LAN: `ip.neighbor.discovery.set {"interfaces": ["ether2", "bridge1"]}`.
+Remover uma interface (`interface.remove`) também a tira da lista. Isso vale para o
+`--backend linux`; o lab virtual tem outro padrão (seção 5.1).
+
+### 5.1 Lab virtual: o "fio" é o loopback (G5.4)
+
+As portas `ether1..8` do `--backend virtual` só existem na memória do daemon; anunciar pelas
+interfaces de mesmo nome do host não faria sentido (e poderia vazar para uma rede real). Por
+isso, com `--backend virtual` o `Agent` usa `Transport::Loopback`:
+
+| Item | Lab virtual | `--backend linux` |
+|---|---|---|
+| Envio | broadcast para `127.255.255.255:7979`, de um socket ligado a `127.0.0.1` (sai só por `lo`); um datagrama por porta virtual ativa | `ff02::1` + broadcast dirigido por interface real (seção 2) |
+| IPv6 / interfaces do kernel | não usa: nunca lê `/proc/net/if_inet6`, nunca entra em grupo multicast | como na seção 2 |
+| Recepção | só origem loopback (`127.0.0.0/8`, `::1`); o resto é descartado | origem loopback é descartada (é o fio dos labs, não um enlace do roteador) |
+| Interface do vizinho | a porta **de mesmo nome** da que o anúncio diz ter saído (TLV 8), se ela existe, não está desabilitada e tem descoberta ativa | a interface de chegada (escopo do link-local ou sub-rede) |
+| Padrão | lab novo (config não restaurada) roda `ip.neighbor.discovery.set {"interfaces": ["ether1"]}` ao subir | nenhuma interface |
+
+`--discovery-transport interfaces|loopback` troca a escolha feita pelo backend: o teste em
+namespace do daemon (`apps/corerouter-daemon/tests/netns.rs`) roda labs virtuais sobre veths
+chamadas `ether1` com `interfaces`, para exercitar o caminho real sem root.
+
+Mapeamento escolhido: **portas de mesmo nome de todos os labs do computador estão no mesmo
+fio** — `ether1` de um lab "vê" a `ether1` dos outros, `ether2` a `ether2`, e assim por diante.
+É determinístico, não cria uma linha por par de portas e permite montar topologias simples só
+escolhendo em quais portas a descoberta fica ativa. O vizinho aparece com `interface` e
+`remote_interface` iguais.
+
+O padrão `ether1` passa pelo `Session::execute` (fica no journal; com `--config-dir` é salvo, e
+uma escolha posterior do operador vence porque config restaurada não recebe o padrão). Ele só
+existe no lab porque loopback nunca sai da máquina: nada é contado à rede. A GUI nativa (que
+escuta em `0.0.0.0:7979`) recebe os mesmos broadcasts e mostra cada lab como
+`127.0.0.1:<porta de controle>`. Para testar: `corerouter-daemon --control 7979` e
+`corerouter-daemon --control 7981` em dois terminais, `ip.neighbor.list` em qualquer um, ou
+`corerouter-gui` sem `--connect` (aba Neighbors).
+
+## 6. Ponto de integração para outros protocolos (G5.2)
+
+LLDP e MNDP entram na mesma tabela sem comando novo:
+
+```rust
+let entry = NeighborEntry {
+    interface,                       // nossa interface de chegada
+    protocol: NeighborProtocol::Lldp,
+    mac, addresses, identity, version, platform, board,
+    uptime_secs, node_id,            // LLDP: chassis id como texto
+    remote_interface,                // LLDP: port id
+    mgmt: None,
+    last_seen: unix_now(),           // o mesmo relógio do expire_neighbors
+    hold_secs: ttl,                  // LLDP TTL; 0 = shutdown, apaga
+};
+corerouter_engine::lock(&shared).record_neighbor(entry); // false: interface sem descoberta
+```
+
+Implementado assim em `apps/corerouter-daemon/src/link_discovery.rs` (G5.2).
+
+A chave da linha é `(interface, protocolo, node_id | MAC | primeiro endereço | identity)`. Quem
+chama `record_neighbor` não precisa filtrar por interface: a sessão já descarta o que chega por
+interface sem descoberta ativa. `expire_neighbors(now)` roda no daemon a cada segundo
+(`corerouter_discovery::Agent`).
+
+### LLDP e MNDP (G5.2)
+
+Com `--backend linux`, o daemon usa as **mesmas** configurações (`enabled`, `interfaces`,
+`interval_secs`) para o LLDP, e escuta MNDP nelas. Detalhes em `docs/lldp-mndp.md`.
+
+| | Enviado | Só lido | Por quê |
+|---|---|---|---|
+| **CRDP** | sim | sim | Nosso, documentado acima |
+| **LLDP** (802.1AB) | sim: a cada `interval_secs`, TTL 4 ×, System Name = identity, System Description = `CoreRouter <versão>`, Port ID = nome da interface, Chassis ID = node id, Management Address = endereços da interface; TTL 0 quando a interface sai | sim | Padrão aberto que switches, MikroTik, Cisco e `lldpd` falam |
+| **MNDP** (MikroTik) | **nunca** | sim, UDP 5678 | Proprietário e sem especificação; anunciar seria fingir ser um MikroTik. Um RouterOS já vê o CoreRouter pelo LLDP |
+
+No laboratório virtual (`--backend virtual`) só roda o CRDP: não há enlace de camada 2.
+`--no-discovery` desliga os três.
+
+## 7. GUI
+
+- **IP › Neighbors** (`crates/ui/src/neighbors.rs`): tabela reutilizável (Interface, Protocol,
+  Address, MAC Address, Identity, Version, Board, Uptime) e as configurações de descoberta.
+- **Tela de conexão** (`crates/ui/src/connect.rs`, estilo login do WinBox 4): abre quando a GUI
+  nativa inicia sem `--connect`. Esquerda: Connect to, Login, Password, Remember password, Group,
+  Comment, Save to list, Connect e "Virtual lab". Direita: abas Neighbors e Saved com Find.
+  Clique num vizinho preenche Connect to; duplo clique preenche e conecta.
+  - Senha salva (G0.3e): com "Remember password", a senha fica no chaveiro do sistema por
+    `usuário@endereço`. Ao mudar Connect to ou Login, a GUI a procura e, se existir, a põe no
+    campo Password (mascarada) com o selo `saved password`, ⓘ e "Forget"; nada é usado escondido
+    (campo vazio = senha vazia). Login recusado com a senha salva diz isso e oferece apagá-la;
+    "Trust and update" num certificado trocado também a esquece (caixa marcada por padrão). O
+    exemplo de Connect to é `e.g. 192.168.88.1:8729` em itálico.
+  - Nativo: escuta CRDP direto nas interfaces da máquina (`corerouter_discovery::Listener`,
+    nunca envia). Um vizinho que roda na própria máquina vira `127.0.0.1:<porta>`. "Na própria
+    máquina" = o bind no endereço de origem funciona ou o endereço IPv6 é de uma interface local
+    (inclusive tentativo, em DAD). O veredito "não é local" vale só 2 s e a tabela de interfaces é
+    relida (no máximo 1×/s): um enlace que acabou de subir, depois da GUI, não fica marcado como
+    remoto para sempre (G5.4; antes o duplo clique ia para `[fe80::…%2]:<porta>` e era recusado).
+  - Vizinho em **outra máquina** fica cinza, com a linha "Greyed out: on another machine…" acima
+    da tabela: até a autenticação (G0.3) o canal de controle só aceita loopback. Clique/duplo
+    clique preenche Connect to e explica, sem tentar conectar; o botão Connect tenta o que estiver
+    no campo (nada bloqueia o endereço digitado). Na web, "outra máquina" = endereço que não é
+    loopback.
+  - Web: o navegador não escuta UDP; a aba Neighbors mostra o `ip.neighbor.list` do daemon que
+    serviu a página, e Connect to usa a porta WebSocket anunciada.
+  - Login e senha ficam **desabilitados** até a autenticação (G0.3). Saved guarda só endereço,
+    grupo e comentário (arquivo `saved-routers.json` no diretório de config do usuário, ou
+    `localStorage` na web); senha nunca é gravada em texto puro.
+
+## 8. Segurança
+
+- Sem autenticação nem assinatura na v1: um anúncio pode ser forjado por quem está no enlace. O
+  efeito é limitado a uma linha falsa na tabela (que nunca é usada para rotear) e um
+  "Connect to" enganoso — e conectar ainda exige alcançar o canal de controle, que hoje só
+  aceita loopback (G0.3).
+- O CRDP nunca responde, então não serve para amplificação.
+- Lab virtual: só fala e escuta pelo loopback; qualquer processo local pode forjar um vizinho de
+  lab, o que não dá a ele nada que já não tenha (o canal de controle também é loopback).
+- Assinatura dos anúncios com o segredo da malha e transporte entre vizinhos sem IP vêm no G5.3.
+
+## Histórico de revisão
+
+- 2026-10-22 — v1 (G5.1).
+- 2026-10-22 — LLDP e MNDP no §6 (G5.2 Parte 2).
+- 2026-10-22 — seção 5.1: lab virtual pelo loopback, portas de mesmo nome no mesmo fio,
+  `ether1` ligada por padrão no lab (G5.4).
+- 2026-10-22 — seção 7: detecção de "vizinho local" sem cache negativo permanente; vizinho remoto
+  cinza com explicação (G5.4).
+- 2026-10-22 — §3: despedida no encerramento do daemon por SIGINT/SIGTERM (G5.5).
